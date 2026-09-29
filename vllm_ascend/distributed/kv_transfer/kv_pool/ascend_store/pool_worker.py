@@ -2494,6 +2494,22 @@ class KVPoolWorker:
             )
             return True
 
+        if self.use_kvpp:
+            # Keep every KVPP rank on the same model-layer window. Counting
+            # only owner-local tasks makes each rank scan forward until it has
+            # queued ``num_prefetch_layers`` of its own layers, so distant
+            # owner partitions can issue H2D transfers far ahead of compute
+            # and contend with the layers on the critical path.
+            target_layer = min(
+                self.current_layer + self.num_prefetch_layers,
+                self.num_layers,
+            )
+            while self.next_layer_to_submit < target_layer:
+                layer_id = self.next_layer_to_submit
+                self.next_layer_to_submit += 1
+                submit_layer_load(layer_id)
+            return
+
         submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
         if getattr(self, "block_key_hybrid", False):
             submit_count = max(0, self.current_layer + self.num_prefetch_layers + 1 - self.next_layer_to_submit)

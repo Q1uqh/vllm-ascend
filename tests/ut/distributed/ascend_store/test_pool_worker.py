@@ -218,6 +218,35 @@ class TestKVPPPoolWorker(unittest.TestCase):
         worker.wait_for_layer_load()
         self.assertTrue(event.is_set())
 
+    def test_kvpp_prefetch_uses_global_layer_window(self):
+        worker = make_worker(
+            self,
+            tp_size=2,
+            num_layers=16,
+            use_mla=True,
+            use_kvpp=True,
+        )
+        worker.kv_recv_thread = MagicMock()
+        worker.num_prefetch_layers = 4
+        worker.current_layer = 0
+        worker.next_layer_to_submit = 0
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[] for _ in range(16)]
+        for layer_id in range(8, 12):
+            worker.layer_load_tasks[layer_id] = [MagicMock()]
+
+        worker._submit_ready_layer_loads()
+
+        self.assertEqual(worker.next_layer_to_submit, 4)
+        worker.kv_recv_thread.add_request.assert_not_called()
+
+        worker.current_layer = 5
+        worker._submit_ready_layer_loads()
+
+        self.assertEqual(worker.next_layer_to_submit, 9)
+        submitted = worker.kv_recv_thread.add_request.call_args.args[0]
+        self.assertEqual(submitted.layer_id, 8)
+
     def test_lookup_requires_every_tp_shard(self):
         worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True)
         for exists, expected in (([1, 1, 1, 1], 32), ([1, 1, 1, 0], 16), ([1, 1, 0, 0], 0)):
