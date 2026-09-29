@@ -91,7 +91,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     plan_sparse_kv_offload_memory,
 )
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import get_kvpp_group, init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -1095,7 +1095,7 @@ class NPUWorker(WorkerBase):
             )
         kvpp_config = KVPPConfig.from_vllm_config(self.vllm_config)
         if kvpp_config.size > 1:
-            kvpp_rank = get_tp_group().rank_in_group % kvpp_config.size
+            kvpp_rank = get_kvpp_group().rank_in_group
             self._kvpp_cache_allocation_plan = create_kvpp_cache_allocation_plan(
                 self.vllm_config,
                 kv_cache_spec,

@@ -65,6 +65,8 @@ def make_worker(
     pcp_group = start_patch(test, f"{module}.get_pcp_group")
     pcp_group.return_value.world_size = pcp_size
     pcp_group.return_value.rank_in_group = pcp_rank
+    kvpp_group = start_patch(test, f"{module}.get_kvpp_group")
+    kvpp_group.return_value.rank_in_group = pcp_rank * tp_size + tp_rank
     start_patch(test, f"{module}.get_decode_context_model_parallel_world_size", return_value=dcp_size)
     start_patch(test, f"{module}.get_decode_context_model_parallel_rank", return_value=0)
     importlib = start_patch(test, f"{module}.importlib")
@@ -172,6 +174,49 @@ class TestKVPPPoolWorker(unittest.TestCase):
                 worker.process_layer_data([MagicMock()])
                 for process in (worker._process_save_for_layer_batch, worker._process_load_for_layer_batch):
                     self.assertEqual([call.args[1:] for call in process.call_args_list], [(9 + rank, 0, 0), (17, 0, 1)])
+
+    def test_owner_filter_uses_kvpp_rank_across_pcp(self):
+        import torch
+
+        from tests.ut.kvpp_utils import layer_name, make_kvpp_config
+
+        worker = make_worker(
+            self,
+            tp_rank=0,
+            tp_size=2,
+            pcp_rank=1,
+            pcp_size=2,
+            num_layers=4,
+            use_mla=True,
+            use_kvpp=True,
+        )
+        worker.vllm_config = make_kvpp_config(4)
+        worker._transfer_threads_started = True
+        names = [layer_name(i) for i in range(4)]
+        caches = {name: torch.zeros((4, 16, 8)) for name in names}
+
+        worker.register_kv_caches(caches)
+
+        self.assertEqual(worker.kvpp_rank, 2)
+        self.assertEqual(list(worker.kv_caches), [names[2]])
+
+    def test_kvpp_keeps_layer_load_event_until_next_step(self):
+        worker = make_worker(
+            self,
+            tp_size=2,
+            use_layerwise=True,
+            use_mla=True,
+            use_kvpp=True,
+        )
+        event = threading.Event()
+        event.set()
+        worker.layer_load_finished_events = [event, threading.Event()]
+        worker.layer_load_tasks = [[], []]
+        worker.prefetch_layer_map = {}
+        worker.kv_recv_thread = MagicMock()
+
+        worker.wait_for_layer_load()
+        self.assertTrue(event.is_set())
 
     def test_lookup_requires_every_tp_shard(self):
         worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True)

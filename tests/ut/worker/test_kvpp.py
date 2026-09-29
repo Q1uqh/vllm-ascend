@@ -113,6 +113,29 @@ def test_prefetch_sequence_across_forwards(scheduler_device):
     assert transport.prefetch.call_count == 6
 
 
+def test_layerwise_transfer_waits_before_kvpp_broadcast(monkeypatch, scheduler_device):
+    events, _, _ = scheduler_device
+    layer = layer_name(0)
+    transport = Mock()
+    transport.prefetch.side_effect = lambda *_args: events.append("broadcast")
+    wait_for_load = Mock(side_effect=lambda name: events.append(("load", name)))
+    monkeypatch.setattr(
+        kvpp,
+        "get_kv_transfer_group",
+        lambda: SimpleNamespace(wait_for_layer_load_ready=wait_for_load),
+    )
+    scheduler = kvpp.KVPPScheduler(transport, (layer,), layerwise=True)
+
+    scheduler.schedule_forward(True)
+    assert not scheduler._prefetch_executor.submitted
+    scheduler._wait_for_load = kvpp.get_kv_transfer_group().wait_for_layer_load_ready
+    scheduler.start_layer_prefetch(layer)
+    scheduler._prefetch_executor.run_next()
+    scheduler.wait_for_layer(layer)
+
+    assert events[-2:] == [("load", layer), "broadcast"]
+
+
 def test_hook_propagates_failed_future_without_scheduling_next(scheduler_device):
     scheduler = kvpp.KVPPScheduler(Mock(), (layer_name(0), layer_name(1)))
     scheduler.schedule_forward(True)

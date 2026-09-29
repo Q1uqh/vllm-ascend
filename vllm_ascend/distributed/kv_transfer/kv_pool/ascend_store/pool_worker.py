@@ -92,6 +92,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.distributed.parallel_state import get_kvpp_group
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -124,6 +125,7 @@ class KVPoolWorker:
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.vllm_config = vllm_config
         self.use_kvpp = KVPPConfig.from_vllm_config(vllm_config).size > 1
+        self.kvpp_rank = get_kvpp_group().rank_in_group if self.use_kvpp else 0
         self.kv_cache_config = kv_cache_config
         hf_text_config = getattr(model_config, "hf_text_config", None)
         hf_config = getattr(model_config, "hf_config", hf_text_config)
@@ -942,7 +944,11 @@ class KVPoolWorker:
         if self.use_kvpp:
             self.physical_layer_to_group_layers.clear()
             owners = map_kvpp_layers_to_owners(self.vllm_config, kv_caches.keys())
-            kv_caches = {name: caches for name, caches in kv_caches.items() if owners.get(name) in (None, self.tp_rank)}
+            kv_caches = {
+                name: caches
+                for name, caches in kv_caches.items()
+                if owners.get(name) in (None, self.kvpp_rank)
+            }
             self.kv_caches = kv_caches
         self.group_kv_cache_families: dict[int, str] = {
             group_id: get_group_cache_family(self.kv_cache_group_families, group_id)
@@ -1045,7 +1051,7 @@ class KVPoolWorker:
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
             self.next_layer_to_submit = 0
-            if self.use_kvpp and self.use_layerwise_transfer:
+            if self.use_kvpp:
                 assert self.layer_load_finished_events is not None
                 for event in self.layer_load_finished_events:
                     event.clear()
@@ -2551,7 +2557,7 @@ class KVPoolWorker:
                 self._finish_current_layerwise_load_sessions()
             raise
         # KVPP also observes this signal; clear it when the next step starts.
-        if not (self.use_kvpp and self.use_layerwise_transfer):
+        if not self.use_kvpp:
             self.layer_load_finished_events[self.current_layer].clear()
         if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
             # The final model layer can have no reachable load rows. Completion
