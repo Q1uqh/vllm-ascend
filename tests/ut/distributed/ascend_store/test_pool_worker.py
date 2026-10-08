@@ -184,7 +184,7 @@ class TestKVPPPoolWorker(unittest.TestCase):
                 self.assertTrue(all("@head_or_tp_rank:0" in key for key in keys[:2]))
                 self.assertTrue(all("@head_or_tp_rank:1" in key for key in keys[2:]))
 
-    def test_prefetch_uses_global_model_layer_window(self):
+    def test_prefetch_refills_only_after_consuming_owner_layer(self):
         worker = make_worker(
             self,
             tp_size=2,
@@ -193,29 +193,39 @@ class TestKVPPPoolWorker(unittest.TestCase):
             use_kvpp=True,
         )
         worker.kv_recv_thread = MagicMock()
-        worker.num_prefetch_layers = 4
+        worker.num_prefetch_layers = 2
         worker.current_layer = 0
         worker.next_layer_to_submit = 0
         worker.prefetch_layer_map = {}
         worker.layer_load_tasks = [[] for _ in range(16)]
-        # Model layers 8-11 are the first owner-local layers on this rank.
+        # Model layers 8-11 are owner-local layers on this rank.
         for layer_id in range(8, 12):
             worker.layer_load_tasks[layer_id] = [MagicMock()]
 
         worker._submit_ready_layer_loads()
 
-        # The rank consumes the shared [0, 4) window; it must not scan ahead
-        # to layer 8 merely to find four owner-local transfer tasks.
-        self.assertEqual(worker.next_layer_to_submit, 4)
-        worker.kv_recv_thread.add_request.assert_not_called()
+        # Prime two owner-local layers early enough to hide their long-context
+        # Pool GETs before the model reaches this rank's partition.
+        self.assertEqual(worker.next_layer_to_submit, 10)
+        self.assertEqual(
+            [call.args[0].layer_id for call in worker.kv_recv_thread.add_request.call_args_list],
+            [8, 9],
+        )
 
         worker.current_layer = 5
         worker._submit_ready_layer_loads()
 
-        # The shared window is now [5, 9), so layer 8 becomes eligible.
-        self.assertEqual(worker.next_layer_to_submit, 9)
-        submitted = worker.kv_recv_thread.add_request.call_args.args[0]
-        self.assertEqual(submitted.layer_id, 8)
+        # Unrelated global layers must not refill this rank's local window.
+        self.assertEqual(worker.next_layer_to_submit, 10)
+        self.assertEqual(worker.kv_recv_thread.add_request.call_count, 2)
+
+        worker.current_layer = 8
+        worker._submit_ready_layer_loads()
+
+        # Consuming owner layer 8 admits exactly one replacement, layer 10.
+        self.assertEqual(worker.next_layer_to_submit, 11)
+        self.assertEqual(worker.kv_recv_thread.add_request.call_count, 3)
+        self.assertEqual(worker.kv_recv_thread.add_request.call_args.args[0].layer_id, 10)
 
 
 class _SparseSWAHitManager:

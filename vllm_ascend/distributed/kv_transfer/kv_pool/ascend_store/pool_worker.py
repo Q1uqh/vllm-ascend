@@ -2488,26 +2488,22 @@ class KVPoolWorker:
             )
             return True
 
-        if self.use_kvpp:
-            # All KVPP ranks must advance through the same model-layer window.
-            # Counting only owner-local tasks lets a rank skip non-owner layers
-            # and enqueue loads for its distant owner partition (for example,
-            # layer 8/16/24 while the model is still at layer 0).  Consume every
-            # layer position in the global window even when this rank has no
-            # transfer task for it, so only owners inside the window may issue
-            # Pool GETs.
-            target_layer = min(
-                self.current_layer + self.num_prefetch_layers,
-                self.num_layers,
+        if self.use_kvpp and self.current_layer > 0:
+            # A KVPP rank owns only part of the model.  Prime each rank's first
+            # ``num_prefetch_layers`` owner-local layers at layer 0, then refill
+            # that local window only when the model consumes a layer owned by
+            # this rank.  Refilling on every global model layer makes ranks with
+            # distant owner partitions enqueue their entire partition near the
+            # start of forward.  Conversely, a global layer-number window gives
+            # those ranks too little lead time for long-context Pool GETs.
+            current_layer_is_local = bool(self.layer_load_tasks[self.current_layer]) or (
+                self.current_layer in self.prefetch_layer_map
             )
-            while self.next_layer_to_submit < target_layer:
-                layer_id = self.next_layer_to_submit
-                self.next_layer_to_submit += 1
-                submit_layer_load(layer_id)
-            return
+            if not current_layer_is_local:
+                return
 
         submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
-        if getattr(self, "block_key_hybrid", False):
+        if getattr(self, "block_key_hybrid", False) and not self.use_kvpp:
             submit_count = max(0, self.current_layer + self.num_prefetch_layers + 1 - self.next_layer_to_submit)
         submitted_layers = 0
         while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
