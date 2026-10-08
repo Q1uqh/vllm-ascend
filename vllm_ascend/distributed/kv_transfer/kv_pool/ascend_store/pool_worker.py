@@ -2488,6 +2488,24 @@ class KVPoolWorker:
             )
             return True
 
+        if self.use_kvpp:
+            # All KVPP ranks must advance through the same model-layer window.
+            # Counting only owner-local tasks lets a rank skip non-owner layers
+            # and enqueue loads for its distant owner partition (for example,
+            # layer 8/16/24 while the model is still at layer 0).  Consume every
+            # layer position in the global window even when this rank has no
+            # transfer task for it, so only owners inside the window may issue
+            # Pool GETs.
+            target_layer = min(
+                self.current_layer + self.num_prefetch_layers,
+                self.num_layers,
+            )
+            while self.next_layer_to_submit < target_layer:
+                layer_id = self.next_layer_to_submit
+                self.next_layer_to_submit += 1
+                submit_layer_load(layer_id)
+            return
+
         submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
         if getattr(self, "block_key_hybrid", False):
             submit_count = max(0, self.current_layer + self.num_prefetch_layers + 1 - self.next_layer_to_submit)

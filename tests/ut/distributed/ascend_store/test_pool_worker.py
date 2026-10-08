@@ -184,6 +184,39 @@ class TestKVPPPoolWorker(unittest.TestCase):
                 self.assertTrue(all("@head_or_tp_rank:0" in key for key in keys[:2]))
                 self.assertTrue(all("@head_or_tp_rank:1" in key for key in keys[2:]))
 
+    def test_prefetch_uses_global_model_layer_window(self):
+        worker = make_worker(
+            self,
+            tp_size=2,
+            num_layers=16,
+            use_mla=True,
+            use_kvpp=True,
+        )
+        worker.kv_recv_thread = MagicMock()
+        worker.num_prefetch_layers = 4
+        worker.current_layer = 0
+        worker.next_layer_to_submit = 0
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[] for _ in range(16)]
+        # Model layers 8-11 are the first owner-local layers on this rank.
+        for layer_id in range(8, 12):
+            worker.layer_load_tasks[layer_id] = [MagicMock()]
+
+        worker._submit_ready_layer_loads()
+
+        # The rank consumes the shared [0, 4) window; it must not scan ahead
+        # to layer 8 merely to find four owner-local transfer tasks.
+        self.assertEqual(worker.next_layer_to_submit, 4)
+        worker.kv_recv_thread.add_request.assert_not_called()
+
+        worker.current_layer = 5
+        worker._submit_ready_layer_loads()
+
+        # The shared window is now [5, 9), so layer 8 becomes eligible.
+        self.assertEqual(worker.next_layer_to_submit, 9)
+        submitted = worker.kv_recv_thread.add_request.call_args.args[0]
+        self.assertEqual(submitted.layer_id, 8)
+
 
 class _SparseSWAHitManager:
     """SWA manager: right-to-left search for a cached aligned segment tail."""
