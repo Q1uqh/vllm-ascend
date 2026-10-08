@@ -26,6 +26,39 @@ _DEFAULT_MAX_PREFETCH_LAYERS = 8
 _INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
 
 
+def has_layerwise_transfer(kv_transfer_config: Any) -> bool:
+    """Return whether an AscendStore connector transfers KV layer by layer.
+
+    This is intentionally independent of physical cache-buffer reuse.  The
+    Mooncake block-key protocol is layerwise but does not expose a GVA reuse
+    layout, so ``get_layerwise_reuse_config`` cannot be used for this check.
+    """
+    if kv_transfer_config is None:
+        return False
+
+    connector_name = getattr(kv_transfer_config, "kv_connector", None)
+    root_extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if connector_name in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
+        connector_configs = [
+            {
+                "kv_connector": connector_name,
+                "kv_connector_extra_config": root_extra_config,
+            }
+        ]
+    elif connector_name == "MultiConnector":
+        connector_configs = root_extra_config.get("connectors", [])
+    else:
+        return False
+
+    return any(
+        isinstance(connector_config, dict)
+        and connector_config.get("kv_connector")
+        in ("AscendStoreConnector", "MooncakeConnectorStoreV1")
+        and bool((connector_config.get("kv_connector_extra_config") or {}).get("use_layerwise", False))
+        for connector_config in connector_configs
+    )
+
+
 def get_layerwise_physical_layer_index(layer_name: str, base_layers: int) -> int:
     match = re.search(
         r"(?:^|\.)mtp(?:\.layers)?\.(\d+)(?:\.|$)",

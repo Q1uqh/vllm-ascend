@@ -1045,7 +1045,7 @@ class KVPoolWorker:
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
             self.next_layer_to_submit = 0
-            if self.use_kvpp and self.use_layerwise_transfer:
+            if self.use_kvpp:
                 assert self.layer_load_finished_events is not None
                 for event in self.layer_load_finished_events:
                     event.clear()
@@ -2565,7 +2565,7 @@ class KVPoolWorker:
                 self._finish_current_layerwise_load_sessions()
             raise
         # KVPP also observes this signal; clear it when the next step starts.
-        if not (self.use_kvpp and self.use_layerwise_transfer):
+        if not self.use_kvpp:
             self.layer_load_finished_events[self.current_layer].clear()
         if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
             # The final model layer can have no reachable load rows. Completion

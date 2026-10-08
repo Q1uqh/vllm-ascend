@@ -184,6 +184,25 @@ class TestKVPPPoolWorker(unittest.TestCase):
                 self.assertTrue(all("@head_or_tp_rank:0" in key for key in keys[:2]))
                 self.assertTrue(all("@head_or_tp_rank:1" in key for key in keys[2:]))
 
+    def test_layer_load_event_is_kept_for_kvpp_broadcast(self):
+        worker = make_worker(
+            self,
+            tp_size=2,
+            use_layerwise=True,
+            use_mla=True,
+            use_kvpp=True,
+        )
+        event = threading.Event()
+        event.set()
+        worker.layer_load_finished_events = [event, threading.Event()]
+        worker.layer_load_tasks = [[], []]
+        worker.prefetch_layer_map = {}
+        worker.kv_recv_thread = MagicMock()
+
+        worker.wait_for_layer_load()
+
+        self.assertTrue(event.is_set())
+
     def test_prefetch_refills_only_after_consuming_owner_layer(self):
         worker = make_worker(
             self,
