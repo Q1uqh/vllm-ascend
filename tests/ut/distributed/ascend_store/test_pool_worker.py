@@ -135,6 +135,36 @@ class TestPCPPoolWorker(unittest.TestCase):
 
 
 class TestKVPPPoolWorker(unittest.TestCase):
+    def test_layerwise_prefetch_uses_model_layer_window(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+            KVPoolWorker,
+        )
+
+        worker = KVPoolWorker.__new__(KVPoolWorker)
+        worker.use_kvpp = True
+        worker.current_layer = 0
+        worker.num_layers = 12
+        worker.num_prefetch_layers = 2
+        worker.next_layer_to_submit = 0
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[] for _ in range(worker.num_layers)]
+        worker.layer_load_tasks[8] = [MagicMock()]
+        worker.layer_load_tasks[9] = [MagicMock()]
+        worker.kv_recv_thread = MagicMock()
+
+        worker._submit_ready_layer_loads()
+
+        self.assertEqual(worker.next_layer_to_submit, 2)
+        worker.kv_recv_thread.add_request.assert_not_called()
+
+        worker.current_layer = 7
+        worker._submit_ready_layer_loads()
+
+        self.assertEqual(worker.next_layer_to_submit, 9)
+        worker.kv_recv_thread.add_request.assert_called_once()
+        task = worker.kv_recv_thread.add_request.call_args.args[0]
+        self.assertEqual(task.layer_id, 8)
+
     def test_registers_persistent_layers_and_mtp(self):
         import torch
 
