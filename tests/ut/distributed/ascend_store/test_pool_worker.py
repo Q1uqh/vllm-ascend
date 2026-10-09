@@ -135,6 +135,19 @@ class TestPCPPoolWorker(unittest.TestCase):
 
 
 class TestKVPPPoolWorker(unittest.TestCase):
+    def test_layerwise_prefetch_depth_honors_user_config(self):
+        worker = make_worker(
+            self,
+            tp_size=2,
+            num_layers=16,
+            use_layerwise=True,
+            use_mla=True,
+            use_kvpp=True,
+            extra_config={"layerwise_prefetch_layers": 3},
+        )
+
+        self.assertEqual(worker.num_prefetch_layers, 3)
+
     def test_registers_persistent_layers_and_mtp(self):
         import torch
 

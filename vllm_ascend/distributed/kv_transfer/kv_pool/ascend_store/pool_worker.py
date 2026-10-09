@@ -559,12 +559,32 @@ class KVPoolWorker:
                     raise ValueError("layerwise_prefetch_layers must be a positive integer") from exc
                 if self.num_prefetch_layers <= 0:
                     raise ValueError("layerwise_prefetch_layers must be a positive integer")
+
+        # The explicit connector setting is authoritative for every
+        # layerwise layout, including KVPP and cache-reuse layouts.  Keep this
+        # override after the layout branches so a derived layout can never
+        # silently replace the value supplied by the user.
+        configured_prefetch_layers = self._extra_config.get("layerwise_prefetch_layers")
+        if configured_prefetch_layers is not None:
+            if isinstance(configured_prefetch_layers, bool):
+                raise ValueError("layerwise_prefetch_layers must be a positive integer")
+            try:
+                self.num_prefetch_layers = int(configured_prefetch_layers)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("layerwise_prefetch_layers must be a positive integer") from exc
+            if self.num_prefetch_layers <= 0:
+                raise ValueError("layerwise_prefetch_layers must be a positive integer")
         self.sync_save_events: list[torch.npu.Event] | None = None
 
         logger.info(
-            "layerwise config: num_layers=%d num_groups=%d physical_layer_to_group_layers_sample=%s",
+            "layerwise config: num_layers=%d num_groups=%d use_kvpp=%s "
+            "configured_prefetch_layers=%s effective_prefetch_layers=%d "
+            "physical_layer_to_group_layers_sample=%s",
             self.num_layers,
             self.num_kv_cache_groups,
+            self.use_kvpp,
+            configured_prefetch_layers,
+            self.num_prefetch_layers,
             {k: v for k, v in list(self.physical_layer_to_group_layers.items())[:3]},
         )
 
@@ -2532,8 +2552,9 @@ class KVPoolWorker:
             # window.  Empty non-owner layers still consume window positions;
             # otherwise each rank scans forward until it finds enough of its
             # own layers and L8/L16/L24 can issue Pool GETs while L0 computes.
-            # ``num_prefetch_layers`` includes the current layer, so the
-            # default value 2 permits only current + next model layer.
+            # ``num_prefetch_layers`` includes the current layer.  Its value
+            # comes from the user's ``layerwise_prefetch_layers`` setting when
+            # provided; otherwise the generic layerwise layout default applies.
             target_layer = min(
                 self.current_layer + self.num_prefetch_layers,
                 self.num_layers,
