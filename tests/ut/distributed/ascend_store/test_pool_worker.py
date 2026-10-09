@@ -203,7 +203,7 @@ class TestKVPPPoolWorker(unittest.TestCase):
 
         self.assertTrue(event.is_set())
 
-    def test_prefetch_refills_only_after_consuming_owner_layer(self):
+    def test_kvpp_prefetch_uses_global_contiguous_layer_window(self):
         worker = make_worker(
             self,
             tp_size=2,
@@ -223,28 +223,25 @@ class TestKVPPPoolWorker(unittest.TestCase):
 
         worker._submit_ready_layer_loads()
 
-        # Prime two owner-local layers early enough to hide their long-context
-        # Pool GETs before the model reaches this rank's partition.
-        self.assertEqual(worker.next_layer_to_submit, 10)
-        self.assertEqual(
-            [call.args[0].layer_id for call in worker.kv_recv_thread.add_request.call_args_list],
-            [8, 9],
-        )
+        # At L0 the global window is [L0, L2), so this rank must not scan
+        # forward to its distant owner partition at L8.
+        self.assertEqual(worker.next_layer_to_submit, 2)
+        worker.kv_recv_thread.add_request.assert_not_called()
 
         worker.current_layer = 5
         worker._submit_ready_layer_loads()
 
-        # Unrelated global layers must not refill this rank's local window.
-        self.assertEqual(worker.next_layer_to_submit, 10)
-        self.assertEqual(worker.kv_recv_thread.add_request.call_count, 2)
+        # The window advances globally to [L5, L7); L8 is still ineligible.
+        self.assertEqual(worker.next_layer_to_submit, 7)
+        worker.kv_recv_thread.add_request.assert_not_called()
 
-        worker.current_layer = 8
+        worker.current_layer = 7
         worker._submit_ready_layer_loads()
 
-        # Consuming owner layer 8 admits exactly one replacement, layer 10.
-        self.assertEqual(worker.next_layer_to_submit, 11)
-        self.assertEqual(worker.kv_recv_thread.add_request.call_count, 3)
-        self.assertEqual(worker.kv_recv_thread.add_request.call_args.args[0].layer_id, 10)
+        # At L7 the global window becomes [L7, L9), admitting only owner L8.
+        self.assertEqual(worker.next_layer_to_submit, 9)
+        worker.kv_recv_thread.add_request.assert_called_once()
+        self.assertEqual(worker.kv_recv_thread.add_request.call_args.args[0].layer_id, 8)
 
 
 class _SparseSWAHitManager:
