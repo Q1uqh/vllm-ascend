@@ -217,6 +217,9 @@ class TestKVPPPoolWorker(unittest.TestCase):
         worker.next_layer_to_submit = 0
         worker.prefetch_layer_map = {}
         worker.layer_load_tasks = [[] for _ in range(16)]
+        worker._open_layerwise_get_sessions = MagicMock()
+        pending_slot = (MagicMock(), "block-key", 7, 0)
+        worker._pending_layerwise_get_slots = [pending_slot]
         # Model layers 8-11 are owner-local layers on this rank.
         for layer_id in range(8, 12):
             worker.layer_load_tasks[layer_id] = [MagicMock()]
@@ -227,6 +230,7 @@ class TestKVPPPoolWorker(unittest.TestCase):
         # forward to its distant owner partition at L8.
         self.assertEqual(worker.next_layer_to_submit, 2)
         worker.kv_recv_thread.add_request.assert_not_called()
+        worker._open_layerwise_get_sessions.assert_not_called()
 
         worker.current_layer = 5
         worker._submit_ready_layer_loads()
@@ -234,6 +238,7 @@ class TestKVPPPoolWorker(unittest.TestCase):
         # The window advances globally to [L5, L7); L8 is still ineligible.
         self.assertEqual(worker.next_layer_to_submit, 7)
         worker.kv_recv_thread.add_request.assert_not_called()
+        worker._open_layerwise_get_sessions.assert_not_called()
 
         worker.current_layer = 7
         worker._submit_ready_layer_loads()
@@ -242,6 +247,14 @@ class TestKVPPPoolWorker(unittest.TestCase):
         self.assertEqual(worker.next_layer_to_submit, 9)
         worker.kv_recv_thread.add_request.assert_called_once()
         self.assertEqual(worker.kv_recv_thread.add_request.call_args.args[0].layer_id, 8)
+        worker._open_layerwise_get_sessions.assert_called_once_with([pending_slot])
+        self.assertEqual(worker._pending_layerwise_get_slots, [])
+
+        # Later owner layers reuse the same open sessions instead of starting
+        # another session for every layer.
+        worker.current_layer = 8
+        worker._submit_ready_layer_loads()
+        worker._open_layerwise_get_sessions.assert_called_once()
 
 
 class _SparseSWAHitManager:

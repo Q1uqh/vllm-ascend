@@ -418,6 +418,12 @@ class KVPoolWorker:
         self._layerwise_session_tracker = LayerwiseSessionTracker()
         self._current_layerwise_request_ids: set[str] = set()
         self._current_layerwise_last_chunk_req_ids: set[str] = set()
+        # KVPP ranks own disjoint model-layer ranges.  Opening every Mooncake
+        # GET session while the forward is being prepared can therefore leave
+        # the sessions of later owner ranks idle for most of a long prefill.
+        # Keep the key metadata here and open the rank's sessions only when its
+        # first real layer transfer enters the global prefetch window.
+        self._pending_layerwise_get_slots: list[tuple[ReqMeta, str, int, int | None]] = []
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -2004,6 +2010,7 @@ class KVPoolWorker:
     def _finish_current_layerwise_load_sessions(self) -> None:
         if not self.use_block_key_layerwise:
             return
+        self._pending_layerwise_get_slots = []
         if self._layer_load_aborted.is_set():
             req_ids = self._current_layerwise_request_ids.copy()
             self._release_layerwise_requests_for_retry(req_ids)
@@ -2183,6 +2190,33 @@ class KVPoolWorker:
         for request_identity, request in requests_by_id.items():
             request.load_keys = request_load_keys[request_identity]
 
+    def _prepare_layerwise_get_sessions(
+        self,
+        request_key_slots: list[tuple[ReqMeta, str, int, int | None]],
+    ) -> None:
+        """Open GET sessions eagerly, except for KVPP layerwise forwards.
+
+        A block-key object contains all layers owned by this KVPP rank.  With
+        KVPP, the first owned layer can be far from layer zero, so eagerly
+        opening the session here makes it sit idle until that owner range is
+        reached.  Deferring only the session start (not task construction)
+        keeps the transfer layout stable while bounding the session lifetime.
+        """
+        if self.use_kvpp:
+            self._pending_layerwise_get_slots = request_key_slots
+            return
+        self._open_layerwise_get_sessions(request_key_slots)
+
+    def _open_pending_layerwise_get_sessions(self) -> None:
+        """Open this rank's deferred sessions exactly once per forward."""
+        slots = self._pending_layerwise_get_slots
+        if not slots:
+            return
+        # Clear before entering the backend so an error/recovery path cannot
+        # submit a duplicate session-start for the same keys.
+        self._pending_layerwise_get_slots = []
+        self._open_layerwise_get_sessions(slots)
+
     def _prepare_block_key_layerwise_sessions(self, requests: list[ReqMeta]) -> None:
         self._layer_load_aborted.clear()
         self._current_layerwise_request_ids = {request.req_id for request in requests}
@@ -2192,7 +2226,7 @@ class KVPoolWorker:
             get_key_slots.extend(
                 (request, key, block_id, slot) for key, block_id, slot in self._prepare_layerwise_get_session(request)
             )
-        self._open_layerwise_get_sessions(get_key_slots)
+        self._prepare_layerwise_get_sessions(get_key_slots)
         for request in requests:
             self._prepare_layerwise_put_session(request)
 
@@ -2475,6 +2509,11 @@ class KVPoolWorker:
             reuse_source = self.prefetch_layer_map.get(layer_id)
             if not self.layer_load_tasks[layer_id] and reuse_source is None:
                 return False
+            if self.use_kvpp and self.layer_load_tasks[layer_id]:
+                # The first non-empty owner layer is the point at which this
+                # rank actually joins the transfer pipeline.  Start its
+                # Mooncake sessions now, rather than at forward preparation.
+                self._open_pending_layerwise_get_sessions()
             attention_start_gate = None
             if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
                 attention_start_gate = get_attention_compute_start_gate()

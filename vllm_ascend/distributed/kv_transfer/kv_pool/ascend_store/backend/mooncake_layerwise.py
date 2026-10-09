@@ -304,5 +304,5 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
             tracker.register_put_keys(
                 request.req_id, ((name, index) for name, index in key_indices if name in started), group_id=group
             )
-    worker._open_layerwise_get_sessions(get_slots)
+    worker._prepare_layerwise_get_sessions(get_slots)
     return result
