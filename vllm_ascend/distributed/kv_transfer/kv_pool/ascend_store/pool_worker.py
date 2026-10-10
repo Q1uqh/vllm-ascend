@@ -2547,44 +2547,22 @@ class KVPoolWorker:
             )
             return True
 
-        if self.use_kvpp:
-            # Keep every KVPP rank on one global, contiguous model-layer
-            # window.  Empty non-owner layers still consume window positions;
-            # otherwise each rank scans forward until it finds enough of its
-            # own layers and L8/L16/L24 can issue Pool GETs while L0 computes.
-            # ``num_prefetch_layers`` includes the current layer.  Its value
-            # comes from the user's ``layerwise_prefetch_layers`` setting when
-            # provided; otherwise the generic layerwise layout default applies.
-            target_layer = self._kvpp_prefetch_window_end()
-            while self.next_layer_to_submit < target_layer:
-                layer_id = self.next_layer_to_submit
-                self.next_layer_to_submit += 1
-                submit_layer_load(layer_id)
-            return
-
         submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
-        if getattr(self, "block_key_hybrid", False):
+        if getattr(self, "block_key_hybrid", False) and not self.use_kvpp:
             submit_count = max(0, self.current_layer + self.num_prefetch_layers + 1 - self.next_layer_to_submit)
         submitted_layers = 0
         while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
-            if submit_layer_load(layer_id):
+            submitted = submit_layer_load(layer_id)
+            if submitted or self.use_kvpp:
+                # Reuse the normal layerwise state machine for KVPP: submit P
+                # model-layer positions at layer zero and exactly one more at
+                # each following layer.  A KVPP rank has no transfer task for
+                # non-owner layers, but those empty positions must still count;
+                # otherwise it scans ahead and queues most of its owner range
+                # before forward reaches that partition.
                 submitted_layers += 1
-
-    def _kvpp_prefetch_window_end(self) -> int:
-        """Return the exclusive end of KVPP's global layer window.
-
-        Layerwise without KVPP counts submitted model layers.  KVPP ranks,
-        however, have sparse owner-local task lists.  Counting non-empty tasks
-        would let a later owner rank skip all preceding model layers and queue
-        most of its partition before forward reaches it.  Advancing by global
-        layer ordinal preserves the same rolling window on every KVPP rank and
-        does not require another cache buffer.
-        """
-        if self.num_prefetch_layers < 1:
-            raise RuntimeError("layerwise prefetch depth must be positive")
-        return min(self.current_layer + self.num_prefetch_layers, self.num_layers)
 
     def wait_for_layer_load_ready(self, layer_name: str) -> None:
         """Observe load completion without advancing the attention-side schedule."""

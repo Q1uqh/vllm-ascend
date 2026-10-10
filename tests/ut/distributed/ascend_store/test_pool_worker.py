@@ -245,16 +245,9 @@ class TestKVPPPoolWorker(unittest.TestCase):
         worker.kv_recv_thread.add_request.assert_not_called()
         worker._open_layerwise_get_sessions.assert_not_called()
 
-        worker.current_layer = 5
-        worker._submit_ready_layer_loads()
-
-        # The window advances globally to [L5, L7); L8 is still ineligible.
-        self.assertEqual(worker.next_layer_to_submit, 7)
-        worker.kv_recv_thread.add_request.assert_not_called()
-        worker._open_layerwise_get_sessions.assert_not_called()
-
-        worker.current_layer = 7
-        worker._submit_ready_layer_loads()
+        for current_layer in range(1, 8):
+            worker.current_layer = current_layer
+            worker._submit_ready_layer_loads()
 
         # At L7 the global window becomes [L7, L9), admitting only owner L8.
         self.assertEqual(worker.next_layer_to_submit, 9)
