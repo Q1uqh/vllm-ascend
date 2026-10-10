@@ -269,6 +269,41 @@ class TestKVPPPoolWorker(unittest.TestCase):
         worker._submit_ready_layer_loads()
         worker._open_layerwise_get_sessions.assert_called_once()
 
+    def test_kvpp_prefetch_never_runs_ahead_of_forward_window(self):
+        worker = make_worker(
+            self,
+            tp_size=4,
+            num_layers=16,
+            use_layerwise=True,
+            use_mla=True,
+            use_kvpp=True,
+            extra_config={"layerwise_prefetch_layers": 2},
+        )
+        worker.kv_recv_thread = MagicMock()
+        worker.current_layer = 0
+        worker.next_layer_to_submit = 0
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[] for _ in range(16)]
+        # Model the third KVPP rank: its persistent cache starts at layer 8.
+        for layer_id in range(8, 12):
+            worker.layer_load_tasks[layer_id] = [MagicMock()]
+        worker._open_pending_layerwise_get_sessions = MagicMock()
+
+        submitted: list[int] = []
+        for forward_layer in range(16):
+            worker.current_layer = forward_layer
+            worker._submit_ready_layer_loads()
+            new_requests = worker.kv_recv_thread.add_request.call_args_list[len(submitted) :]
+            submitted.extend(call.args[0].layer_id for call in new_requests)
+
+            # A depth of two means [current, current + 2).  In particular,
+            # owner layer 8 cannot be queued while forward is still near L0.
+            self.assertTrue(all(layer_id < forward_layer + 2 for layer_id in submitted))
+            if forward_layer < 7:
+                self.assertEqual(submitted, [])
+
+        self.assertEqual(submitted, [8, 9, 10, 11])
+
 
 class _SparseSWAHitManager:
     """SWA manager: right-to-left search for a cached aligned segment tail."""

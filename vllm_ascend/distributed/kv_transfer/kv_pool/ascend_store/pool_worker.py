@@ -2555,10 +2555,7 @@ class KVPoolWorker:
             # ``num_prefetch_layers`` includes the current layer.  Its value
             # comes from the user's ``layerwise_prefetch_layers`` setting when
             # provided; otherwise the generic layerwise layout default applies.
-            target_layer = min(
-                self.current_layer + self.num_prefetch_layers,
-                self.num_layers,
-            )
+            target_layer = self._kvpp_prefetch_window_end()
             while self.next_layer_to_submit < target_layer:
                 layer_id = self.next_layer_to_submit
                 self.next_layer_to_submit += 1
@@ -2574,6 +2571,20 @@ class KVPoolWorker:
             self.next_layer_to_submit += 1
             if submit_layer_load(layer_id):
                 submitted_layers += 1
+
+    def _kvpp_prefetch_window_end(self) -> int:
+        """Return the exclusive end of KVPP's global layer window.
+
+        Layerwise without KVPP counts submitted model layers.  KVPP ranks,
+        however, have sparse owner-local task lists.  Counting non-empty tasks
+        would let a later owner rank skip all preceding model layers and queue
+        most of its partition before forward reaches it.  Advancing by global
+        layer ordinal preserves the same rolling window on every KVPP rank and
+        does not require another cache buffer.
+        """
+        if self.num_prefetch_layers < 1:
+            raise RuntimeError("layerwise prefetch depth must be positive")
+        return min(self.current_layer + self.num_prefetch_layers, self.num_layers)
 
     def wait_for_layer_load_ready(self, layer_name: str) -> None:
         """Observe load completion without advancing the attention-side schedule."""
