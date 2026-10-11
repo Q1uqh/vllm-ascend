@@ -1184,6 +1184,7 @@ class LayerRangeReqMeta:
     all_sizes: list[list[int]]
     all_offsets: list[list[int]]
     load_keys: list[str] = field(default_factory=list)
+    key_req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1205,6 +1206,7 @@ class SharedBlockData:
     block_keys: list[str] | None = None
     save_keys: list[str] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
+    key_req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

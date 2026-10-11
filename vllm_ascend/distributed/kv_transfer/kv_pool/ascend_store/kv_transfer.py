@@ -5,7 +5,7 @@ import json
 import queue
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -74,7 +74,19 @@ def _emit_range_debug_event(
     try:
         if not envs.VLLM_ASCEND_KVPOOL_RANGE_DEBUG:
             return
-        payload = _build_range_debug_payload(direction, layer_id, sizes, object_offsets, results)
+        failed = [(index, int(result)) for index, result in enumerate(results) if result < 0]
+        if not failed:
+            return
+        payload = {
+            "event": "range_failure",
+            "direction": direction,
+            "layer_id": int(layer_id),
+            "key_count": len(results),
+            "failed_count": len(failed),
+            "result_codes": dict(Counter(result for _, result in failed)),
+            "failed_indices_sample": [index for index, _ in failed[:16]],
+            "total_bytes": sum(sum(int(size) for size in row) for row in sizes),
+        }
         logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
     except Exception:
         # Debug instrumentation must never affect the transfer path.
@@ -85,11 +97,15 @@ def _emit_commit_debug_event(layer_id: int, key_count: int, results: list[int]) 
     try:
         if not envs.VLLM_ASCEND_KVPOOL_RANGE_DEBUG:
             return
+        failures = [int(result) for result in results if result < 0]
+        if not failures:
+            return
         payload = {
-            "event": "commit",
+            "event": "commit_failure",
             "layer_id": int(layer_id),
             "key_count": int(key_count),
-            "results": [int(result) for result in results],
+            "failed_count": len(failures),
+            "result_codes": dict(Counter(failures)),
         }
         logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
     except Exception:
@@ -385,6 +401,7 @@ class LayerBatchBuilder:
         """Build block-key rows shared by all backend layer ranges."""
         block_ids: list[int] = []
         block_keys: list[str] = []
+        key_req_ids: list[str] = []
         req_ids: list[str] = []
         is_last_chunks: list[bool | None] = []
         all_load_keys: list[str] = []
@@ -425,6 +442,7 @@ class LayerBatchBuilder:
                     continue
                 block_ids.append(block_id)
                 block_keys.append(key)
+                key_req_ids.append(request.req_id)
                 if is_save:
                     seen_save_keys.add(key)
 
@@ -435,6 +453,7 @@ class LayerBatchBuilder:
                 if last_block_key is not None and (not is_save or last_block_key not in seen_save_keys):
                     block_ids.append(request_block_ids[partial_block_index])
                     block_keys.append(last_block_key)
+                    key_req_ids.append(request.req_id)
                     if is_save:
                         seen_save_keys.add(last_block_key)
 
@@ -445,6 +464,7 @@ class LayerBatchBuilder:
             req_ids=req_ids,
             is_last_chunks=is_last_chunks,
             load_keys=all_load_keys,
+            key_req_ids=key_req_ids,
         )
 
     def build_addrs(
@@ -477,6 +497,7 @@ class LayerBatchBuilder:
                 all_sizes=[sizes.copy() for _ in shared.block_ids_arr],
                 all_offsets=[offsets.copy() for _ in shared.block_ids_arr],
                 load_keys=shared.load_keys,
+                key_req_ids=shared.key_req_ids,
             )
 
         assert shared.block_gvas_arr is not None
@@ -1982,6 +2003,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             active_sizes = [req_meta.all_sizes[index] for index in active_indices]
             active_offsets = [req_meta.all_offsets[index] for index in active_indices]
             results: list[int] = []
+            failed_batches: list[dict[str, object]] = []
+            batch_count = 0
             if layer_id < 4:
                 emit_timeline_event(
                     "layerwise_hixl_range_get_begin",
@@ -1997,22 +2020,52 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
             ):
-                results.extend(
-                    require_aligned_batch_results(
-                        "batch_copy_get",
-                        keys,
-                        self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
-                    )
+                batch_results = require_aligned_batch_results(
+                    "batch_copy_get",
+                    keys,
+                    self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
                 )
+                batch_failures = [result for result in batch_results if result < 0]
+                if batch_failures:
+                    failed_batches.append(
+                        {
+                            "batch": batch_count,
+                            "key_count": len(keys),
+                            "total_bytes": sum(sum(int(size) for size in row) for row in sizes),
+                            "failed_count": len(batch_failures),
+                            "result_codes": dict(Counter(batch_failures)),
+                        }
+                    )
+                results.extend(batch_results)
+                batch_count += 1
             if layer_id < 4:
                 emit_timeline_event(
                     "layerwise_hixl_range_get_end",
                     layer_id=layer_id,
                     result_count=len(results),
                 )
-            _emit_range_debug_event("load", layer_id, active_sizes, active_offsets, results)
             failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
             if failed_indices:
+                failed_block_ids = [req_meta.block_ids[index] for index in failed_indices]
+                failed_req_ids = (
+                    sorted({req_meta.key_req_ids[index] for index in failed_indices})
+                    if len(req_meta.key_req_ids) == len(req_meta.keys)
+                    else req_meta.req_ids
+                )
+                logger.warning(
+                    "[KVPOOL_LOAD_FAILURE] layer=%d keys=%d batches=%d "
+                    "failed=%d codes=%s failed_batches=%s requests=%s "
+                    "block_ids_sample=%s indices_sample=%s",
+                    layer_id,
+                    len(active_keys),
+                    batch_count,
+                    len(failed_indices),
+                    dict(Counter(result for result in results if result < 0)),
+                    failed_batches[:8],
+                    failed_req_ids[:8],
+                    failed_block_ids[:16],
+                    failed_indices[:16],
+                )
                 self._mark_invalid_range_indices(req_meta, failed_indices)
                 self._active_load_indices.difference_update(failed_indices)
 

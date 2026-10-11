@@ -90,6 +90,7 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
         assert isinstance(result, LayerRangeReqMeta)
         self.assertEqual(result.keys, ["key"])
         self.assertEqual(result.block_ids, [2])
+        self.assertEqual(result.key_req_ids, ["r1"])
         self.assertEqual(result.all_buffers, [[3600]])
         self.assertEqual(result.all_sizes, [[30]])
         self.assertEqual(result.all_offsets, [[30]])
