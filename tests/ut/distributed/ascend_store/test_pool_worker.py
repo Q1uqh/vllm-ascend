@@ -312,7 +312,9 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.num_prefetch_layers = 2
         worker.next_layer_to_submit = 0
         worker.use_kvpp = True
-        worker.use_layerwise_transfer = True
+        worker.use_layerwise = True
+        worker.use_layerwise_transfer = False
+        worker.use_block_key_layerwise = True
         worker.block_key_hybrid = True
         worker.prefetch_layer_map = {}
         worker.layer_load_tasks = [[] for _ in range(worker.num_layers)]
@@ -335,7 +337,9 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.num_prefetch_layers = 2
         worker.next_layer_to_submit = 10
         worker.use_kvpp = True
-        worker.use_layerwise_transfer = True
+        worker.use_layerwise = True
+        worker.use_layerwise_transfer = False
+        worker.use_block_key_layerwise = True
         worker.block_key_hybrid = True
         worker.prefetch_layer_map = {}
         worker.layer_load_tasks = [[] for _ in range(worker.num_layers)]
@@ -352,6 +356,29 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         request = worker.kv_recv_thread.add_request.call_args.args[0]
         self.assertEqual(request.layer_id, 10)
         self.assertIs(request.attention_start_gate, get_gate.return_value)
+
+    def test_kvpp_block_key_keeps_load_ready_event_for_broadcast_waiter(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        ready = threading.Event()
+        ready.set()
+        worker.current_layer = 0
+        worker.num_layers = 1
+        worker.layer_load_tasks = [[]]
+        worker.prefetch_layer_map = {}
+        worker.layer_load_finished_events = [ready]
+        worker.kv_recv_thread = MagicMock()
+        worker.external_slot_release_waiter = None
+        worker._submit_ready_layer_loads = MagicMock()
+        worker.use_kvpp = True
+        worker.use_layerwise = True
+        worker.use_layerwise_transfer = False
+        worker.use_block_key_layerwise = False
+        worker.block_key_hybrid = False
+
+        worker.wait_for_layer_load()
+
+        self.assertTrue(ready.is_set())
 
     def test_find_all_discontinuous_hit_positions_all_tp_hits(self):
         cls = self._make_worker_class()

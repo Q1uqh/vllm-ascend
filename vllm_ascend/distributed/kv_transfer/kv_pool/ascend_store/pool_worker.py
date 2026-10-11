@@ -1046,7 +1046,7 @@ class KVPoolWorker:
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
             self.next_layer_to_submit = 0
-            if self.use_kvpp and self.use_layerwise_transfer:
+            if self.use_kvpp and self.use_layerwise:
                 assert self.layer_load_finished_events is not None
                 for event in self.layer_load_finished_events:
                     event.clear()
@@ -2471,7 +2471,7 @@ class KVPoolWorker:
     def _submit_ready_layer_loads(self) -> None:
         assert self.kv_recv_thread is not None
         recv_thread = self.kv_recv_thread
-        use_global_kvpp_window = self.use_kvpp and self.use_layerwise_transfer
+        use_global_kvpp_window = self.use_kvpp and self.use_layerwise
         window_end = (
             min(self.current_layer + self.num_prefetch_layers, self.num_layers - 1)
             if use_global_kvpp_window
@@ -2584,7 +2584,7 @@ class KVPoolWorker:
                 self._finish_current_layerwise_load_sessions()
             raise
         # KVPP also observes this signal; clear it when the next step starts.
-        if not (self.use_kvpp and self.use_layerwise_transfer):
+        if not (self.use_kvpp and self.use_layerwise):
             self.layer_load_finished_events[self.current_layer].clear()
         if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
             # The final model layer can have no reachable load rows. Completion
