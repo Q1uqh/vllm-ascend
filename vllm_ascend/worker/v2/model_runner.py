@@ -69,6 +69,7 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.timeline import emit_timeline_event
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_utils import (
     bypass_upstream_spec_pp_guard,
@@ -300,6 +301,7 @@ class NPUModelRunner(GPUModelRunner):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ):
+        emit_timeline_event("model_execute_begin", dummy_run=dummy_run, is_profile=is_profile)
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
@@ -316,6 +318,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
         with pcp_dispatch_context():
+            emit_timeline_event("model_super_execute_begin")
             output = super().execute_model(
                 scheduler_output,
                 intermediate_tensors=intermediate_tensors,
@@ -325,8 +328,10 @@ class NPUModelRunner(GPUModelRunner):
                 context_len=context_len,
                 **({} if vllm_version_is("0.29.0") else {"valid_dummy_state_slots": valid_dummy_state_slots}),
             )
+            emit_timeline_event("model_super_execute_end")
         self.model_state.kvpp_is_dummy_run = False
         self.kvpp.complete_forward()
+        emit_timeline_event("model_execute_end")
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,

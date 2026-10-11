@@ -22,6 +22,8 @@ from contextlib import contextmanager
 
 import torch
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.timeline import emit_timeline_event
+
 _lock = threading.RLock()
 _attention_compute_start_gate: AttentionComputeStartGate | None = None
 
@@ -46,6 +48,7 @@ class AttentionComputeStartGate:
         self,
         stream: torch.npu.Stream | None = None,
     ) -> None:
+        emit_timeline_event("attention_gate_record_begin", gate_id=id(self))
         stream = stream or torch.npu.current_stream()
         event = torch.npu.Event()
         event.record(stream)
@@ -53,6 +56,7 @@ class AttentionComputeStartGate:
             if self._event is None:
                 self._event = event
                 self._condition.notify_all()
+                emit_timeline_event("attention_gate_recorded", gate_id=id(self))
                 if self.on_start is not None:
                     self.on_start()
 
@@ -63,13 +67,16 @@ class AttentionComputeStartGate:
         self.record()
 
     def wait(self, timeout: float = 10.0) -> bool:
+        emit_timeline_event("attention_gate_wait_begin", gate_id=id(self))
         with self._condition:
             while self._event is None:
                 if not self._condition.wait(timeout=timeout):
+                    emit_timeline_event("attention_gate_wait_timeout", gate_id=id(self))
                     return False
             event = self._event
 
         event.synchronize()
+        emit_timeline_event("attention_gate_wait_end", gate_id=id(self))
         return True
 
 
@@ -84,6 +91,7 @@ def reset_attention_compute_start_gate() -> AttentionComputeStartGate:
     gate = AttentionComputeStartGate()
     with _lock:
         _attention_compute_start_gate = gate
+    emit_timeline_event("attention_gate_created", gate_id=id(gate))
     return gate
 
 
