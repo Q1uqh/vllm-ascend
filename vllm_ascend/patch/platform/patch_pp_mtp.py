@@ -25,6 +25,7 @@ before consuming the older output, so updating ``request.spec_token_ids`` from
 from __future__ import annotations
 
 import copy
+import os
 from functools import wraps
 from itertools import chain
 
@@ -32,6 +33,136 @@ from vllm.logger import logger
 
 _PATCHED = False
 _PP_IN_FLIGHT_STEP = 1 << 60
+
+
+def _async_placeholder_debug_enabled() -> bool:
+    return os.getenv("VLLM_ASYNC_PLACEHOLDER_DEBUG", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _trace_async_placeholder(scheduler, event: str, request, **fields) -> None:
+    if not _async_placeholder_debug_enabled():
+        return
+    budgets = getattr(scheduler, "_ascend_placeholder_trace_budgets", None)
+    if budgets is None:
+        budgets = {}
+        scheduler._ascend_placeholder_trace_budgets = budgets
+    req_id = request.request_id
+    budget = budgets.get(req_id, 0)
+    if event != "underflow" and budget <= 0:
+        return
+    if event != "underflow":
+        budgets[req_id] = budget - 1
+    state = {
+        "event": event,
+        "req_id": req_id,
+        "placeholders": request.num_output_placeholders,
+        "in_flight": request.num_in_flight_tokens,
+        "stale": request.num_stale_output_tokens,
+        "drop_stale": request.drop_stale_output,
+        "computed": request.num_computed_tokens,
+        **fields,
+    }
+    logger.info("[ASYNC_PLACEHOLDER_DEBUG] %s", state)
+
+
+def _patch_async_placeholder_debug() -> None:
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(AsyncScheduler._update_after_schedule, "_vllm_ascend_placeholder_debug", False):
+        return
+
+    original_handle_invalid = Scheduler._handle_invalid_blocks
+
+    @wraps(original_handle_invalid)
+    def _debug_handle_invalid(self, invalid_block_ids, num_scheduled_tokens):
+        before = {
+            request.request_id: (
+                request.num_output_placeholders,
+                request.num_in_flight_tokens,
+                request.num_stale_output_tokens,
+                request.num_computed_tokens,
+            )
+            for request in chain(self.running, self.skipped_waiting)
+        }
+        failed_before = set(self.failed_recving_kv_req_ids)
+        affected = original_handle_invalid(self, invalid_block_ids, num_scheduled_tokens)
+        async_affected = set(self.failed_recving_kv_req_ids) - failed_before
+        if _async_placeholder_debug_enabled():
+            budgets = getattr(self, "_ascend_placeholder_trace_budgets", None)
+            if budgets is None:
+                budgets = {}
+                self._ascend_placeholder_trace_budgets = budgets
+            for req_id in affected | async_affected:
+                request = self.requests.get(req_id)
+                if request is None:
+                    continue
+                budgets[req_id] = 32
+                _trace_async_placeholder(
+                    self,
+                    "kv_recovery",
+                    request,
+                    before=before.get(req_id),
+                    scheduled=num_scheduled_tokens.get(req_id, 0),
+                    async_failure=req_id in async_affected,
+                    invalid_blocks=len(invalid_block_ids),
+                )
+        return affected
+
+    Scheduler._handle_invalid_blocks = _debug_handle_invalid
+
+    original_after_schedule = AsyncScheduler._update_after_schedule
+
+    @wraps(original_after_schedule)
+    def _debug_after_schedule(self, scheduler_output):
+        before = {
+            req_id: self.requests[req_id].num_output_placeholders
+            for req_id in scheduler_output.num_scheduled_tokens
+            if req_id in self.requests
+        }
+        original_after_schedule(self, scheduler_output)
+        for req_id, placeholder_before in before.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            _trace_async_placeholder(
+                self,
+                "schedule",
+                request,
+                before=placeholder_before,
+                added=request.num_output_placeholders - placeholder_before,
+                scheduled=scheduler_output.num_scheduled_tokens[req_id],
+                draft=len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())),
+            )
+
+    _debug_after_schedule._vllm_ascend_placeholder_debug = True  # type: ignore[attr-defined]
+    AsyncScheduler._update_after_schedule = _debug_after_schedule
+
+    original_update_request = AsyncScheduler._update_request_with_output
+
+    @wraps(original_update_request)
+    def _debug_update_request(self, request, new_token_ids, is_stale=False):
+        placeholder_before = request.num_output_placeholders
+        expected_after = placeholder_before if is_stale else placeholder_before - len(new_token_ids)
+        event = "underflow" if expected_after < 0 else "output"
+        _trace_async_placeholder(
+            self,
+            event,
+            request,
+            before=placeholder_before,
+            generated=len(new_token_ids),
+            expected_after=expected_after,
+            is_stale=is_stale,
+        )
+        return original_update_request(self, request, new_token_ids, is_stale=is_stale)
+
+    _debug_update_request._vllm_ascend_placeholder_debug = True  # type: ignore[attr-defined]
+    AsyncScheduler._update_request_with_output = _debug_update_request
 
 
 def _is_pd_prefill_node(vllm_config) -> bool:
@@ -343,6 +474,7 @@ def _apply_patch() -> None:
     _patch_scheduler_update_after_schedule()
     _patch_scheduler_make_cached_request_data()
     _patch_scheduler_update_from_output()
+    _patch_async_placeholder_debug()
     _patch_model_config_validation()
 
 
