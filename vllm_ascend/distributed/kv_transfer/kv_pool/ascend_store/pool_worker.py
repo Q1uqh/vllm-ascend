@@ -2471,6 +2471,16 @@ class KVPoolWorker:
     def _submit_ready_layer_loads(self) -> None:
         assert self.kv_recv_thread is not None
         recv_thread = self.kv_recv_thread
+        use_global_kvpp_window = self.use_kvpp and self.use_layerwise_transfer
+        window_end = (
+            min(self.current_layer + self.num_prefetch_layers, self.num_layers - 1)
+            if use_global_kvpp_window
+            else None
+        )
+        first_local_load_layer = next(
+            (layer_id for layer_id, tasks in enumerate(self.layer_load_tasks) if tasks),
+            None,
+        )
 
         def submit_layer_load(layer_id: int) -> bool:
             reuse_source = self.prefetch_layer_map.get(layer_id)
@@ -2487,15 +2497,29 @@ class KVPoolWorker:
                     attention_start_gate=attention_start_gate,
                 )
             )
-            if layer_id < 4:
+            if layer_id < 4 or layer_id == first_local_load_layer:
                 emit_timeline_event(
                     "layerwise_load_enqueued",
                     layer_id=layer_id,
                     current_layer=self.current_layer,
+                    window_end=window_end,
                     task_count=len(self.layer_load_tasks[layer_id]),
                     gated=attention_start_gate is not None,
                 )
             return True
+
+        if use_global_kvpp_window:
+            # KVPP shards physical layers across TP ranks. Advancing by the
+            # number of local tasks lets each rank skip non-owned layers and
+            # prematurely fill its quota with distant layers (10, 20, ... at
+            # model layer 0). Advance every rank through the same global
+            # layer-number window; only the owner enqueues work inside it.
+            assert window_end is not None
+            while self.next_layer_to_submit <= window_end:
+                layer_id = self.next_layer_to_submit
+                self.next_layer_to_submit += 1
+                submit_layer_load(layer_id)
+            return
 
         submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
         if getattr(self, "block_key_hybrid", False):

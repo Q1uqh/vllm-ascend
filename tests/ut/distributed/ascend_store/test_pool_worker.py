@@ -304,6 +304,55 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
 
         worker.external_slot_release_waiter.assert_called_once_with(0)
 
+    def test_kvpp_layerwise_prefetch_uses_global_layer_window(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.current_layer = 0
+        worker.num_layers = 32
+        worker.num_prefetch_layers = 2
+        worker.next_layer_to_submit = 0
+        worker.use_kvpp = True
+        worker.use_layerwise_transfer = True
+        worker.block_key_hybrid = True
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[] for _ in range(worker.num_layers)]
+        worker.layer_load_tasks[10] = [MagicMock()]
+        worker.layer_load_tasks[11] = [MagicMock()]
+        worker.kv_recv_thread = MagicMock()
+
+        # At model layer 0 the global window is [0, 2]. This rank owns no
+        # layer in that range, so it must not skip ahead to layers 10 and 11.
+        worker._submit_ready_layer_loads()
+
+        self.assertEqual(worker.next_layer_to_submit, 3)
+        worker.kv_recv_thread.add_request.assert_not_called()
+
+    def test_kvpp_layerwise_opens_owner_layer_at_global_boundary(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.current_layer = 8
+        worker.num_layers = 32
+        worker.num_prefetch_layers = 2
+        worker.next_layer_to_submit = 10
+        worker.use_kvpp = True
+        worker.use_layerwise_transfer = True
+        worker.block_key_hybrid = True
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[] for _ in range(worker.num_layers)]
+        worker.layer_load_tasks[10] = [MagicMock()]
+        worker.layer_load_tasks[11] = [MagicMock()]
+        worker.kv_recv_thread = MagicMock()
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_attention_compute_start_gate"
+        ) as get_gate:
+            worker._submit_ready_layer_loads()
+
+        self.assertEqual(worker.next_layer_to_submit, 11)
+        request = worker.kv_recv_thread.add_request.call_args.args[0]
+        self.assertEqual(request.layer_id, 10)
+        self.assertIs(request.attention_start_gate, get_gate.return_value)
+
     def test_find_all_discontinuous_hit_positions_all_tp_hits(self):
         cls = self._make_worker_class()
         arr = [[0, 0, 1, 0, 0, 1], [0, 0, 1, 0, 0, 1]]
