@@ -126,6 +126,17 @@ class KVPPScheduler:
             self._wait_for_load(layer_name)
             if self._trace_this_forward and layer_name in self._traced_layers:
                 emit_timeline_event("kvpp_wait_load_ready_end", layer_name=layer_name)
+        if self.layerwise:
+            # A transfer-stream wait orders device execution, but it does not
+            # delay this executor thread's host-side HCCL collective launch.
+            # Ensure every rank has completed the main-stream work preceding
+            # this layer before submitting the KVPP broadcast, otherwise ranks
+            # can enqueue collectives in different communicator orders.
+            # Later-layer events are recorded before their attention compute,
+            # so the intended prefetch/compute overlap remains intact.
+            cache_ready.synchronize()
+            if self._trace_this_forward and layer_name in self._traced_layers:
+                emit_timeline_event("kvpp_collective_ready", layer_name=layer_name)
         if self._trace_this_forward and layer_name in self._traced_layers:
             emit_timeline_event("kvpp_broadcast_begin", layer_name=layer_name)
         self.transport.prefetch(layer_name, cache_ready, self._kv_transfer_stream)

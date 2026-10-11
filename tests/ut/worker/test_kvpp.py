@@ -25,6 +25,7 @@ def scheduler_device(monkeypatch):
     def make_event():
         event = Mock()
         event.record.side_effect = lambda stream: events.append(("ready", event, stream))
+        event.synchronize.side_effect = lambda: events.append(("synchronize", event))
         return event
 
     monkeypatch.setattr(kvpp.torch.npu, "current_device", lambda: 3)
@@ -122,3 +123,23 @@ def test_hook_propagates_failed_future_without_scheduling_next(scheduler_device)
         scheduler.wait_for_layer(layer_name(0))
     assert raised.value is error
     assert len(scheduler._prefetch_executor.submitted) == 1
+
+
+def test_layerwise_synchronizes_producer_before_collective(scheduler_device):
+    events, _compute, transfer = scheduler_device
+    transport = Mock()
+    transport.prefetch.side_effect = lambda name, ready, stream: events.append(("prefetch", name, ready, stream))
+    name = layer_name(0)
+    scheduler = kvpp.KVPPScheduler(transport, (name,), layerwise=True)
+    scheduler._wait_for_load = lambda layer: events.append(("load_ready", layer))
+
+    scheduler.schedule_forward(True)
+    scheduler.wait_for_layer(name)
+
+    ready = transport.prefetch.call_args.args[1]
+    assert events[-4:] == [
+        ("device", 3),
+        ("load_ready", name),
+        ("synchronize", ready),
+        ("prefetch", name, ready, transfer),
+    ]

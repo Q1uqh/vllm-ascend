@@ -1546,7 +1546,7 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
 
         if data.attention_start_gate is not None:
             while not data.attention_start_gate.wait(timeout=10):
-                logger.info("Layerwise %d load waits for attention compute start", layer_id)
+                logger.debug("Layerwise %d load waits for attention compute start", layer_id)
 
         key_list = []
         addr_list = []
@@ -2038,7 +2038,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
             if data.attention_start_gate is not None:
                 while not data.attention_start_gate.wait(timeout=10):
-                    logger.info("Layerwise %d load waits for attention compute start", layer_id)
+                    logger.debug("Layerwise %d load waits for attention compute start", layer_id)
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
             for task in data.transfer_tasks:
@@ -2145,7 +2145,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         if attention_start_gate is not None:
             while not attention_start_gate.wait(timeout=10):
-                logger.info("Layerwise %d load waits for attention compute start", layer_id)
+                logger.debug("Layerwise %d load waits for attention compute start", layer_id)
 
         all_load_keys: list[str] = []
         all_req_ids: set[str] = set()
