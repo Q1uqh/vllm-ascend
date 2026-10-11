@@ -4,7 +4,6 @@ from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.core.kv_cache_placement import (
-    KVPP_SCRATCH_BUFFER_COUNT,
     build_kvpp_layer_layout,
     create_kvpp_cache_allocation_plan,
 )
@@ -30,7 +29,7 @@ def get_kvpp_cache_specs(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpe
 def allocate_kvpp_cache(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, device: torch.device
 ) -> dict[str, tuple[torch.Tensor, ...]]:
-    """Allocate contiguous layer bundles and two shared Target scratch buffers."""
+    """Allocate contiguous layer bundles and shared Target scratch buffers."""
     plan = create_kvpp_cache_allocation_plan(
         vllm_config, get_kvpp_cache_specs(kv_cache_config), get_kvpp_group().rank_in_group
     )
@@ -40,7 +39,9 @@ def allocate_kvpp_cache(
     }
     scratch_size = max((size for name, (_, size) in layouts.items() if name in plan.layer_owner_ranks), default=0)
     scratch = (
-        [_allocate_kvpp_buffer(scratch_size, device) for _ in range(KVPP_SCRATCH_BUFFER_COUNT)] if scratch_size else []
+        [_allocate_kvpp_buffer(scratch_size, device) for _ in range(plan.scratch_buffer_count)]
+        if scratch_size
+        else []
     )
     caches: dict[str, tuple[torch.Tensor, ...]] = {}
     target_index = 0
@@ -49,7 +50,7 @@ def allocate_kvpp_cache(
         if owner is None or owner == plan.kvpp_rank:
             buffer = _allocate_kvpp_buffer(size, device)
         else:
-            buffer = scratch[target_index % KVPP_SCRATCH_BUFFER_COUNT]
+            buffer = scratch[target_index % plan.scratch_buffer_count]
         for cache_name, parts in layout.items():
             caches[cache_name] = tuple(buffer.narrow(0, offset, length) for offset, length in parts)
         if owner is not None:

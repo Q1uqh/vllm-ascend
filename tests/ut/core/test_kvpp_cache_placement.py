@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -107,6 +108,22 @@ def test_physical_cost_per_rank(tp, rank, cost):
     plan = placement.create_kvpp_cache_allocation_plan(make_kvpp_config(tp), make_kvpp_specs(), rank)
     assert plan.get_num_blocks(cost - 1) == 0
     assert plan.get_num_blocks(cost) == 1
+
+
+def test_layerwise_scratch_count_matches_prefetch_window():
+    config = make_kvpp_config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="AscendStoreConnector",
+        kv_connector_extra_config={
+            "backend": "mooncake",
+            "use_layerwise": True,
+            "layerwise_prefetch_layers": 2,
+        },
+    )
+    plan = placement.create_kvpp_cache_allocation_plan(config, make_kvpp_specs(), 1)
+    assert plan.scratch_buffer_count == 3
+    assert plan.get_num_blocks(467) == 0
+    assert plan.get_num_blocks(468) == 1
 
 
 @pytest.mark.parametrize("available,blocks", [(0, 0), (391, 0), (392, 1), (1175, 2), (1176, 3)])

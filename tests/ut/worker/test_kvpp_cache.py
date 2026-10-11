@@ -46,3 +46,28 @@ def test_physical_allocations_and_scratch_aliases(monkeypatch, num_blocks, total
         part.fill_(value)
     for value, part in enumerate(parts, 1):
         assert torch.all(part == value)
+
+
+def test_layerwise_allocates_one_scratch_per_window_slot(monkeypatch):
+    monkeypatch.setattr(kvpp_cache, "get_kvpp_group", lambda: SimpleNamespace(rank_in_group=1))
+    config = make_kvpp_config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="AscendStoreConnector",
+        kv_connector_extra_config={
+            "backend": "mooncake",
+            "use_layerwise": True,
+            "layerwise_prefetch_layers": 2,
+        },
+    )
+    caches = kvpp_cache.allocate_kvpp_cache(
+        config,
+        make_cache_config(make_kvpp_specs(), num_blocks=3),
+        torch.device("cpu"),
+    )
+
+    def storage_id(index):
+        return caches[layer_name(index)][0].untyped_storage().data_ptr()
+
+    assert len({storage_id(index) for index in (9, 10, 11)}) == 3
+    assert storage_id(9) == storage_id(15)
+    assert storage_id(10) == storage_id(16)

@@ -134,6 +134,8 @@ def test_layerwise_synchronizes_producer_before_collective(scheduler_device):
     scheduler._wait_for_load = lambda layer: events.append(("load_ready", layer))
 
     scheduler.schedule_forward(True)
+    scheduler._schedule_through(0)
+    scheduler._prefetch_executor.run_next()
     scheduler.wait_for_layer(name)
 
     ready = transport.prefetch.call_args.args[1]
@@ -143,3 +145,23 @@ def test_layerwise_synchronizes_producer_before_collective(scheduler_device):
         ("synchronize", ready),
         ("prefetch", name, ready, transfer),
     ]
+
+
+def test_layerwise_queues_rolling_prefetch_window(scheduler_device):
+    names = tuple(layer_name(i) for i in range(5))
+    scheduler = kvpp.KVPPScheduler(Mock(), names, layerwise=True, prefetch_depth=2)
+    scheduler._wait_for_load = lambda _layer: None
+    executor = scheduler._prefetch_executor
+    scheduler.schedule_forward(True)
+
+    scheduler._schedule_through(2)
+    assert [args[0] for _, args in executor.submitted] == list(names[:3])
+    for _ in range(3):
+        executor.run_next()
+    scheduler.wait_for_layer(names[0])
+    assert len(executor.submitted) == 3
+
+    scheduler._schedule_through(3)
+    executor.run_next()
+    scheduler.wait_for_layer(names[1])
+    assert [args[0] for _, args in executor.submitted] == list(names[:4])

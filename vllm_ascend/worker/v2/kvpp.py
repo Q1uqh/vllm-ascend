@@ -64,6 +64,7 @@ class KVPPRuntime:
             transport=BroadcastKVPPTransport(group, plan.layer_owner_ranks, layer_buffers),
             attention_layer_names=tuple(layer_buffers),
             layerwise=is_layerwise_transfer_enabled(vllm_config.kv_transfer_config),
+            prefetch_depth=plan.scratch_buffer_count - 1,
         )
         for name in layer_buffers:
             static_forward_context[name].impl.layerwise_kv_cache_hook = scheduler
@@ -79,22 +80,36 @@ class KVPPRuntime:
 
 
 class KVPPScheduler:
-    """Prefetch one layer ahead; Target execution ordinal selects scratch."""
+    """Queue ordered KVPP broadcasts in a rolling per-layer window."""
 
     def __init__(
-        self, transport: BroadcastKVPPTransport, attention_layer_names: tuple[str, ...], *, layerwise: bool = False
+        self,
+        transport: BroadcastKVPPTransport,
+        attention_layer_names: tuple[str, ...],
+        *,
+        layerwise: bool = False,
+        prefetch_depth: int = 1,
     ) -> None:
+        if prefetch_depth < 1:
+            raise ValueError("prefetch_depth must be positive")
         self.layerwise = layerwise
+        self.prefetch_depth = prefetch_depth
         self._wait_for_load: Callable[[str], None] | None = None
         self.transport = transport
         self.attention_layer_names = attention_layer_names
         self._has_history = False
         self._next_attention_layer_index = 0
-        self._prefetch_future: Future[None] | None = None
+        self._next_layer_to_schedule = 0
+        self._prefetch_futures: dict[int, Future[None]] = {}
+        self._last_submitted_future: Future[None] | None = None
         self._npu_device_id = torch.npu.current_device()
         self._kv_transfer_stream = torch.npu.Stream()
         self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kvpp-prefetch")
-        self._traced_layers = frozenset(attention_layer_names[:4])
+        self._traced_layers = frozenset(
+            name
+            for index, name in enumerate(attention_layer_names)
+            if index % 10 == 0 or index == len(attention_layer_names) - 1
+        )
         self._remaining_trace_forwards = 2
         self._trace_this_forward = False
 
@@ -106,17 +121,48 @@ class KVPPScheduler:
                 "kvpp_schedule_forward",
                 has_history=has_history,
                 layerwise=self.layerwise,
+                prefetch_depth=self.prefetch_depth,
                 num_layers=len(self.attention_layer_names),
             )
         self._has_history = has_history
         self._next_attention_layer_index = 0
+        self._next_layer_to_schedule = 0
+        self._prefetch_futures.clear()
+        self._last_submitted_future = None
         if has_history and not self.layerwise:
-            self.start_layer_prefetch(self.attention_layer_names[0])
+            self._schedule_through(0)
 
-    def start_layer_prefetch(self, layer_name: str) -> None:
+    def _schedule_through(self, end_index: int) -> None:
+        last_index = min(end_index, len(self.attention_layer_names) - 1)
+        while self._next_layer_to_schedule <= last_index:
+            self.start_layer_prefetch(self._next_layer_to_schedule)
+
+    def start_layer_prefetch(self, layer_index: int) -> None:
+        layer_name = self.attention_layer_names[layer_index]
         cache_ready = torch.npu.Event()
         cache_ready.record(torch.npu.current_stream())
-        self._prefetch_future = self._prefetch_executor.submit(self.run_layer_prefetch, layer_name, cache_ready)
+        previous = self._last_submitted_future
+        future = self._prefetch_executor.submit(self._run_ordered_layer_prefetch, layer_name, cache_ready, previous)
+        self._prefetch_futures[layer_index] = future
+        self._last_submitted_future = future
+        self._next_layer_to_schedule = layer_index + 1
+        if self._trace_this_forward and layer_name in self._traced_layers:
+            emit_timeline_event(
+                "kvpp_broadcast_queued",
+                layer_name=layer_name,
+                layer_index=layer_index,
+                scratch_index=layer_index % (self.prefetch_depth + 1),
+            )
+
+    def _run_ordered_layer_prefetch(
+        self, layer_name: str, cache_ready: Any, previous: Future[None] | None
+    ) -> None:
+        # ThreadPoolExecutor keeps submission order. The explicit dependency
+        # additionally prevents later collectives from running after a failed
+        # layer, which would otherwise desynchronize KVPP ranks.
+        if previous is not None:
+            previous.result()
+        self.run_layer_prefetch(layer_name, cache_ready)
 
     def run_layer_prefetch(self, layer_name: str, cache_ready: Any) -> None:
         torch.npu.set_device(self._npu_device_id)
@@ -146,17 +192,39 @@ class KVPPScheduler:
     def wait_for_layer(self, layer_name: str) -> None:
         if not self._has_history:
             return
-        if self.layerwise and self._prefetch_future is None:
+        layer_index = self._next_attention_layer_index
+        expected_name = self.attention_layer_names[layer_index]
+        if layer_name != expected_name:
+            raise RuntimeError(f"KVPP layer order mismatch: expected {expected_name}, got {layer_name}")
+        if self.layerwise:
             # The connector's attention hook has now submitted this step's loads.
-            self._wait_for_load = get_kv_transfer_group().wait_for_layer_load_ready
-            self.start_layer_prefetch(layer_name)
-        assert self._prefetch_future is not None
-        self._prefetch_future.result()
-        self._prefetch_future = None
+            if self._wait_for_load is None:
+                self._wait_for_load = get_kv_transfer_group().wait_for_layer_load_ready
+            # At layer N, attention for N-1 is complete. Its scratch slot can
+            # therefore be reused safely for N+prefetch_depth.
+            self._schedule_through(layer_index + self.prefetch_depth)
+        else:
+            self._schedule_through(layer_index)
+        future = self._prefetch_futures[layer_index]
+        if self._trace_this_forward and layer_name in self._traced_layers:
+            emit_timeline_event("kvpp_attention_wait_begin", layer_name=layer_name, layer_index=layer_index)
+        try:
+            future.result()
+        except BaseException:
+            for pending in self._prefetch_futures.values():
+                pending.cancel()
+            self._prefetch_futures.clear()
+            raise
+        if self._trace_this_forward and layer_name in self._traced_layers:
+            emit_timeline_event("kvpp_attention_wait_end", layer_name=layer_name, layer_index=layer_index)
+        del self._prefetch_futures[layer_index]
         self._next_attention_layer_index += 1
-        if self._next_attention_layer_index < len(self.attention_layer_names):
-            self.start_layer_prefetch(self.attention_layer_names[self._next_attention_layer_index])
+        if not self.layerwise and self._next_attention_layer_index < len(self.attention_layer_names):
+            self._schedule_through(self._next_attention_layer_index)
 
     def complete_forward(self) -> None:
         self._has_history = False
         self._next_attention_layer_index = 0
+        self._next_layer_to_schedule = 0
+        self._prefetch_futures.clear()
+        self._last_submitted_future = None

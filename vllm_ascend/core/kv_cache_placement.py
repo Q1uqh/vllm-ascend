@@ -16,8 +16,48 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSF
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor, enable_sfa
 
-# One buffer for the current layer and one for the next layer's prefetch.
+# Default for non-layerwise KVPP: one buffer for the current layer and one for
+# the next layer's prefetch. Layerwise KVPP derives this from its prefetch
+# depth so every prefetched broadcast has a distinct destination.
 KVPP_SCRATCH_BUFFER_COUNT = 2
+
+
+def get_kvpp_scratch_buffer_count(vllm_config: VllmConfig) -> int:
+    """Return current-layer plus layerwise-prefetch scratch slots."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return KVPP_SCRATCH_BUFFER_COUNT
+    connector_name = getattr(kv_transfer_config, "kv_connector", None)
+    root_extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if connector_name in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
+        connector_extras = [root_extra]
+    elif connector_name == "MultiConnector":
+        connector_extras = [
+            connector.get("kv_connector_extra_config") or {}
+            for connector in root_extra.get("connectors", [])
+            if isinstance(connector, dict)
+            and connector.get("kv_connector") in ("AscendStoreConnector", "MooncakeConnectorStoreV1")
+        ]
+    else:
+        return KVPP_SCRATCH_BUFFER_COUNT
+
+    depths: list[int] = []
+    for extra in connector_extras:
+        if not bool(extra.get("use_layerwise", False)):
+            continue
+        value = extra.get("layerwise_prefetch_layers", 2)
+        if isinstance(value, bool):
+            raise ValueError("layerwise_prefetch_layers must be a positive integer")
+        try:
+            depth = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("layerwise_prefetch_layers must be a positive integer") from exc
+        if depth <= 0:
+            raise ValueError("layerwise_prefetch_layers must be a positive integer")
+        depths.append(depth)
+    if not depths:
+        return KVPP_SCRATCH_BUFFER_COUNT
+    return max(depths) + 1
 
 
 @dataclass(frozen=True)
@@ -29,6 +69,7 @@ class KVPPPhysicalCachePlan:
     layer_bundles: dict[str, tuple[str, ...]]
     tensor_sizes: dict[str, tuple[int, ...]]
     kvpp_rank: int
+    scratch_buffer_count: int = KVPP_SCRATCH_BUFFER_COUNT
 
     def get_num_blocks(self, available_bytes: int) -> int:
         persistent_bytes = 0
@@ -40,7 +81,7 @@ class KVPPPhysicalCachePlan:
                 persistent_bytes += size
             if owner is not None:
                 scratch_bytes = max(scratch_bytes, size)
-        bytes_per_block = persistent_bytes + KVPP_SCRATCH_BUFFER_COUNT * scratch_bytes
+        bytes_per_block = persistent_bytes + self.scratch_buffer_count * scratch_bytes
         return available_bytes // bytes_per_block if bytes_per_block else 0
 
 
@@ -177,4 +218,5 @@ def create_kvpp_cache_allocation_plan(
         layer_bundles=build_layer_cache_bundles(logical_spec),
         tensor_sizes=build_kvpp_buffer_sizes(vllm_config, logical_spec),
         kvpp_rank=kvpp_rank,
+        scratch_buffer_count=get_kvpp_scratch_buffer_count(vllm_config),
     )
