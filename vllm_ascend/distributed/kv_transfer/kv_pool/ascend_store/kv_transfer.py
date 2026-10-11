@@ -1982,12 +1982,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             active_sizes = [req_meta.all_sizes[index] for index in active_indices]
             active_offsets = [req_meta.all_offsets[index] for index in active_indices]
             results: list[int] = []
-            emit_timeline_event(
-                "layerwise_hixl_range_get_begin",
-                layer_id=layer_id,
-                key_count=len(active_keys),
-                total_bytes=sum(sum(int(size) for size in sizes) for sizes in active_sizes),
-            )
+            if layer_id < 4:
+                emit_timeline_event(
+                    "layerwise_hixl_range_get_begin",
+                    layer_id=layer_id,
+                    key_count=len(active_keys),
+                    total_bytes=sum(sum(int(size) for size in sizes) for sizes in active_sizes),
+                )
             for keys, buffers, sizes, offsets in self._range_transfer_batches(
                 active_keys,
                 active_buffers,
@@ -2003,11 +2004,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                         self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
                     )
                 )
-            emit_timeline_event(
-                "layerwise_hixl_range_get_end",
-                layer_id=layer_id,
-                result_count=len(results),
-            )
+            if layer_id < 4:
+                emit_timeline_event(
+                    "layerwise_hixl_range_get_end",
+                    layer_id=layer_id,
+                    result_count=len(results),
+                )
             _emit_range_debug_event("load", layer_id, active_sizes, active_offsets, results)
             failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
             if failed_indices:
@@ -2022,14 +2024,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
-        emit_timeline_event(
-            "layerwise_recv_dequeue",
-            layer_id=layer_id,
-            task_count=len(data.transfer_tasks),
-            gated=data.attention_start_gate is not None,
-            gate_id=id(data.attention_start_gate) if data.attention_start_gate is not None else None,
-            range_mode=True,
-        )
         try:
             wait_for_save = data.wait_for_save_layer
             if wait_for_save is not None:
@@ -2098,13 +2092,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
         attention_start_gate = data.attention_start_gate
-        emit_timeline_event(
-            "layerwise_recv_dequeue",
-            layer_id=layer_id,
-            task_count=len(transfer_tasks),
-            gated=attention_start_gate is not None,
-            gate_id=id(attention_start_gate) if attention_start_gate is not None else None,
-        )
 
         if wait_for_save is not None:
             while not self.layer_save_finished_events[wait_for_save].wait(timeout=10):
@@ -2157,10 +2144,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             return
 
         if attention_start_gate is not None:
-            emit_timeline_event("layerwise_recv_gate_wait_begin", layer_id=layer_id)
             while not attention_start_gate.wait(timeout=10):
                 logger.info("Layerwise %d load waits for attention compute start", layer_id)
-            emit_timeline_event("layerwise_recv_gate_wait_end", layer_id=layer_id)
 
         all_load_keys: list[str] = []
         all_req_ids: set[str] = set()
@@ -2185,12 +2170,13 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
         if self.external_slot_release_waiter is not None:
             self.external_slot_release_waiter(layer_id)
-        emit_timeline_event(
-            "layerwise_hixl_batch_get_begin",
-            layer_id=layer_id,
-            transfer_count=len(gvas_array),
-            total_bytes=int(size_array.sum()) if len(size_array) else 0,
-        )
+        if layer_id < 4:
+            emit_timeline_event(
+                "layerwise_hixl_batch_get_begin",
+                layer_id=layer_id,
+                transfer_count=len(gvas_array),
+                total_bytes=int(size_array.sum()) if len(size_array) else 0,
+            )
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,
@@ -2199,7 +2185,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.max_transfer_blocks,
             self.max_transfer_bytes,
         )
-        emit_timeline_event("layerwise_hixl_batch_get_end", layer_id=layer_id, result=res)
+        if layer_id < 4:
+            emit_timeline_event("layerwise_hixl_batch_get_end", layer_id=layer_id, result=res)
         if layer_id <= 2 or res != 0:
             logger.debug(
                 "load_thread: layer=%d groups=%d blocks=%d res=%d",
@@ -2226,7 +2213,6 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         assert not self.layer_load_finished_events[layer_id].is_set(), f"thread: {layer_id} load failed "
         logger.debug("Layer load event set: layer %d", layer_id)
         self.layer_load_finished_events[layer_id].set()
-        emit_timeline_event("layerwise_load_finished_set", layer_id=layer_id)
         # transfer_tasks aliases KVPoolWorker.layer_load_tasks[layer_id]. Do
         # not mutate the worker-owned list from this asynchronous thread. The
         # worker replaces all per-layer lists at the beginning of every step.

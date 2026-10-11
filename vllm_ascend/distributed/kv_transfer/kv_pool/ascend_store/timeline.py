@@ -16,12 +16,12 @@ _PREFIX = "[KVPP_LAYERWISE_TIMELINE]"
 def emit_timeline_event(event: str, **fields: Any) -> None:
     """Emit a process-wide monotonic timeline for KVPP/layerwise debugging.
 
-    Reuse ``VLLM_ASCEND_KVPOOL_RANGE_DEBUG`` so production behavior and log
-    volume remain unchanged unless the existing KV-pool debug switch is on.
+    The dedicated switch keeps this compact scheduler trace independent from
+    the much more verbose per-range KV-pool audit log.
     This helper must never alter the forward or transfer path.
     """
     try:
-        if not envs.VLLM_ASCEND_KVPOOL_RANGE_DEBUG:
+        if not envs.VLLM_ASCEND_KVPP_LAYERWISE_TIMELINE:
             return
         payload = {
             "event": event,

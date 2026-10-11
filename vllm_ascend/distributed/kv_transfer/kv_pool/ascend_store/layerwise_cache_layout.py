@@ -116,6 +116,39 @@ def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None
     return None
 
 
+def is_layerwise_transfer_enabled(kv_transfer_config: Any) -> bool:
+    """Return whether an AscendStore-family connector enables layerwise I/O.
+
+    Layerwise transfer and physical layer-buffer reuse are separate features.
+    In particular, Mooncake's block-key protocol supports layerwise transfer
+    but deliberately returns no reuse layout. KVPP needs the transfer state so
+    that its broadcast waits for the connector's per-layer load completion.
+    """
+    if kv_transfer_config is None:
+        return False
+
+    connector_name = getattr(kv_transfer_config, "kv_connector", None)
+    root_extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if connector_name in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
+        connector_configs = [
+            {
+                "kv_connector": connector_name,
+                "kv_connector_extra_config": root_extra_config,
+            }
+        ]
+    elif connector_name == "MultiConnector":
+        connector_configs = root_extra_config.get("connectors", [])
+    else:
+        return False
+
+    return any(
+        isinstance(connector_config, dict)
+        and connector_config.get("kv_connector") in ("AscendStoreConnector", "MooncakeConnectorStoreV1")
+        and bool((connector_config.get("kv_connector_extra_config") or {}).get("use_layerwise", False))
+        for connector_config in connector_configs
+    )
+
+
 def _parse_int_config(value: Any, name: str) -> int:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be an integer, got bool")

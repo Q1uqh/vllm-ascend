@@ -1042,12 +1042,6 @@ class KVPoolWorker:
         self._start_kv_transfer_threads()
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
-        emit_timeline_event(
-            "layerwise_start_load_begin",
-            request_count=len(metadata.requests),
-            use_kvpp=self.use_kvpp,
-            prefetch_layers=self.num_prefetch_layers,
-        )
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
@@ -1065,15 +1059,9 @@ class KVPoolWorker:
             self._attention_saved_layers = set()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
-            emit_timeline_event("layerwise_start_load_end", request_count=0)
             return
         if self.use_layerwise:
             self.process_layer_data(metadata.requests)
-            emit_timeline_event(
-                "layerwise_start_load_end",
-                request_count=len(metadata.requests),
-                load_task_counts=[len(tasks) for tasks in self.layer_load_tasks],
-            )
             return
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -2499,15 +2487,14 @@ class KVPoolWorker:
                     attention_start_gate=attention_start_gate,
                 )
             )
-            emit_timeline_event(
-                "layerwise_load_enqueued",
-                layer_id=layer_id,
-                current_layer=self.current_layer,
-                task_count=len(self.layer_load_tasks[layer_id]),
-                waits_for_save_layer=reuse_source,
-                gated=attention_start_gate is not None,
-                gate_id=id(attention_start_gate) if attention_start_gate is not None else None,
-            )
+            if layer_id < 4:
+                emit_timeline_event(
+                    "layerwise_load_enqueued",
+                    layer_id=layer_id,
+                    current_layer=self.current_layer,
+                    task_count=len(self.layer_load_tasks[layer_id]),
+                    gated=attention_start_gate is not None,
+                )
             return True
 
         submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
@@ -2523,34 +2510,17 @@ class KVPoolWorker:
     def wait_for_layer_load_ready(self, layer_name: str) -> None:
         """Observe load completion without advancing the attention-side schedule."""
         layer_id = self._global_to_local_layer[self._extract_physical_layer_index(layer_name)]
-        emit_timeline_event(
-            "layerwise_load_ready_wait_begin",
-            layer_id=layer_id,
-            layer_name=layer_name,
-            task_count=len(self.layer_load_tasks[layer_id]),
-        )
         if not self.layer_load_tasks[layer_id] and layer_id not in self.prefetch_layer_map:
-            emit_timeline_event(
-                "layerwise_load_ready_wait_end", layer_id=layer_id, layer_name=layer_name, skipped=True
-            )
             return
         assert self.layer_load_finished_events is not None
         assert self.kv_recv_thread is not None
         while not self.layer_load_finished_events[layer_id].wait(timeout=1):
             self.kv_recv_thread.raise_if_failed()
         self.kv_recv_thread.raise_if_failed()
-        emit_timeline_event("layerwise_load_ready_wait_end", layer_id=layer_id, layer_name=layer_name, skipped=False)
 
     def wait_for_layer_load(self) -> None:
         if self.current_layer >= self.num_layers:
             return
-        waited_layer = self.current_layer
-        emit_timeline_event(
-            "layerwise_attention_wait_begin",
-            layer_id=waited_layer,
-            next_layer_to_submit=self.next_layer_to_submit,
-            prefetch_layers=self.num_prefetch_layers,
-        )
         assert self.layer_load_finished_events is not None
         assert self.kv_recv_thread is not None
         gate = reset_attention_compute_start_gate()
@@ -2603,12 +2573,6 @@ class KVPoolWorker:
             self._finish_current_layerwise_load_sessions()
         if hasattr(self, "kv_role") and not is_kv_save_role(self.kv_role, getattr(self, "consumer_is_to_put", False)):
             self.current_layer += 1
-        emit_timeline_event(
-            "layerwise_attention_wait_end",
-            layer_id=waited_layer,
-            current_layer=self.current_layer,
-            next_layer_to_submit=self.next_layer_to_submit,
-        )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._invalid_block_ids_lock:

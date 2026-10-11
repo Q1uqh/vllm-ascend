@@ -17,6 +17,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     build_layerwise_reuse_layout,
     get_layerwise_physical_layer_index,
     get_layerwise_reuse_config,
+    is_layerwise_transfer_enabled,
 )
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 
@@ -55,6 +56,46 @@ def _make_vllm_config(num_layers: int, num_shared_buffers: int):
         model_config=model_config,
         parallel_config=MagicMock(),
     )
+
+
+@pytest.mark.parametrize("connector_name", ["AscendStoreConnector", "MooncakeConnectorStoreV1"])
+def test_mooncake_layerwise_transfer_is_independent_of_reuse_layout(connector_name):
+    config = SimpleNamespace(
+        kv_connector=connector_name,
+        kv_connector_extra_config={"backend": "mooncake", "use_layerwise": True},
+    )
+
+    assert is_layerwise_transfer_enabled(config)
+    assert get_layerwise_reuse_config(config) is None
+
+
+def test_layerwise_transfer_disabled_without_opt_in():
+    config = SimpleNamespace(
+        kv_connector="AscendStoreConnector",
+        kv_connector_extra_config={"backend": "mooncake"},
+    )
+
+    assert not is_layerwise_transfer_enabled(config)
+
+
+def test_layerwise_transfer_detected_inside_multi_connector():
+    config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_connector_extra_config={
+            "connectors": [
+                {
+                    "kv_connector": "SomeOtherConnector",
+                    "kv_connector_extra_config": {},
+                },
+                {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_connector_extra_config": {"backend": "mooncake", "use_layerwise": True},
+                },
+            ]
+        },
+    )
+
+    assert is_layerwise_transfer_enabled(config)
 
 
 def test_no_reuse_skips_topology_validation():
