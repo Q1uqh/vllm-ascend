@@ -274,9 +274,14 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self.connector_worker.start_load_kv(metadata)
 
-    def wait_for_layer_load_ready(self, layer_name: str) -> None:
+    def wait_for_layer_load_ready(self, layer_name: str) -> bool:
         assert self.connector_worker is not None
-        self.connector_worker.wait_for_layer_load_ready(layer_name)
+        return self.connector_worker.wait_for_layer_load_ready(layer_name)
+
+    def release_layer_load_waiters(self) -> None:
+        """End pending layer-load waits when a forward pass ends early."""
+        assert self.connector_worker is not None
+        self.connector_worker.release_layer_load_waiters()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:

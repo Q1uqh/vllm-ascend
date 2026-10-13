@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -179,3 +180,51 @@ def test_runtime_reads_layerwise_from_connector_not_reuse_layout(
 
     assert runtime.scheduler is not None
     assert runtime.scheduler.layerwise is expected
+
+
+def test_released_load_wait_still_broadcasts(scheduler_device):
+    """A released wait must not skip the collective: peers may be inside it."""
+    events, _compute, transfer = scheduler_device
+    transport = Mock()
+    transport.prefetch.side_effect = lambda name, ready, stream: events.append(("prefetch", name))
+    scheduler = kvpp.KVPPScheduler(transport, (layer_name(0),), layerwise=True)
+    scheduler._wait_for_load = lambda _layer: False
+
+    scheduler.run_layer_prefetch(layer_name(0), "ready")
+
+    assert events == [("device", 3), ("prefetch", layer_name(0))]
+    assert transport.prefetch.call_args.args[0] == layer_name(0)
+
+
+def test_complete_forward_releases_then_joins_pending_prefetch(monkeypatch, scheduler_device):
+    transport = Mock()
+    scheduler = kvpp.KVPPScheduler(transport, (layer_name(0),), layerwise=True)
+    future: Future = Future()
+    scheduler._prefetch_executor = SimpleNamespace(submit=lambda *_args: future)
+    releases: list[str] = []
+
+    def release():
+        releases.append("released")
+        # The real executor reaches the collective right after the release.
+        future.set_result(None)
+
+    monkeypatch.setattr(kvpp, "get_kv_transfer_group", lambda: SimpleNamespace(release_layer_load_waiters=release))
+    scheduler.start_layer_prefetch(layer_name(0))
+    assert not future.done()
+
+    scheduler.complete_forward()
+
+    assert releases == ["released"]
+    assert scheduler._prefetch_future is None
+
+
+def test_complete_forward_without_pending_prefetch_does_not_release(monkeypatch, scheduler_device):
+    scheduler = kvpp.KVPPScheduler(Mock(), (layer_name(0),))
+    releases: list[str] = []
+    monkeypatch.setattr(
+        kvpp, "get_kv_transfer_group", lambda: SimpleNamespace(release_layer_load_waiters=lambda: releases.append("x"))
+    )
+
+    scheduler.complete_forward()
+
+    assert releases == []

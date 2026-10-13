@@ -376,6 +376,52 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
 
         self.assertEqual(worker.next_layer_to_submit, 0)
         self.assertTrue(all(not event.is_set() for event in events))
+        self.assertFalse(worker._layer_load_waits_released)
+
+    def test_kvpp_release_ends_pending_layer_load_wait(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.layer_load_tasks = [[MagicMock()]]
+        worker.prefetch_layer_map = {}
+        worker.layer_load_finished_events = [threading.Event()]
+        worker.kv_recv_thread = MagicMock()
+        worker._layer_load_waits_released = False
+        worker._extract_physical_layer_index = lambda _name: 0
+        worker._global_to_local_layer = {0: 0}
+
+        worker.release_layer_load_waiters()
+
+        # The wait ends without the signal ever being faked.
+        self.assertFalse(worker.wait_for_layer_load_ready("model.layers.0.self_attn"))
+        self.assertFalse(worker.layer_load_finished_events[0].is_set())
+
+    def test_kvpp_load_ready_true_when_layer_has_no_load(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.layer_load_tasks = [[]]
+        worker.prefetch_layer_map = {}
+        worker.layer_load_finished_events = [threading.Event()]
+        worker.kv_recv_thread = MagicMock()
+        worker._layer_load_waits_released = True
+        worker._extract_physical_layer_index = lambda _name: 0
+        worker._global_to_local_layer = {0: 0}
+
+        self.assertTrue(worker.wait_for_layer_load_ready("model.layers.0.self_attn"))
+
+    def test_kvpp_load_ready_prefers_completion_over_release(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        ready = threading.Event()
+        ready.set()
+        worker.layer_load_tasks = [[MagicMock()]]
+        worker.prefetch_layer_map = {}
+        worker.layer_load_finished_events = [ready]
+        worker.kv_recv_thread = MagicMock()
+        worker._layer_load_waits_released = True
+        worker._extract_physical_layer_index = lambda _name: 0
+        worker._global_to_local_layer = {0: 0}
+
+        self.assertTrue(worker.wait_for_layer_load_ready("model.layers.0.self_attn"))
 
     def test_kvpp_submit_invalidates_signal_before_queueing_load(self):
         cls = self._make_worker_class()

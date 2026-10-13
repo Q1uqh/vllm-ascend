@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_placement import build_kvpp_layer_layout, create_kvpp_cache_allocation_plan
@@ -84,7 +85,7 @@ class KVPPScheduler:
         self, transport: BroadcastKVPPTransport, attention_layer_names: tuple[str, ...], *, layerwise: bool = False
     ) -> None:
         self.layerwise = layerwise
-        self._wait_for_load: Callable[[str], None] | None = None
+        self._wait_for_load: Callable[[str], bool] | None = None
         self.transport = transport
         self.attention_layer_names = attention_layer_names
         self._has_history = False
@@ -107,8 +108,16 @@ class KVPPScheduler:
 
     def run_layer_prefetch(self, layer_name: str, cache_ready: Any) -> None:
         torch.npu.set_device(self._npu_device_id)
-        if self._wait_for_load is not None:
-            self._wait_for_load(layer_name)
+        if self._wait_for_load is not None and not self._wait_for_load(layer_name):
+            # The step ended while this layer's load was still pending. The
+            # collective must run anyway: every rank participates, and the
+            # peers may already be blocked inside it. Say so loudly instead —
+            # they are about to receive this layer's previous contents.
+            logger.warning(
+                "KVPP broadcast of %s proceeds after the connector released its layer-load wait; "
+                "the layer's cache may not hold this step's data.",
+                layer_name,
+            )
         self.transport.prefetch(layer_name, cache_ready, self._kv_transfer_stream)
 
     def wait_for_layer(self, layer_name: str) -> None:
@@ -128,3 +137,29 @@ class KVPPScheduler:
     def complete_forward(self) -> None:
         self._has_history = False
         self._next_attention_layer_index = 0
+        self._drain_pending_prefetch()
+
+    def _drain_pending_prefetch(self) -> None:
+        """Make sure no prefetch from this step survives into the next one.
+
+        A broadcast that is already on its way must be joined — dropping it
+        would leave the peer ranks blocked inside the collective. A prefetch
+        that is still waiting for its pool load is first released by the
+        connector, and then broadcasts anyway (with a warning), which keeps the
+        participation set and the collective order intact.
+        """
+        future = self._prefetch_future
+        self._prefetch_future = None
+        if future is None:
+            return
+        if not future.done():
+            release = getattr(get_kv_transfer_group(), "release_layer_load_waiters", None)
+            if release is not None:
+                release()
+            logger.warning("KVPP prefetch still in flight at the end of a forward pass; releasing its load wait.")
+        try:
+            future.result()
+        except Exception:
+            # The failure was already reported where the layer consumed it; the
+            # step is over, so do not raise a second time from the drain path.
+            logger.exception("KVPP prefetch failed at the end of a forward pass.")

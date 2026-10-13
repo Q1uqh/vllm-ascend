@@ -230,6 +230,27 @@ class TestAscendStoreConnector(unittest.TestCase):
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.LookupKeyServer")
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolWorker")
+    def test_layer_load_wait_pass_through(self, mock_worker_cls, mock_lookup_cls):
+        config = self._make_vllm_config()
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        connector = AscendStoreConnector(
+            vllm_config=config,
+            role=KVConnectorRole.WORKER,
+            kv_cache_config=None,
+        )
+        mock_worker = mock_worker_cls.return_value
+        mock_worker.wait_for_layer_load_ready.return_value = False
+
+        # KVPP keeps broadcasting when the connector reports a released wait.
+        self.assertFalse(connector.wait_for_layer_load_ready("layer.0"))
+        mock_worker.wait_for_layer_load_ready.assert_called_once_with("layer.0")
+
+        connector.release_layer_load_waiters()
+        mock_worker.release_layer_load_waiters.assert_called_once_with()
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.LookupKeyServer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolWorker")
     def test_layerwise_methods_return_early(self, mock_worker_cls, mock_lookup_cls):
         from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 

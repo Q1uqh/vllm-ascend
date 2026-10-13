@@ -210,6 +210,9 @@ class KVPoolWorker:
         self.layerwise_data_plane = get_layerwise_data_plane(self.layerwise_protocol)
         self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
         self.use_layerwise_transfer = self.use_layerwise and self.layerwise_data_plane == "gva"
+        # Set by release_layer_load_waiters() at a step boundary and checked by
+        # wait_for_layer_load_ready(), so a stray waiter cannot outlive its step.
+        self._layer_load_waits_released = False
         validate_layerwise_topology(self.layerwise_protocol, vllm_config.parallel_config, self.use_layerwise)
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups) or (
@@ -1057,6 +1060,7 @@ class KVPoolWorker:
                 assert self.layer_load_finished_events is not None
                 for event in self.layer_load_finished_events:
                     event.clear()
+                self._layer_load_waits_released = False
             # Transfer threads receive these lists by reference. Give every
             # step fresh lists so a late clear of a previous step cannot drop
             # newly prepared loads/saves and leave a reused buffer stale.
@@ -2526,16 +2530,40 @@ class KVPoolWorker:
             if submit_layer_load(layer_id):
                 submitted_layers += 1
 
-    def wait_for_layer_load_ready(self, layer_name: str) -> None:
-        """Observe load completion without advancing the attention-side schedule."""
+    def release_layer_load_waiters(self) -> None:
+        """End pending layer-load waits at a step boundary.
+
+        The broadcast that was waiting still has to be launched — it is a
+        collective, and the peer ranks may already be blocked inside it — so
+        this only stops the *host* wait. It never signals completion: faking
+        the event would let a half-loaded layer be broadcast. start_load_kv()
+        clears the flag for the next step.
+        """
+        self._layer_load_waits_released = True
+
+    def wait_for_layer_load_ready(self, layer_name: str) -> bool:
+        """Wait for this layer's load unless the step ends first.
+
+        Returns True once the layer's data has landed. Returns False when
+        ``release_layer_load_waiters`` ended the wait, i.e. the caller must not
+        treat the layer as loaded but must still take part in its collective to
+        keep the ranks aligned.
+        """
         layer_id = self._global_to_local_layer[self._extract_physical_layer_index(layer_name)]
         if not self.layer_load_tasks[layer_id] and layer_id not in self.prefetch_layer_map:
-            return
+            return True
         assert self.layer_load_finished_events is not None
         assert self.kv_recv_thread is not None
-        while not self.layer_load_finished_events[layer_id].wait(timeout=1):
+        while True:
+            # Completion wins over a release: only report "not loaded" when the
+            # step really ended first.
+            if self.layer_load_finished_events[layer_id].is_set():
+                self.kv_recv_thread.raise_if_failed()
+                return True
+            if self._layer_load_waits_released:
+                return False
+            self.layer_load_finished_events[layer_id].wait(timeout=1)
             self.kv_recv_thread.raise_if_failed()
-        self.kv_recv_thread.raise_if_failed()
 
     def wait_for_layer_load(self) -> None:
         if self.current_layer >= self.num_layers:
