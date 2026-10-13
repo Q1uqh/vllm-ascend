@@ -2501,6 +2501,21 @@ class KVPoolWorker:
             )
             return True
 
+        if self.use_kvpp and self.use_layerwise:
+            # KVPP registers only the layers this rank owns, so counting
+            # *local* tasks lets a rank skip over the layers it does not own and
+            # load its whole partition during the first few model layers.
+            # Advance every rank through the same global layer window instead:
+            # only the owner enqueues work inside it, so load(L) is submitted at
+            # model layer L-P and each layer's H2D overlaps the compute of the P
+            # layers before the one that needs it.
+            window_end = min(self.current_layer + self.num_prefetch_layers, self.num_layers - 1)
+            while self.next_layer_to_submit <= window_end:
+                layer_id = self.next_layer_to_submit
+                self.next_layer_to_submit += 1
+                submit_layer_load(layer_id)
+            return
+
         submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
         if getattr(self, "block_key_hybrid", False):
             submit_count = max(0, self.current_layer + self.num_prefetch_layers + 1 - self.next_layer_to_submit)
