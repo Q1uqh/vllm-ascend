@@ -235,6 +235,8 @@ class KVPoolScheduler:
                     vllm_config.kv_transfer_config.kv_connector_extra_config,
                 ).has_layer_reuse
         self.model_name = model_config.model.split("/")[-1]
+        if self.use_block_key_layerwise:
+            self.model_name = self.layerwise_protocol.namespaced_model_name(self.model_name, vllm_config)
 
         self.client: LookupKeyClient | None = None
 

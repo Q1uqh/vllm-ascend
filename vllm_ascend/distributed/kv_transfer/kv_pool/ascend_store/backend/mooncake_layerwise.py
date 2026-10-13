@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import logger
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
+from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
     block_hash_to_str,
@@ -32,8 +33,23 @@ def extract_layout_config(extra_config: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
-def make_block_key(model_name: str, block_hash_or_tail: str, head_or_tp_rank: int) -> str:
+def layerwise_topology_namespace(vllm_config: Any) -> str:
+    """Separate owner-sharded objects from replicated cache layouts."""
+    if KVPPConfig.from_vllm_config(vllm_config).size <= 1:
+        return ""
+    parallel = vllm_config.parallel_config
+    return f"kvpp-tp{parallel.tensor_parallel_size}-pcp{parallel.prefill_context_parallel_size}"
+
+
+def namespaced_model_name(model_name: str, vllm_config: Any) -> str:
+    """Use the same namespace for single-group and hybrid pool objects."""
+    namespace = layerwise_topology_namespace(vllm_config)
+    return f"{model_name}@{namespace}" if namespace else model_name
+
+
+def make_block_key(model_name: str, block_hash_or_tail: str, head_or_tp_rank: int, *, namespace: str = "") -> str:
     """Build the canonical one-object-per-block-and-saving-rank key."""
+    model_name = f"{model_name}@{namespace}" if namespace else model_name
     return f"{model_name}@{block_hash_or_tail}@{head_or_tp_rank}"
 
 

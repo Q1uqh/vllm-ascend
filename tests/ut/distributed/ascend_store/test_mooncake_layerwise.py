@@ -58,6 +58,33 @@ def make_token_database() -> ChunkedTokenDatabase:
 
 
 class TestMooncakeLayerBatchBuilder(unittest.TestCase):
+    def test_kvpp_objects_are_isolated_from_replicated_layouts(self):
+        from tests.ut.kvpp_utils import make_kvpp_config
+
+        config = make_kvpp_config(8)
+        namespace = mooncake_layerwise.layerwise_topology_namespace(config)
+        self.assertEqual(namespace, "kvpp-tp8-pcp1")
+        owner_key = mooncake_layerwise.make_block_key("model", "hash", 0, namespace=namespace)
+
+        owner_model = mooncake_layerwise.namespaced_model_name("model", config)
+        self.assertEqual(mooncake_layerwise.make_block_key(owner_model, "hash", 0), owner_key)
+        owner_hybrid = mooncake_layerwise.hybrid_block_key(owner_model, "layout", 0, 16, "hash", 0)
+        owner_lookup = mooncake_layerwise.make_hit_check_keys(owner_model, 0, "hash", 8, 1)
+        self.assertEqual(
+            owner_lookup,
+            [mooncake_layerwise.make_block_key("model", "hash", rank, namespace=namespace) for rank in range(8)],
+        )
+        ordinary_hybrid = mooncake_layerwise.hybrid_block_key("model", "layout", 0, 16, "hash", 0)
+        self.assertNotEqual(owner_hybrid, ordinary_hybrid)
+        config.additional_config = {"enable_kvpp": False}
+        ordinary_namespace = mooncake_layerwise.layerwise_topology_namespace(config)
+        self.assertEqual(ordinary_namespace, "")
+        ordinary_key = mooncake_layerwise.make_block_key("model", "hash", 0, namespace=ordinary_namespace)
+        self.assertNotEqual(owner_key, ordinary_key)
+        config.additional_config = {"enable_kvpp": True}
+        config.parallel_config.prefill_context_parallel_size = 2
+        self.assertNotEqual(mooncake_layerwise.layerwise_topology_namespace(config), namespace)
+
     def test_range_debug_payload_reports_per_key_bytes_and_offsets(self):
         payload = _build_range_debug_payload(
             "save",

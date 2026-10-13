@@ -135,6 +135,57 @@ class TestPCPPoolWorker(unittest.TestCase):
 
 
 class TestKVPPPoolWorker(unittest.TestCase):
+    def test_mooncake_worker_uses_owner_namespace_only_for_layerwise_kvpp(self):
+        for use_kvpp, use_layerwise in ((True, True), (False, True), (True, False)):
+            with self.subTest(use_kvpp=use_kvpp, use_layerwise=use_layerwise):
+                worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=use_kvpp, use_layerwise=use_layerwise)
+                expected = "llama-7b@kvpp-tp2-pcp1" if use_kvpp and use_layerwise else "llama-7b"
+                self.assertEqual(worker.model_name, expected)
+
+    def test_load_completion_is_shared_and_reset_at_step_binding(self):
+        worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True, use_layerwise=True)
+        worker._global_to_local_layer = {9: 0, 10: 1}
+        worker.layer_load_tasks[0] = [MagicMock()]
+        worker.layer_load_finished_events = [threading.Event(), threading.Event()]
+        worker.layer_load_finished_events[0].set()
+        worker.current_layer = 0
+        worker.kv_recv_thread = MagicMock()
+        worker.external_slot_release_waiter = None
+        worker._submit_ready_layer_loads = MagicMock()
+        worker._finish_current_layerwise_load_sessions = MagicMock()
+        worker.wait_for_layer_load()
+        worker.wait_for_layer_load_ready("model.layers.9.self_attn.attn")
+        worker.wait_for_layer_load_ready("model.layers.9.self_attn.attn")
+        self.assertTrue(worker.layer_load_finished_events[0].is_set())
+        self.assertEqual(worker.current_layer, 0)
+        worker.wait_for_layer_load_ready("model.layers.10.self_attn.attn")
+        worker.current_layer = 1
+        worker._current_layerwise_last_chunk_req_ids = {"loaded-request"}
+        worker.wait_for_layer_load()
+        worker.kv_recv_thread.set_finished_request.assert_called_once_with("loaded-request")
+        worker.process_layer_data = MagicMock()
+        worker.start_load_kv(AscendConnectorMetadata(preempted_req_ids=set()))
+        self.assertFalse(worker.layer_load_finished_events[0].is_set())
+        self.assertEqual(worker.next_layer_to_submit, 0)
+
+    def test_load_observer_surfaces_receive_failure(self):
+        worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True, use_layerwise=True)
+        worker.layer_load_tasks[0] = [MagicMock()]
+        worker.layer_load_finished_events = [threading.Event(), threading.Event()]
+        worker.kv_recv_thread = MagicMock()
+        worker.kv_recv_thread.raise_if_failed.side_effect = RuntimeError("receive failed")
+        with self.assertRaisesRegex(RuntimeError, "receive failed"):
+            worker.wait_for_layer_load_ready("model.layers.0.self_attn.attn")
+
+    def test_load_observer_surfaces_aborted_step(self):
+        worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True, use_layerwise=True)
+        worker.layer_load_tasks[0] = [MagicMock()]
+        worker.layer_load_finished_events = [threading.Event(), threading.Event()]
+        worker.kv_recv_thread = MagicMock()
+        worker._layer_load_aborted.set()
+        with self.assertRaisesRegex(RuntimeError, "Layerwise load aborted"):
+            worker.wait_for_layer_load_ready("model.layers.0.self_attn.attn")
+
     def test_registers_persistent_layers_and_mtp(self):
         import torch
 
@@ -291,6 +342,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
     def test_wait_for_layer_load_fallback_waits_for_reuse(self):
         cls = self._make_worker_class()
         worker = cls.__new__(cls)
+        worker.use_kvpp = False
         worker.current_layer = 0
         worker.num_layers = 1
         worker.layer_load_tasks = [[]]

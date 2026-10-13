@@ -208,6 +208,8 @@ class KVPoolWorker:
         self.layerwise_protocol = get_layerwise_protocol(self.backend_name)
         self.layerwise_data_plane = get_layerwise_data_plane(self.layerwise_protocol)
         self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
+        if self.use_block_key_layerwise:
+            self.model_name = self.layerwise_protocol.namespaced_model_name(self.model_name, vllm_config)
         self.use_layerwise_transfer = self.use_layerwise and self.layerwise_data_plane == "gva"
         validate_layerwise_topology(self.layerwise_protocol, vllm_config.parallel_config, self.use_layerwise)
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
@@ -1045,7 +1047,7 @@ class KVPoolWorker:
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
             self.next_layer_to_submit = 0
-            if self.use_kvpp and self.use_layerwise_transfer:
+            if self.use_kvpp:
                 assert self.layer_load_finished_events is not None
                 for event in self.layer_load_finished_events:
                     event.clear()
@@ -2500,13 +2502,18 @@ class KVPoolWorker:
 
     def wait_for_layer_load_ready(self, layer_name: str) -> None:
         """Observe load completion without advancing the attention-side schedule."""
-        layer_id = self._global_to_local_layer[self._extract_physical_layer_index(layer_name)]
+        physical_layer = self._extract_physical_layer_index(layer_name)
+        layer_id = self._global_to_local_layer.get(physical_layer, physical_layer)
+        assert self.kv_recv_thread is not None
+        self.kv_recv_thread.raise_if_failed()
         if not self.layer_load_tasks[layer_id] and layer_id not in self.prefetch_layer_map:
             return
         assert self.layer_load_finished_events is not None
         assert self.kv_recv_thread is not None
         while not self.layer_load_finished_events[layer_id].wait(timeout=1):
             self.kv_recv_thread.raise_if_failed()
+            if self._layer_load_aborted.is_set():
+                raise RuntimeError("Layerwise load aborted before KVPP broadcast")
         self.kv_recv_thread.raise_if_failed()
 
     def wait_for_layer_load(self) -> None:
@@ -2551,9 +2558,11 @@ class KVPoolWorker:
                 self._finish_current_layerwise_load_sessions()
             raise
         # KVPP also observes this signal; clear it when the next step starts.
-        if not (self.use_kvpp and self.use_layerwise_transfer):
+        if not self.use_kvpp:
             self.layer_load_finished_events[self.current_layer].clear()
-        if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
+        if (
+            getattr(self, "block_key_hybrid", False) or (self.use_kvpp and self.use_block_key_layerwise)
+        ) and self.current_layer == self.num_layers - 1:
             # The final model layer can have no reachable load rows. Completion
             # belongs to the whole request, not whichever group happens to end here.
             for req_id in self._current_layerwise_last_chunk_req_ids:
