@@ -61,9 +61,31 @@ def test_emit_serializes_non_json_values(monkeypatch):
     assert isinstance(_payload(recorder.lines[0])["handle"], str)
 
 
+def test_emit_warns_once_on_invalid_switch(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_KVPP_LAYERWISE_TIMELINE", "true")
+    monkeypatch.setattr(timeline, "_invalid_switch_warned", False)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        timeline,
+        "logger",
+        SimpleNamespace(info=lambda *a, **k: None, warning=lambda message, *a: warnings.append(message % a)),
+    )
+
+    timeline.emit_timeline_event("kvpp_broadcast_end", layer_name="l0")
+    timeline.emit_timeline_event("kvpp_broadcast_end", layer_name="l1")
+
+    # A silent no-op would look like a missing feature; warn exactly once.
+    assert len(warnings) == 1
+    assert "must be '0' or '1'" in warnings[0]
+
+
 def test_emit_never_raises(monkeypatch):
-    monkeypatch.setenv("VLLM_ASCEND_KVPP_LAYERWISE_TIMELINE", "1")
+    monkeypatch.setattr(timeline, "_invalid_switch_warned", False)
     monkeypatch.setattr(timeline, "logger", _Boom())
 
-    # Instrumentation must never break the forward or transfer path.
-    timeline.emit_timeline_event("kvpp_broadcast_end", layer_name="l0")
+    for value in ("1", "true"):
+        with monkeypatch.context() as patch_env:
+            patch_env.setenv("VLLM_ASCEND_KVPP_LAYERWISE_TIMELINE", value)
+            # Instrumentation must never break the forward or transfer path,
+            # neither when logging fails nor when the switch value is invalid.
+            timeline.emit_timeline_event("kvpp_broadcast_end", layer_name="l0")
