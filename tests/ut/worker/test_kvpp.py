@@ -77,6 +77,9 @@ def test_runtime_binds_complete_layer_storage(monkeypatch, scheduler_device, exp
     assert payload.dtype == torch.int8
     assert payload.shape == (36,)
     assert payload.storage_offset() == 2
+    # The timeline reports this payload size next to each broadcast.
+    assert scheduler.layer_bytes == {main: 36}
+    assert scheduler.num_blocks == 2
     for value, (start, end) in enumerate(((0, 12), (12, 16), (16, 32), (32, 36)), 1):
         payload[start:end].fill_(value)
     for value, component in enumerate(components, 1):

@@ -5,6 +5,8 @@ import torch
 import torch.distributed as dist
 from vllm.distributed.parallel_state import GroupCoordinator
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.timeline import emit_timeline_event
+
 
 class BroadcastKVPPTransport:
     """Broadcast allocated cache bytes using the existing KVPP device group."""
@@ -28,9 +30,16 @@ class BroadcastKVPPTransport:
                 group=self._device_group,
                 async_op=True,
             )
+            # Phase boundaries for the timeline: enqueue (host), hccl_wait
+            # (device execution, including waiting for the compute stream to
+            # reach cache_ready) and sync (host). They tell "transferred
+            # slowly" apart from "scheduled late", which need different fixes.
+            emit_timeline_event("kvpp_broadcast_enqueued", layer_name=layer_name)
             work.wait()
+            emit_timeline_event("kvpp_broadcast_hccl_done", layer_name=layer_name)
             done = torch.npu.Event()
             done.record(transfer_stream)
         # A Future must cover device completion, including the owner's source
         # reads, before attention can overwrite the persistent cache.
         done.synchronize()
+        emit_timeline_event("kvpp_broadcast_synced", layer_name=layer_name)

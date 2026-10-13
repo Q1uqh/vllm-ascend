@@ -51,6 +51,7 @@ class KVPPRuntime:
         if not plan.layer_owner_ranks:
             return cls()
         layer_buffers = {}
+        layer_bytes: dict[str, int] = {}
         for name, bundle in plan.layer_bundles.items():
             if name not in plan.layer_owner_ranks:
                 continue
@@ -61,10 +62,13 @@ class KVPPRuntime:
             # The allocator binds every component to this contiguous layer span.
             raw = torch.empty(0, dtype=torch.int8, device=first.device).set_(storage, base, (size,), (1,))
             layer_buffers[name] = raw
+            layer_bytes[name] = size
         scheduler = KVPPScheduler(
             transport=BroadcastKVPPTransport(group, plan.layer_owner_ranks, layer_buffers),
             attention_layer_names=tuple(layer_buffers),
             layerwise=is_layerwise_transfer_enabled(vllm_config.kv_transfer_config),
+            layer_bytes=layer_bytes,
+            num_blocks=kv_cache_config.num_blocks,
         )
         for name in layer_buffers:
             static_forward_context[name].impl.layerwise_kv_cache_hook = scheduler
@@ -83,9 +87,18 @@ class KVPPScheduler:
     """Prefetch one layer ahead; Target execution ordinal selects scratch."""
 
     def __init__(
-        self, transport: BroadcastKVPPTransport, attention_layer_names: tuple[str, ...], *, layerwise: bool = False
+        self,
+        transport: BroadcastKVPPTransport,
+        attention_layer_names: tuple[str, ...],
+        *,
+        layerwise: bool = False,
+        layer_bytes: dict[str, int] | None = None,
+        num_blocks: int | None = None,
     ) -> None:
         self.layerwise = layerwise
+        # Per-layer broadcast payload, for the timeline's bytes/bandwidth report.
+        self.layer_bytes = layer_bytes or {}
+        self.num_blocks = num_blocks
         self._wait_for_load: Callable[[str], bool] | None = None
         self.transport = transport
         self.attention_layer_names = attention_layer_names
@@ -130,7 +143,12 @@ class KVPPScheduler:
                     "the layer's cache may not hold this step's data.",
                     layer_name,
                 )
-        emit_timeline_event("kvpp_broadcast_begin", layer_name=layer_name)
+        emit_timeline_event(
+            "kvpp_broadcast_begin",
+            layer_name=layer_name,
+            payload_bytes=self.layer_bytes.get(layer_name),
+            num_blocks=self.num_blocks,
+        )
         self.transport.prefetch(layer_name, cache_ready, self._kv_transfer_stream)
         emit_timeline_event("kvpp_broadcast_end", layer_name=layer_name)
 

@@ -58,3 +58,32 @@ def test_full_layer_broadcast_completes_before_future(monkeypatch, local_rank):
     assert torch.all(payload == 17)
     assert torch.count_nonzero(backing[:2]) == 0
     assert torch.count_nonzero(backing[38:]) == 0
+
+
+def test_broadcast_phases_are_traced_in_order(monkeypatch):
+    """The timeline must separate enqueue, collective execution and host sync."""
+    traced: list[tuple[str, dict]] = []
+    monkeypatch.setattr(kvpp, "emit_timeline_event", lambda event, **fields: traced.append((event, fields)))
+
+    group = SimpleNamespace(ranks=[4, 9], device_group=object())
+    payload = torch.zeros(36, dtype=torch.int8)
+    transfer = Mock()
+    work = Mock()
+    done = Mock()
+
+    monkeypatch.setattr(kvpp.torch.npu, "stream", lambda stream: nullcontext(stream))
+    monkeypatch.setattr(kvpp.torch.npu, "Event", lambda: done)
+    monkeypatch.setattr(kvpp.dist, "broadcast", lambda *args, **kwargs: work)
+
+    transport = kvpp.BroadcastKVPPTransport(group, {"layer": 1}, {"layer": payload})
+    transport.prefetch("layer", object(), transfer)
+
+    assert [name for name, _fields in traced] == [
+        "kvpp_broadcast_enqueued",
+        "kvpp_broadcast_hccl_done",
+        "kvpp_broadcast_synced",
+    ]
+    assert all(fields == {"layer_name": "layer"} for _name, fields in traced)
+    transfer.wait_event.assert_called_once()
+    work.wait.assert_called_once()
+    done.synchronize.assert_called_once()
