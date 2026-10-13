@@ -24,6 +24,7 @@ _PREFETCH_LAYERS = "layerwise_prefetch_layers"
 _INDEPENDENT_LAYERS = "layerwise_independent_layers"
 _DEFAULT_MAX_PREFETCH_LAYERS = 8
 _INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
+_STORE_CONNECTOR_NAMES = ("AscendStoreConnector", "MooncakeConnectorStoreV1")
 
 
 def get_layerwise_physical_layer_index(layer_name: str, base_layers: int) -> int:
@@ -73,6 +74,34 @@ class LayerwiseReuseLayout:
     has_layer_reuse: bool
 
 
+def _iter_store_connector_configs(kv_transfer_config: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Return ``(connector name, extra config)`` for every AscendStore-family connector.
+
+    Handles a bare ``AscendStoreConnector``/``MooncakeConnectorStoreV1`` and the
+    ``MultiConnector`` composite, so callers never spell the connector set out
+    twice. Unknown connectors yield nothing.
+    """
+    if kv_transfer_config is None:
+        return []
+
+    connector_name = getattr(kv_transfer_config, "kv_connector", None)
+    root_extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if connector_name in _STORE_CONNECTOR_NAMES:
+        return [(connector_name, root_extra_config)]
+    if connector_name != "MultiConnector":
+        return []
+
+    connector_configs: list[tuple[str, dict[str, Any]]] = []
+    for connector_config in root_extra_config.get("connectors") or []:
+        if not isinstance(connector_config, dict):
+            continue
+        nested_name = connector_config.get("kv_connector")
+        if nested_name not in _STORE_CONNECTOR_NAMES:
+            continue
+        connector_configs.append((nested_name, connector_config.get("kv_connector_extra_config") or {}))
+    return connector_configs
+
+
 def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None:
     """Return the extra config of the layerwise-reuse connector, if any.
 
@@ -81,32 +110,7 @@ def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None
     config. Both checks resolve through the backend registry — the generic
     layer never names the protocol or the backend.
     """
-    if kv_transfer_config is None:
-        return None
-
-    connector_name = getattr(kv_transfer_config, "kv_connector", None)
-    root_extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
-    if connector_name in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
-        connector_configs = [
-            {
-                "kv_connector": connector_name,
-                "kv_connector_extra_config": root_extra_config,
-            }
-        ]
-    elif connector_name == "MultiConnector":
-        connector_configs = root_extra_config.get("connectors", [])
-    else:
-        return None
-
-    for connector_config in connector_configs:
-        if not isinstance(connector_config, dict):
-            continue
-        if connector_config.get("kv_connector") not in (
-            "AscendStoreConnector",
-            "MooncakeConnectorStoreV1",
-        ):
-            continue
-        extra_config = connector_config.get("kv_connector_extra_config") or {}
+    for _connector_name, extra_config in _iter_store_connector_configs(kv_transfer_config):
         protocol = get_layerwise_protocol(str(extra_config.get("backend", "mooncake")))
         if protocol is None:
             continue
@@ -114,6 +118,21 @@ def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None
         if layerwise_config is not None:
             return layerwise_config
     return None
+
+
+def is_layerwise_transfer_enabled(kv_transfer_config: Any) -> bool:
+    """Whether an AscendStore-family connector transfers KV layer by layer.
+
+    Deliberately independent of :func:`get_layerwise_reuse_config`: Mooncake's
+    block-key protocol transfers layer by layer but provides no physical reuse
+    layout, so the presence of a reuse config is not a proxy for layerwise
+    transfer. KVPP needs the transfer fact itself to order each layer's
+    broadcast behind the connector's per-layer load completion.
+    """
+    return any(
+        bool(extra_config.get("use_layerwise", False))
+        for _connector_name, extra_config in _iter_store_connector_configs(kv_transfer_config)
+    )
 
 
 def _parse_int_config(value: Any, name: str) -> int:

@@ -2207,6 +2207,8 @@ class TestKVPPWorkerBudget(TestBase):
         ascend_config = SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False))
         with (
             patch.object(worker_module, "get_tp_group", return_value=SimpleNamespace(rank_in_group=1)),
+            # The KVPP allocation plan is indexed by KVPP group rank, not TP rank.
+            patch.object(worker_module, "get_kvpp_group", return_value=SimpleNamespace(rank_in_group=1)),
             patch.object(worker_module, "get_ascend_config", return_value=ascend_config),
         ):
             self.assertEqual(worker.get_kv_cache_spec(), specs)

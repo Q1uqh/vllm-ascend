@@ -92,6 +92,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.distributed.parallel_state import get_kvpp_group
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -942,7 +943,10 @@ class KVPoolWorker:
         if self.use_kvpp:
             self.physical_layer_to_group_layers.clear()
             owners = map_kvpp_layers_to_owners(self.vllm_config, kv_caches.keys())
-            kv_caches = {name: caches for name, caches in kv_caches.items() if owners.get(name) in (None, self.tp_rank)}
+            # The owner mapping is indexed by KVPP group rank, which differs from
+            # the TP rank once PCP is enabled.
+            kvpp_rank = get_kvpp_group().rank_in_group
+            kv_caches = {name: caches for name, caches in kv_caches.items() if owners.get(name) in (None, kvpp_rank)}
             self.kv_caches = kv_caches
         self.group_kv_cache_families: dict[int, str] = {
             group_id: get_group_cache_family(self.kv_cache_group_families, group_id)
@@ -1045,7 +1049,11 @@ class KVPoolWorker:
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
             self.next_layer_to_submit = 0
-            if self.use_kvpp and self.use_layerwise_transfer:
+            if self.use_kvpp:
+                # Every KVPP rank waits on these signals before broadcasting a
+                # layer, so they must be invalidated at the step boundary —
+                # after the previous step's waiters are done and before any of
+                # this step's loads are queued.
                 assert self.layer_load_finished_events is not None
                 for event in self.layer_load_finished_events:
                     event.clear()
@@ -2478,6 +2486,11 @@ class KVPoolWorker:
             attention_start_gate = None
             if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
                 attention_start_gate = get_attention_compute_start_gate()
+            if self.use_kvpp:
+                # Invalidate the previous step's completion signal before this
+                # step's load is queued: a KVPP broadcast waiter may still
+                # observe it, and the receive thread asserts it is unset.
+                self.layer_load_finished_events[layer_id].clear()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
                     wait_for_save_layer=reuse_source,
@@ -2550,8 +2563,11 @@ class KVPoolWorker:
             if getattr(self, "use_block_key_layerwise", False):
                 self._finish_current_layerwise_load_sessions()
             raise
-        # KVPP also observes this signal; clear it when the next step starts.
-        if not (self.use_kvpp and self.use_layerwise_transfer):
+        # KVPP observes this signal from its broadcast thread, possibly after
+        # this layer's attention hook returns, so it must stay set for the rest
+        # of the step. The next step invalidates it in start_load_kv (and again
+        # when that layer's load is queued).
+        if not self.use_kvpp:
             self.layer_load_finished_events[self.current_layer].clear()
         if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
             # The final model layer can have no reachable load rows. Completion

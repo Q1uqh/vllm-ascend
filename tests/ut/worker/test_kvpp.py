@@ -122,3 +122,60 @@ def test_hook_propagates_failed_future_without_scheduling_next(scheduler_device)
         scheduler.wait_for_layer(layer_name(0))
     assert raised.value is error
     assert len(scheduler._prefetch_executor.submitted) == 1
+
+
+@pytest.mark.parametrize(
+    ("kv_transfer_config", "expected"),
+    [
+        (None, False),
+        (
+            SimpleNamespace(
+                kv_connector="AscendStoreConnector",
+                kv_connector_extra_config={"backend": "mooncake", "use_layerwise": True},
+            ),
+            True,
+        ),
+        (
+            SimpleNamespace(
+                kv_connector="AscendStoreConnector",
+                kv_connector_extra_config={"backend": "mooncake"},
+            ),
+            False,
+        ),
+    ],
+)
+def test_runtime_reads_layerwise_from_connector_not_reuse_layout(
+    monkeypatch, scheduler_device, kv_transfer_config, expected
+):
+    """Mooncake block-key transfers per layer without a reuse layout.
+
+    KVPP must still order each broadcast behind the connector's load, so the
+    layerwise flag comes from the connector's opt-in rather than from the
+    presence of a physical reuse layout.
+    """
+    main = layer_name(11)
+    specs = {main: make_kvpp_specs()[main]}
+    plan = KVPPPhysicalCachePlan(
+        logical_cache_spec=specs,
+        layer_owner_ranks={main: 0},
+        layer_bundles={main: (main,)},
+        tensor_sizes={main: (6, 2)},
+        kvpp_rank=0,
+    )
+    monkeypatch.setattr(kvpp, "create_kvpp_cache_allocation_plan", lambda *_args: plan)
+    monkeypatch.setattr(
+        kvpp, "get_kvpp_group", lambda: SimpleNamespace(rank_in_group=0, ranks=[4], device_group=object())
+    )
+    vllm_config = make_kvpp_config(2)
+    vllm_config.kv_transfer_config = kv_transfer_config
+    cache = torch.zeros(64, dtype=torch.int8)
+    context = {main: SimpleNamespace(kv_cache=(cache,), impl=SimpleNamespace())}
+
+    runtime = kvpp.KVPPRuntime.create_from_kv_cache(
+        vllm_config=vllm_config,
+        kv_cache_config=make_cache_config(specs, 2),
+        static_forward_context=context,
+    )
+
+    assert runtime.scheduler is not None
+    assert runtime.scheduler.layerwise is expected

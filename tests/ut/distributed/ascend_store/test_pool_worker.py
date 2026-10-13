@@ -65,6 +65,10 @@ def make_worker(
     pcp_group = start_patch(test, f"{module}.get_pcp_group")
     pcp_group.return_value.world_size = pcp_size
     pcp_group.return_value.rank_in_group = pcp_rank
+    # KVPP ownership is indexed by the KVPP group rank. These fixtures are
+    # TP-only, where that rank equals the TP rank.
+    kvpp_group = start_patch(test, f"{module}.get_kvpp_group")
+    kvpp_group.return_value.rank_in_group = tp_rank
     start_patch(test, f"{module}.get_decode_context_model_parallel_world_size", return_value=dcp_size)
     start_patch(test, f"{module}.get_decode_context_model_parallel_rank", return_value=0)
     importlib = start_patch(test, f"{module}.importlib")
@@ -303,6 +307,96 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.wait_for_layer_load()
 
         worker.external_slot_release_waiter.assert_called_once_with(0)
+
+    def test_kvpp_block_key_keeps_load_ready_event_for_broadcast_waiter(self):
+        """The KVPP broadcast thread may observe this signal after the hook."""
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        ready = threading.Event()
+        ready.set()
+        worker.current_layer = 0
+        worker.num_layers = 1
+        worker.layer_load_tasks = [[MagicMock()]]
+        worker.prefetch_layer_map = {}
+        worker.layer_load_finished_events = [ready]
+        worker.kv_recv_thread = MagicMock()
+        worker.external_slot_release_waiter = None
+        worker._submit_ready_layer_loads = MagicMock()
+        worker.use_kvpp = True
+        worker.use_layerwise = True
+        worker.use_layerwise_transfer = False
+        worker.use_block_key_layerwise = False
+        worker.block_key_hybrid = False
+
+        worker.wait_for_layer_load()
+
+        self.assertTrue(ready.is_set())
+
+    def test_non_kvpp_layerwise_still_clears_load_ready_event(self):
+        """Existing non-KVPP layerwise behaviour is unchanged."""
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        ready = threading.Event()
+        ready.set()
+        worker.current_layer = 0
+        worker.num_layers = 1
+        worker.layer_load_tasks = [[MagicMock()]]
+        worker.prefetch_layer_map = {}
+        worker.layer_load_finished_events = [ready]
+        worker.kv_recv_thread = MagicMock()
+        worker.external_slot_release_waiter = None
+        worker._submit_ready_layer_loads = MagicMock()
+        worker.use_kvpp = False
+        worker.use_layerwise = True
+        worker.use_layerwise_transfer = False
+        worker.use_block_key_layerwise = False
+        worker.block_key_hybrid = False
+
+        worker.wait_for_layer_load()
+
+        self.assertFalse(ready.is_set())
+
+    def test_kvpp_start_load_kv_invalidates_previous_signals(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        events = [threading.Event(), threading.Event()]
+        for event in events:
+            event.set()
+        worker.use_layerwise = True
+        worker.use_kvpp = True
+        worker.current_layer = 5
+        worker.next_layer_to_submit = 5
+        worker.num_layers = 2
+        worker.layer_load_finished_events = events
+        worker.layer_save_tasks = []
+        worker.layer_load_tasks = []
+        worker.layerwise_retrievers = []
+
+        worker.start_load_kv(SimpleNamespace(requests=[]))
+
+        self.assertEqual(worker.next_layer_to_submit, 0)
+        self.assertTrue(all(not event.is_set() for event in events))
+
+    def test_kvpp_submit_invalidates_signal_before_queueing_load(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        ready = threading.Event()
+        ready.set()
+        worker.current_layer = 0
+        worker.num_layers = 1
+        worker.num_prefetch_layers = 1
+        worker.next_layer_to_submit = 0
+        worker.use_kvpp = True
+        worker.use_layerwise = True
+        worker.prefetch_layer_map = {}
+        worker.layer_load_tasks = [[MagicMock()]]
+        worker.layer_load_finished_events = [ready]
+        worker.kv_recv_thread = MagicMock()
+
+        worker._submit_ready_layer_loads()
+
+        self.assertFalse(ready.is_set())
+        self.assertEqual(worker.kv_recv_thread.add_request.call_count, 1)
 
     def test_find_all_discontinuous_hit_positions_all_tp_hits(self):
         cls = self._make_worker_class()
