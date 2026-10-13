@@ -14,6 +14,7 @@ from vllm_ascend.core.kv_cache_placement import build_kvpp_layer_layout, create_
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     is_layerwise_transfer_enabled,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.timeline import emit_timeline_event
 from vllm_ascend.distributed.kvpp import BroadcastKVPPTransport
 from vllm_ascend.distributed.parallel_state import get_kvpp_group
 from vllm_ascend.worker.kvpp_cache import get_kvpp_cache_specs
@@ -98,27 +99,40 @@ class KVPPScheduler:
     def schedule_forward(self, has_history: bool) -> None:
         self._has_history = has_history
         self._next_attention_layer_index = 0
+        emit_timeline_event(
+            "kvpp_schedule_forward",
+            has_history=has_history,
+            layerwise=self.layerwise,
+            num_layers=len(self.attention_layer_names),
+        )
         if has_history and not self.layerwise:
             self.start_layer_prefetch(self.attention_layer_names[0])
 
     def start_layer_prefetch(self, layer_name: str) -> None:
         cache_ready = torch.npu.Event()
         cache_ready.record(torch.npu.current_stream())
+        emit_timeline_event("kvpp_broadcast_queued", layer_name=layer_name)
         self._prefetch_future = self._prefetch_executor.submit(self.run_layer_prefetch, layer_name, cache_ready)
 
     def run_layer_prefetch(self, layer_name: str, cache_ready: Any) -> None:
         torch.npu.set_device(self._npu_device_id)
-        if self._wait_for_load is not None and not self._wait_for_load(layer_name):
-            # The step ended while this layer's load was still pending. The
-            # collective must run anyway: every rank participates, and the
-            # peers may already be blocked inside it. Say so loudly instead —
-            # they are about to receive this layer's previous contents.
-            logger.warning(
-                "KVPP broadcast of %s proceeds after the connector released its layer-load wait; "
-                "the layer's cache may not hold this step's data.",
-                layer_name,
-            )
+        if self._wait_for_load is not None:
+            emit_timeline_event("kvpp_wait_load_ready_begin", layer_name=layer_name)
+            load_ready = self._wait_for_load(layer_name)
+            emit_timeline_event("kvpp_wait_load_ready_end", layer_name=layer_name, load_ready=load_ready)
+            if not load_ready:
+                # The step ended while this layer's load was still pending. The
+                # collective must run anyway: every rank participates, and the
+                # peers may already be blocked inside it. Say so loudly instead —
+                # they are about to receive this layer's previous contents.
+                logger.warning(
+                    "KVPP broadcast of %s proceeds after the connector released its layer-load wait; "
+                    "the layer's cache may not hold this step's data.",
+                    layer_name,
+                )
+        emit_timeline_event("kvpp_broadcast_begin", layer_name=layer_name)
         self.transport.prefetch(layer_name, cache_ready, self._kv_transfer_stream)
+        emit_timeline_event("kvpp_broadcast_end", layer_name=layer_name)
 
     def wait_for_layer(self, layer_name: str) -> None:
         if not self._has_history:
@@ -128,7 +142,9 @@ class KVPPScheduler:
             self._wait_for_load = get_kv_transfer_group().wait_for_layer_load_ready
             self.start_layer_prefetch(layer_name)
         assert self._prefetch_future is not None
+        emit_timeline_event("kvpp_attention_wait_begin", layer_name=layer_name)
         self._prefetch_future.result()
+        emit_timeline_event("kvpp_attention_wait_end", layer_name=layer_name)
         self._prefetch_future = None
         self._next_attention_layer_index += 1
         if self._next_attention_layer_index < len(self.attention_layer_names):
@@ -156,6 +172,7 @@ class KVPPScheduler:
             release = getattr(get_kv_transfer_group(), "release_layer_load_waiters", None)
             if release is not None:
                 release()
+            emit_timeline_event("kvpp_drain_pending_prefetch", released=release is not None)
             logger.warning("KVPP prefetch still in flight at the end of a forward pass; releasing its load wait.")
         try:
             future.result()

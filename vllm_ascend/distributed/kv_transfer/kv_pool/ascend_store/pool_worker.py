@@ -92,6 +92,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.timeline import emit_timeline_event
 from vllm_ascend.distributed.parallel_state import get_kvpp_group
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
@@ -2495,6 +2496,14 @@ class KVPoolWorker:
                 # step's load is queued: a KVPP broadcast waiter may still
                 # observe it, and the receive thread asserts it is unset.
                 self.layer_load_finished_events[layer_id].clear()
+            emit_timeline_event(
+                "layerwise_load_enqueued",
+                layer_id=layer_id,
+                model_layer=self.current_layer,
+                prefetch_layers=self.num_prefetch_layers,
+                task_count=len(self.layer_load_tasks[layer_id]),
+                gated=attention_start_gate is not None,
+            )
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
                     wait_for_save_layer=reuse_source,
