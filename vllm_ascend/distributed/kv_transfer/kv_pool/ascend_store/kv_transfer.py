@@ -24,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base impor
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tracker import (
     LayerwiseSessionTracker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.timeline import emit_timeline_event
 
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -1543,9 +1544,15 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
         if wait_for_save is not None:
             self._wait_for_save(wait_for_save)
 
+        t_gate = time.monotonic_ns()
         if data.attention_start_gate is not None:
             while not data.attention_start_gate.wait(timeout=10):
                 logger.info("Layerwise %d load waits for attention compute start", layer_id)
+        emit_timeline_event(
+            "layerwise_load_gate_done",
+            layer_id=layer_id,
+            gate_wait_ms=(time.monotonic_ns() - t_gate) / 1e6,
+        )
 
         key_list = []
         addr_list = []
@@ -1586,7 +1593,9 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
             key_list_c = _circular_shift(key_list, shift)
             addr_list_c = _circular_shift(addr_list, shift)
             size_list_c = _circular_shift(size_list, shift)
+            emit_timeline_event("layerwise_load_h2d_begin", layer_id=layer_id, key_count=len(key_list_c))
             self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            emit_timeline_event("layerwise_load_h2d_end", layer_id=layer_id, key_count=len(key_list_c))
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
@@ -2022,11 +2031,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self.sync_save_events[wait_for_save].synchronize()
                 self.layer_save_finished_events[wait_for_save].clear()
 
+            t_gate = time.monotonic_ns()
             if data.attention_start_gate is not None:
                 while not data.attention_start_gate.wait(timeout=10):
                     logger.info("Layerwise %d load waits for attention compute start", layer_id)
+            emit_timeline_event(
+                "layerwise_load_gate_done",
+                layer_id=layer_id,
+                gate_wait_ms=(time.monotonic_ns() - t_gate) / 1e6,
+            )
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            emit_timeline_event(
+                "layerwise_load_h2d_begin", layer_id=layer_id, task_count=len(data.transfer_tasks)
+            )
             for task in data.transfer_tasks:
                 shared = task.shared_block_data
                 if shared is None:
@@ -2039,6 +2057,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 self._active_load_indices = self._group_load_indices.get(task.group_id)
                 self._handle_range_request(req_meta, shared)
                 self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices
+            emit_timeline_event("layerwise_load_h2d_end", layer_id=layer_id)
         except Exception as exc:
             self._fatal_error = exc
             if self._active_load_indices is not None:
@@ -2129,9 +2148,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
+        t_gate = time.monotonic_ns()
         if attention_start_gate is not None:
             while not attention_start_gate.wait(timeout=10):
                 logger.info("Layerwise %d load waits for attention compute start", layer_id)
+        emit_timeline_event(
+            "layerwise_load_gate_done",
+            layer_id=layer_id,
+            gate_wait_ms=(time.monotonic_ns() - t_gate) / 1e6,
+        )
 
         all_load_keys: list[str] = []
         all_req_ids: set[str] = set()
@@ -2156,6 +2181,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
         if self.external_slot_release_waiter is not None:
             self.external_slot_release_waiter(layer_id)
+        emit_timeline_event("layerwise_load_h2d_begin", layer_id=layer_id, key_count=len(all_load_keys))
         res = self._batch_copy_with_limits(
             gvas_array,
             addr_array,
@@ -2164,6 +2190,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.max_transfer_blocks,
             self.max_transfer_bytes,
         )
+        emit_timeline_event("layerwise_load_h2d_end", layer_id=layer_id, result=res)
         if layer_id <= 2 or res != 0:
             logger.debug(
                 "load_thread: layer=%d groups=%d blocks=%d res=%d",

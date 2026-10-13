@@ -2392,6 +2392,15 @@ class KVPoolWorker:
                     group_requests.get(group_id, requests), local_layer, group_id, layer_idx_in_group
                 )
         self._build_shared_load_data()
+        # Everything above runs before the forward: it opens per-layer sessions
+        # and builds every layer's load rows. A profiler sees all layers here,
+        # so mark the boundary to tell preparation apart from the H2D itself.
+        emit_timeline_event(
+            "layerwise_prepare_done",
+            layers=num_local,
+            requests=len(requests),
+            layers_with_loads=sum(1 for tasks in self.layer_load_tasks if tasks),
+        )
 
     def _check_hybrid_load_errors(self) -> None:
         # A hybrid block ID can belong to SWA, compressed KV or compressor
