@@ -446,7 +446,7 @@ class KVPoolWorker:
                 ready_event_sending,
                 self.group_uses_align_state,
                 self.enable_kv_events,
-                worker=self if self.tp_mismatch else None,
+                worker=self if self.tp_mismatch or getattr(self, "shared_pool_w2", False) else None,
             )
             self.kv_send_thread.start()
             ready_event_sending.wait()
@@ -462,7 +462,7 @@ class KVPoolWorker:
                 ready_event,
                 invalid_block_ids=self._invalid_block_ids,
                 invalid_block_ids_lock=self._invalid_block_ids_lock,
-                worker=self if self.tp_mismatch else None,
+                worker=self if self.tp_mismatch or getattr(self, "shared_pool_w2", False) else None,
                 record_operation=self._record_kv_connector_operation,
             )
             self.kv_recv_thread.start()

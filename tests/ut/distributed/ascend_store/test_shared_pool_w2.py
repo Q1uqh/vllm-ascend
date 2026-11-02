@@ -5,7 +5,7 @@ import logging
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
@@ -304,3 +304,52 @@ class TestSharedPoolW2(unittest.TestCase):
         self.assertEqual(thread.get_source_block_completions(), {(0, 7, 0), (0, 8, 0)})
         self.assertFalse(thread._source_remaining)
         self.assertTrue(thread.request_queue.empty())
+
+    def test_real_thread_factory_propagates_w2_without_tp_mismatch(self):
+        # Construct real transfer objects through the production factory. Mock
+        # only start(), so this catches missing constructor context on TP1.
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreRecvingThread
+
+        for enabled in (False, True):
+            template, store, _ = self.make_thread(enabled)
+            worker = KVPoolWorker.__new__(KVPoolWorker)
+            worker.shared_pool_w2 = enabled
+            worker.tp_mismatch = False
+            worker._transfer_threads_started = False
+            worker.can_put = True
+            worker.load_async = True
+            worker.m_store = store
+            worker.token_database = template.token_database
+            worker.grouped_block_size = [16]
+            worker.tp_rank = 0
+            worker.tp_size = 1
+            worker.pcp_rank = 0
+            worker.pcp_size = 1
+            worker.dcp_size = 1
+            worker.put_step = 1
+            worker.kv_role = "kv_producer"
+            worker.use_kvpp = False
+            worker.group_uses_align_state = [False]
+            worker.enable_kv_events = False
+            worker._invalid_block_ids = set()
+            worker._invalid_block_ids_lock = threading.Lock()
+            worker.w2_worker_rank = 0
+            worker._w2_observation = self.observation()
+
+            def construct(cls, *args, **kwargs):
+                thread = cls(*args, **kwargs)
+                thread.start = thread.ready_event.set
+                return thread
+
+            prefix = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker."
+            with patch(prefix + "KVCacheStoreSendingThread", side_effect=lambda *a, **kw: construct(
+                KVCacheStoreSendingThread, *a, **kw
+            )), patch(prefix + "KVCacheStoreRecvingThread", side_effect=lambda *a, **kw: construct(
+                KVCacheStoreRecvingThread, *a, **kw
+            )):
+                worker._start_kv_transfer_threads()
+            self.assertEqual(worker.kv_send_thread.shared_pool_w2, enabled)
+            self.assertIs(worker.kv_send_thread.worker, worker if enabled else None)
+            self.assertIs(worker.kv_recv_thread.worker, worker if enabled else None)
+            if enabled:
+                self.assertEqual(worker.kv_send_thread.get_source_block_completions(), set())
