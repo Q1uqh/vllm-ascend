@@ -231,6 +231,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     if client is not None:
                         client.close()
                 finally:
+                    if getattr(self.connector_scheduler, "shared_pool_w2", False):
+                        scheduler = self.connector_scheduler
+                        scheduler._w2_observation.emit(
+                            logger, final=True, pending_source_refs=len(scheduler._source_blocks.pending)
+                        )
                     self.connector_scheduler.store_scheduler.close()
         finally:
             if hasattr(self, "lookup_server"):

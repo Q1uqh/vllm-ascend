@@ -444,8 +444,9 @@ class KVTransferThread(threading.Thread):
 class KVCacheStoreBatch:
     """FIFO fence for a batch of asynchronous KV store requests."""
 
-    def __init__(self) -> None:
+    def __init__(self, requests: list[ReqMeta] | None = None) -> None:
         self.done = threading.Event()
+        self.requests = tuple(requests or ())
 
 
 # Poll interval for waiting on a specific request's queued save chunks
@@ -487,6 +488,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.completed_events_lock = threading.Lock()
         self.completed_events: dict[int, int] = {}
         self.worker = worker
+        self.shared_pool_w2 = worker is not None and getattr(worker, "shared_pool_w2", False) is True
+        if self.shared_pool_w2:
+            self._source_completion_lock = threading.Lock()
+            self._source_completions: set[tuple[int, int, int]] = set()
+            self._source_remaining: dict[int, set[int]] = {}
         # Request-local durable high-water marks. They are advanced only after
         # the backend store succeeds, so a failed range is retried on the next
         # Decode boundary instead of being lost when scheduler metadata moves
@@ -548,15 +554,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def add_save_batch(self, requests: list[ReqMeta]) -> KVCacheStoreBatch:
         """Queue requests followed by a fence that completes after the batch."""
-        save_batch = KVCacheStoreBatch()
+        save_batch = KVCacheStoreBatch(requests if self.shared_pool_w2 else None)
         # The lock makes registration, queue publication, and the transition
         # to a fatal state mutually exclusive. A failed consumer therefore
         # either drains this complete batch or rejects it before registration.
         with self._request_submit_lock:
             if self._stopping.is_set():
+                if self.shared_pool_w2:
+                    raise RuntimeError("Shared-pool W2 cannot submit saves after shutdown")
                 save_batch.done.set()
                 return save_batch
             if self._fatal_error is not None:
+                if self.shared_pool_w2:
+                    self.raise_if_failed()
                 logger.error("Reject KV save batch to failed thread %s: %s", self.name, self._fatal_error)
                 # No source KV is read, but completion must release Scheduler pins.
                 # Reject without registering jobs, advancing offsets, or emitting BlockStored.
@@ -567,11 +577,83 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 save_batch.done.set()
                 return save_batch
             for request in requests:
+                if self.shared_pool_w2:
+                    request.w2_save_succeeded = None
+                    self.register_source_blocks(request)
                 self.add_stored_request(request)
             for request in requests:
                 self.request_queue.put(request)
             self.request_queue.put(save_batch)
         return save_batch
+
+    def register_source_blocks(self, request: ReqMeta) -> None:
+        if self.shared_pool_w2 and request.source_save_id is not None:
+            with self._source_completion_lock:
+                self._source_remaining[request.source_save_id] = set(request.source_block_ids)
+
+    def complete_source_blocks(self, request: ReqMeta, blocks: list[int] | None = None) -> None:
+        if not self.shared_pool_w2 or request.source_save_id is None:
+            return
+        with self._source_completion_lock:
+            remaining = self._source_remaining.get(request.source_save_id)
+            if remaining is None:
+                return
+            completed = remaining.copy() if blocks is None else remaining.intersection(blocks)
+            self._source_completions.update(
+                (request.source_save_id, block, self.worker.w2_worker_rank) for block in completed
+            )
+            remaining.difference_update(completed)
+            if not remaining:
+                self._source_remaining.pop(request.source_save_id, None)
+
+    def get_source_block_completions(self) -> set[tuple[int, int, int]]:
+        with self._source_completion_lock:
+            completed = self._source_completions
+            self._source_completions = set()
+        return completed
+
+    def wait_for_batch(self, batch: KVCacheStoreBatch) -> None:
+        while not batch.done.wait(timeout=_TRANSFER_SHUTDOWN_POLL_S):
+            self.raise_if_failed()
+            if self._stopping.is_set():
+                raise RuntimeError("Shared-pool W2 save interrupted by shutdown")
+        self.raise_if_failed()
+        failed = sum(request.w2_save_succeeded is not True for request in batch.requests)
+        if failed:
+            self.worker._w2_observation.add(save_jobs_failed=failed)
+            raise RuntimeError(f"Shared-pool W2 failed to publish {failed} save job(s); PD handoff aborted")
+
+    def _put_shared_pool_blocks(self, request: ReqMeta, keys, addrs, sizes, block_ids) -> list[bool]:
+        # One logical source block per call. Preserve all PP-expanded key shards
+        # of that block; completion of only one shard must never unpin it.
+        if not block_ids or len(keys) % len(block_ids):
+            raise ValueError("Shared-pool W2 source blocks must align with put keys")
+        partitions = len(keys) // len(block_ids)
+        results = [False] * len(keys)
+        indices_by_block: dict[int, list[int]] = {}
+        for index, block in enumerate(block_ids):
+            indices_by_block.setdefault(block, []).extend(
+                index * partitions + shard for shard in range(partitions)
+            )
+        for block, indices in indices_by_block.items():
+            block_keys = [keys[index] for index in indices]
+            block_addrs = [addrs[index] for index in indices]
+            block_sizes = [sizes[index] for index in indices]
+            tick = time.perf_counter()
+            result = self.m_store.put(block_keys, block_addrs, block_sizes)
+            if isinstance(result, list) and len(result) == len(indices):
+                succeeded = [value is True for value in result]
+            else:
+                succeeded = [result is True] * len(indices)
+            for index, success in zip(indices, succeeded, strict=True):
+                results[index] = success
+            self.worker._w2_observation.add(
+                put_calls=1, put_blocks=1, put_failed=int(not all(succeeded)),
+                put_bytes=sum(sum(row) for row in block_sizes),
+                put_ms=(time.perf_counter() - tick) * 1000,
+            )
+            self.complete_source_blocks(request, [block])
+        return results
 
     def wait_for_requests_saved(self, req_ids: set[str] | None) -> None:
         """Block until every queued save chunk of these requests completed.
@@ -740,6 +822,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             tracked_request = self.is_live_store_job(req_meta)
             try:
                 succeeded = self.worker._store_kv_tp_mismatch(req_meta)
+                if self.shared_pool_w2:
+                    req_meta.w2_save_succeeded = succeeded is True
                 if tracked_request:
                     if succeeded is True:
                         self.record_saved_offset(req_meta, req_meta.token_len_chunk)
@@ -750,6 +834,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._remember_retry_token_ids(req_meta)
                 logger.exception("Failed to store KV cache for TP-mismatch request %s", req_id)
             finally:
+                self.complete_source_blocks(req_meta)
                 remaining = self.finish_store_job(req_meta) if tracked_request else None
                 if tracked_request and remaining == 0:
                     self.set_finished_request(req_id)
@@ -767,6 +852,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
             # Only explicit success may advance the saved offset; failures return False.
             succeeded = self._handle_stored_request(req_meta)
+            if self.shared_pool_w2:
+                req_meta.w2_save_succeeded = succeeded is True
             if succeeded is True:
                 self.record_saved_offset(req_meta, req_meta.token_len_chunk)
                 self._clear_retry_token_ids(req_meta)
@@ -774,8 +861,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._remember_retry_token_ids(req_meta)
         except Exception:
             self._remember_retry_token_ids(req_meta)
-            logger.exception("Failed to store KV cache for request %s", req_id)
+            if not self.shared_pool_w2:
+                logger.exception("Failed to store KV cache for request %s", req_id)
         finally:
+            self.complete_source_blocks(req_meta)
             remaining = self.finish_store_job(req_meta) if tracked_request else None
             if tracked_request and remaining == 0:
                 self.set_finished_request(req_id)
@@ -973,7 +1062,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return False
             if current_event is not None:
                 current_event.synchronize()
-            put_result = self.m_store.put(keys, addrs, sizes)
+            if self.shared_pool_w2:
+                put_result = self._put_shared_pool_blocks(req_meta, keys, addrs, sizes, key_block_ids)
+            else:
+                put_result = self.m_store.put(keys, addrs, sizes)
             if isinstance(put_result, list):
                 if len(put_result) != len(keys):
                     logger.error("KV store backend returned %s results for %s keys", len(put_result), len(keys))
@@ -1057,6 +1149,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     req_meta.block_ids_by_group[0],
                     token_len,
                     mask_num,
+                    **({"request_id": req_id} if getattr(self.worker, "shared_pool_w2", False) is True else {}),
                 )
                 if loaded is False:
                     self._mark_failed_requests([req_meta])
@@ -1117,6 +1210,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
             load_get_start = time.perf_counter() if self._record_operation_cb is not None else 0.0
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if self.worker is not None and getattr(self.worker, "shared_pool_w2", False) is True:
+                success = ret is not None and len(ret) == len(key_list_c) and all(value == 0 for value in ret)
+                self.worker._w2_observation.record_load(req_id, key_list_c, size_list_c, success)
             if self._record_operation_cb is not None:
                 self._record_operation_cb(
                     "load_get",

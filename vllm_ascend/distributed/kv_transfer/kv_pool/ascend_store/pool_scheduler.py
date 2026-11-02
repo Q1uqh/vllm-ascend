@@ -42,6 +42,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.shared_pool_w2 import (
+    SharedPoolObservation,
+    SourceBlockTracker,
+    validate_shared_pool_w2,
+)
 
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
@@ -50,7 +55,6 @@ def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
         return request.prefill_token_ids
     assert request.prompt_token_ids is not None
     return request.prompt_token_ids
-
 
 class KVPoolScheduler:
     def __init__(
@@ -82,6 +86,10 @@ class KVPoolScheduler:
         self.kv_cache_group_families = infer_group_cache_families(kv_cache_groups, self.compress_ratios, self.hf_config)
         self.num_speculative_blocks_by_group = self._infer_mamba_groups()
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self.shared_pool_w2 = validate_shared_pool_w2(
+            vllm_config.kv_transfer_config.kv_connector_extra_config, self.kv_role,
+            len(kv_cache_groups) if kv_cache_groups is not None else None,
+        )
         self.consumer_is_to_load = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_load", False
         )
@@ -141,6 +149,11 @@ class KVPoolScheduler:
         # {event_id, completed_woke_count}
         self.sending_events: dict[int, int] = {}
         self._expected_worker_count = vllm_config.parallel_config.world_size
+        if self.shared_pool_w2:
+            self._source_blocks = SourceBlockTracker(self._expected_worker_count)
+            self._w2_observation = SharedPoolObservation(
+                "scheduler", self.kv_role, vllm_config.parallel_config.rank, self._expected_worker_count
+            )
 
         use_mla = getattr(vllm_config.model_config, "use_mla", False)
         tp_mismatch_info = infer_tp_mismatch_info(
@@ -358,6 +371,11 @@ class KVPoolScheduler:
             return 0, False
 
         num_external_hit_tokens = self._lookup_external_hit_tokens(request, num_computed_tokens)
+        if getattr(self, "shared_pool_w2", False):
+            self._w2_observation.add(
+                lookup_queries=1, lookup_misses=int(not num_external_hit_tokens),
+                external_hit_tokens=num_external_hit_tokens or 0,
+            )
         if not num_external_hit_tokens:
             return 0, False
 
@@ -816,6 +834,22 @@ class KVPoolScheduler:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
 
+        if getattr(self, "shared_pool_w2", False):
+            for request in meta.requests:
+                if not request.can_save:
+                    continue
+                if self._block_pool is None:
+                    raise RuntimeError("Shared-pool W2 requires the bound BlockPool before save scheduling")
+                # Speculative align-state scratch must stay exclusively owned;
+                # the ordinary step fence protects these scratch buffers.
+                scratch = self.num_speculative_blocks_by_group.get(0, 0)
+                blocks = request.block_ids_by_group[0]
+                sources = blocks[:-scratch] if scratch else blocks
+                sources = sorted(set(block for block in sources if block > 0))
+                self._block_pool.touch([self._block_pool.blocks[block] for block in sources])
+                request.source_save_id, request.source_block_ids = self._source_blocks.register(sources)
+                self._w2_observation.add(source_pins=len(sources), save_jobs=1)
+            self._w2_observation.emit(logger, pending_source_refs=len(self._source_blocks.pending))
         return meta
 
     def get_sending_event_id(self):
@@ -831,6 +865,8 @@ class KVPoolScheduler:
         """
         Keep the reference of all non-null Mamba blocks sent to the external store.
         """
+        if getattr(self, "shared_pool_w2", False):
+            return
         if not self.use_hybrid or not self.num_speculative_blocks_by_group or not req_meta.can_save:
             return
         # Layerwise transfer frees mamba blocks layer by layer on its own
@@ -858,7 +894,9 @@ class KVPoolScheduler:
         self.sending_blocks[using_event_id] = current_step_sending
 
     def has_pending_push_work(self) -> bool:
-        return bool(self.sending_events)
+        return bool(self.sending_events) or (
+            getattr(self, "shared_pool_w2", False) and bool(self._source_blocks.pending)
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -869,6 +907,12 @@ class KVPoolScheduler:
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, AscendStoreKVConnectorWorkerMetadata) or self._block_pool is None:
             return
+
+        if getattr(self, "shared_pool_w2", False):
+            released = self._source_blocks.acknowledge(meta.source_block_completions)
+            self._block_pool.free_blocks([self._block_pool.blocks[block] for block in released])
+            self._w2_observation.add(source_unpins=len(released))
+            self._w2_observation.emit(logger, pending_source_refs=len(self._source_blocks.pending))
 
         for event_id, count in meta.completed_events.items():
             logger.debug("event %s update with %s", event_id, count)
@@ -896,6 +940,8 @@ class KVPoolScheduler:
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Allow the scheduler to free blocks after synchronous saving."""
+        if getattr(self, "shared_pool_w2", False):
+            self._w2_observation.add(requests_finished=1)
         return False, None
 
     def request_finished_all_groups(
@@ -904,6 +950,8 @@ class KVPoolScheduler:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """Allow the scheduler to free all groups after synchronous saving."""
+        if getattr(self, "shared_pool_w2", False):
+            self._w2_observation.add(requests_finished=1)
         return False, None
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
@@ -915,7 +963,7 @@ class KVPoolScheduler:
 
     def reset_store(self) -> bool:
         """Drain the send queue and ``remove_all`` when no in-flight blocks are held."""
-        if self.sending_events or self.sending_blocks:
+        if self.has_pending_push_work() or self.sending_blocks:
             logger.error(
                 "AscendStore reset_store refused; in-flight saves still track sending_events=%s sending_blocks=%s",
                 list(self.sending_events),

@@ -960,6 +960,9 @@ class ReqMeta:
     # operation cannot update the save progress of a new request generation
     # that happens to reuse the same req_id.
     store_job_id: int | None = None
+    source_save_id: int | None = None
+    source_block_ids: tuple[int, ...] = ()
+    w2_save_succeeded: bool | None = None
 
     def __init__(
         self,
@@ -1001,6 +1004,9 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        source_save_id: int | None = None,
+        source_block_ids: tuple[int, ...] = (),
+        w2_save_succeeded: bool | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -1023,6 +1029,9 @@ class ReqMeta:
         self.token_ids = token_ids
         self.original_block_size = original_block_size
         self.event_id = event_id
+        self.source_save_id = source_save_id
+        self.source_block_ids = source_block_ids
+        self.w2_save_succeeded = w2_save_succeeded
         self.store_job_id = store_job_id
         self.last_block_gva = last_block_gva
         self.partial_block_index = partial_block_index
@@ -1251,6 +1260,8 @@ class AscendConnectorMetadata(KVConnectorMetadata):
 class AscendStoreKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
     completed_events: dict[int, int] = field(default_factory=dict)
     """key: event_id, value: completed worker count"""
+    # (scheduler save generation, physical source block, global worker rank)
+    source_block_completions: set[tuple[int, int, int]] = field(default_factory=set)
 
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
         assert isinstance(other, AscendStoreKVConnectorWorkerMetadata), (
@@ -1263,4 +1274,6 @@ class AscendStoreKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
                 merged[event_id] = other.completed_events[event_id]
             else:
                 merged[event_id] = merged[event_id] + other.completed_events[event_id]
-        return AscendStoreKVConnectorWorkerMetadata(merged)
+        return AscendStoreKVConnectorWorkerMetadata(
+            merged, self.source_block_completions | other.source_block_completions
+        )

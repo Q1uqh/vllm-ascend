@@ -66,11 +66,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.shared_pool_w2 import (
+    SharedPoolObservation,
+    validate_shared_pool_w2,
+)
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
-
 
 class KVPoolWorker:
     # The main class for the cache engine.
@@ -172,6 +175,14 @@ class KVPoolWorker:
         self.backend = extra_config.get("backend", "mooncake")
         self.backend_name = self.backend.lower()
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
+        self.shared_pool_w2 = validate_shared_pool_w2(
+            extra_config, self.kv_role, len(kv_cache_groups) if kv_cache_groups is not None else None
+        )
+        if self.shared_pool_w2:
+            self.w2_worker_rank = vllm_config.parallel_config.rank % vllm_config.parallel_config.world_size
+            self._w2_observation = SharedPoolObservation(
+                "worker", self.kv_role, self.w2_worker_rank, vllm_config.parallel_config.world_size
+            )
         self.use_hybrid = self._compute_use_hybrid(vllm_config, kv_cache_groups)
         self._attention_saved_layers: set[int] = set()
         self.use_mamba = self._uses_mamba_kv_cache(self.use_hybrid, kv_cache_config)
@@ -406,6 +417,8 @@ class KVPoolWorker:
         for thread in threads:
             if thread.is_alive():
                 thread.join()
+        if getattr(self, "shared_pool_w2", False):
+            self._w2_observation.emit(logger, final=True)
         self.m_store.close()
         self._closed = True
 
@@ -896,6 +909,7 @@ class KVPoolWorker:
                     request.block_ids_by_group[0],
                     token_len,
                     mask_num,
+                    **({"request_id": request.req_id} if getattr(self, "shared_pool_w2", False) else {}),
                 )
                 if loaded is False:
                     self._record_failed_request(request)
@@ -959,6 +973,9 @@ class KVPoolWorker:
             )
             load_get_start = time.perf_counter()
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if getattr(self, "shared_pool_w2", False):
+                success = ret is not None and len(ret) == len(key_list_c) and all(value == 0 for value in ret)
+                self._w2_observation.record_load(request.req_id, key_list_c, size_list_c, success)
             self._record_kv_connector_operation(
                 "load_get",
                 time.perf_counter() - load_get_start,
@@ -1080,6 +1097,12 @@ class KVPoolWorker:
         for request in connector_metadata.requests:
             can_save = request.can_save
             if can_save is None or not can_save:
+                if getattr(self, "shared_pool_w2", False) and request.source_save_id is not None:
+                    # A load failure can disable saving after the scheduler
+                    # pinned sources. No save reads them; still return pins.
+                    send_thread.register_source_blocks(request)
+                    send_thread.complete_source_blocks(request)
+                    self._w2_observation.add(save_jobs_skipped=1)
                 continue
             if current_event is None:
                 current_event = torch.npu.Event()
@@ -1092,6 +1115,15 @@ class KVPoolWorker:
             return
 
         self._previous_save_batch = send_thread.add_save_batch(requests)
+        if getattr(self, "shared_pool_w2", False):
+            tick = time.perf_counter()
+            try:
+                send_thread.wait_for_batch(self._previous_save_batch)
+            except Exception:
+                self._w2_observation.add(step_save_failed=1)
+                self._w2_observation.emit(logger, final=True)
+                raise
+            self._w2_observation.add(step_save_done=1, wait_ms=(time.perf_counter() - tick) * 1000)
 
     def _make_sub_key_str(self, base_key: str, effective_rank: int) -> str:
         """Rewrite ``@head_or_tp_rank:<local>`` in serialized ``base_key`` to ``<effective_rank>``.
@@ -1173,6 +1205,7 @@ class KVPoolWorker:
         block_ids: list[int],
         token_len: int,
         mask_num: int,
+        request_id: str | None = None,
     ) -> bool | None:
         keys, addrs, sizes, key_block_ids = self._build_tp_mismatch_keys_and_addrs(
             block_hashes, block_ids, token_len, mask_num
@@ -1191,6 +1224,9 @@ class KVPoolWorker:
         )
         load_get_start = time.perf_counter()
         ret = self.m_store.get(keys_c, addrs_c, sizes_c)
+        if getattr(self, "shared_pool_w2", False) and request_id is not None:
+            success = ret is not None and len(ret) == len(keys_c) and all(value == 0 for value in ret)
+            self._w2_observation.record_load(request_id, keys_c, sizes_c, success)
         self._record_kv_connector_operation(
             "load_get",
             time.perf_counter() - load_get_start,
@@ -1224,7 +1260,7 @@ class KVPoolWorker:
         token_len = req_meta.token_len_chunk
         block_ids = req_meta.block_ids_by_group[0]
         save_start_token = send_thread.get_saved_offset(req_id)
-        keys, addrs, sizes, _ = self._build_tp_mismatch_keys_and_addrs(
+        keys, addrs, sizes, key_block_ids = self._build_tp_mismatch_keys_and_addrs(
             req_meta.block_hashes,
             block_ids,
             token_len,
@@ -1251,6 +1287,8 @@ class KVPoolWorker:
             logger.error("Prefill-PP adaptor expanded %s TP keys to an invalid count %s", logical_key_count, len(keys))
             return False
         physical_keys_per_logical_key = len(keys) // logical_key_count
+        if getattr(self, "shared_pool_w2", False):
+            key_block_ids = [block for block in key_block_ids for _ in range(physical_keys_per_logical_key)]
         physical_keys_per_block = self.num_sub_keys * physical_keys_per_logical_key
         exists_states = send_thread.lookup(keys)
         if len(exists_states) != len(keys):
@@ -1275,7 +1313,13 @@ class KVPoolWorker:
             len(missing_keys),
             missing_keys[:3],
         )
-        put_result = self.m_store.put(missing_keys, missing_addrs, missing_sizes)
+        if getattr(self, "shared_pool_w2", False):
+            put_result = send_thread._put_shared_pool_blocks(
+                req_meta, missing_keys, missing_addrs, missing_sizes,
+                [key_block_ids[index] for index in missing_indices],
+            )
+        else:
+            put_result = self.m_store.put(missing_keys, missing_addrs, missing_sizes)
         if isinstance(put_result, list):
             if len(put_result) != len(missing_keys):
                 logger.error(
@@ -1355,6 +1399,10 @@ class KVPoolWorker:
         return True
 
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
+        if getattr(self, "shared_pool_w2", False):
+            self._w2_observation.retire(finished_req_ids)
+            self._w2_observation.retire(meta.preempted_req_ids, recovery=bool(meta.preempted_req_ids))
+            self._w2_observation.emit(logger)
         if self.kv_send_thread is not None:
             send_thread = self.kv_send_thread
             for req_id in meta.preempted_req_ids:
@@ -1774,6 +1822,11 @@ class KVPoolWorker:
 
     def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
         if isinstance(self.kv_send_thread, KVCacheStoreSendingThread):
-            if ce := self.kv_send_thread.get_completed_events():
-                return AscendStoreKVConnectorWorkerMetadata(ce)
+            ce = self.kv_send_thread.get_completed_events()
+            completions = (
+                self.kv_send_thread.get_source_block_completions()
+                if getattr(self, "shared_pool_w2", False) else set()
+            )
+            if ce or completions:
+                return AscendStoreKVConnectorWorkerMetadata(ce, completions)
         return None
