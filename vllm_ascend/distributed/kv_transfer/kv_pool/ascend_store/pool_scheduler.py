@@ -43,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.shared_pool_w2 import (
+    BlockPoolObservation,
     SharedPoolObservation,
     SourceBlockTracker,
     validate_shared_pool_w2,
@@ -151,6 +152,7 @@ class KVPoolScheduler:
         self._expected_worker_count = vllm_config.parallel_config.world_size
         if self.shared_pool_w2:
             self._source_blocks = SourceBlockTracker(self._expected_worker_count)
+            self._w2_expected_checks: dict[int, set[int]] = {}
             self._w2_observation = SharedPoolObservation(
                 "scheduler", self.kv_role, vllm_config.parallel_config.rank, self._expected_worker_count
             )
@@ -848,8 +850,14 @@ class KVPoolScheduler:
                 sources = sorted(set(block for block in sources if block > 0))
                 self._block_pool.touch([self._block_pool.blocks[block] for block in sources])
                 request.source_save_id, request.source_block_ids = self._source_blocks.register(sources)
+                self._w2_expected_checks[request.source_save_id] = set()
+                if hasattr(self, "_w2_allocator"):
+                    self._w2_allocator.tracked.update(sources)
                 self._w2_observation.add(source_pins=len(sources), save_jobs=1)
-            self._w2_observation.emit(logger, pending_source_refs=len(self._source_blocks.pending))
+            self._w2_observation.emit(
+                logger, pending_source_refs=len(self._source_blocks.pending),
+                pending_return_checks=len(self._w2_expected_checks),
+            )
         return meta
 
     def get_sending_event_id(self):
@@ -895,7 +903,8 @@ class KVPoolScheduler:
 
     def has_pending_push_work(self) -> bool:
         return bool(self.sending_events) or (
-            getattr(self, "shared_pool_w2", False) and bool(self._source_blocks.pending)
+            getattr(self, "shared_pool_w2", False)
+            and bool(self._source_blocks.pending or self._w2_expected_checks)
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -909,10 +918,27 @@ class KVPoolScheduler:
             return
 
         if getattr(self, "shared_pool_w2", False):
+            # This callback receives the executor's actual model-runner output.
+            # Match each save's worker-side boundary checks by generation.
+            for save_id, rank, complete in meta.w2_save_checks:
+                seen = self._w2_expected_checks.get(save_id)
+                if seen is None or rank not in self._source_blocks.workers:
+                    continue
+                if not complete:
+                    self._w2_observation.add(return_before_save=1)
+                    self._w2_observation.emit(logger, final=True)
+                    raise RuntimeError("Shared-pool W2 executor output returned before a successful save")
+                seen.add(rank)
+                if seen == self._source_blocks.workers:
+                    del self._w2_expected_checks[save_id]
+                    self._w2_observation.add(return_checked_jobs=1)
             released = self._source_blocks.acknowledge(meta.source_block_completions)
             self._block_pool.free_blocks([self._block_pool.blocks[block] for block in released])
             self._w2_observation.add(source_unpins=len(released))
-            self._w2_observation.emit(logger, pending_source_refs=len(self._source_blocks.pending))
+            self._w2_observation.emit(
+                logger, pending_source_refs=len(self._source_blocks.pending),
+                pending_return_checks=len(self._w2_expected_checks),
+            )
 
         for event_id, count in (meta.completed_events or {}).items():
             logger.debug("event %s update with %s", event_id, count)
@@ -956,6 +982,10 @@ class KVPoolScheduler:
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         self._block_pool = gpu_block_pool
+        if getattr(self, "shared_pool_w2", False) and self.kv_role == "kv_producer":
+            if hasattr(self, "_w2_allocator"):
+                self._w2_allocator.detach()
+            self._w2_allocator = BlockPoolObservation(gpu_block_pool, self._source_blocks, self._w2_observation)
 
     def update_finished_recving(self, finished_recving: set[str] | None) -> None:
         if finished_recving:

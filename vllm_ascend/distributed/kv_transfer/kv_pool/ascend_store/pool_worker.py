@@ -1820,13 +1820,22 @@ class KVPoolWorker:
             return events
         return []
 
-    def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
+    def build_connector_worker_meta(
+        self, metadata: AscendConnectorMetadata | None = None
+    ) -> AscendStoreKVConnectorWorkerMetadata | None:
         if isinstance(self.kv_send_thread, KVCacheStoreSendingThread):
             ce = self.kv_send_thread.get_completed_events()
             completions = (
                 self.kv_send_thread.get_source_block_completions()
                 if getattr(self, "shared_pool_w2", False) else set()
             )
-            if ce or completions:
-                return AscendStoreKVConnectorWorkerMetadata(ce or {}, completions)
+            checks = set()
+            if getattr(self, "shared_pool_w2", False) and metadata is not None:
+                for request in metadata.requests:
+                    if request.source_save_id is not None:
+                        complete = request.w2_save_succeeded is True
+                        checks.add((request.source_save_id, self.w2_worker_rank, complete))
+                self._w2_observation.add(worker_return_checked_jobs=len(checks))
+            if ce or completions or checks:
+                return AscendStoreKVConnectorWorkerMetadata(ce or {}, completions, checks)
         return None

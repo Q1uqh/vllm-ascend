@@ -21,6 +21,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.shared_pool_w2 import (
+    BlockPoolObservation,
     SharedPoolObservation,
     SourceBlockTracker,
     validate_shared_pool_w2,
@@ -202,6 +203,7 @@ class TestSharedPoolW2(unittest.TestCase):
         scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
         scheduler.shared_pool_w2 = True
         scheduler._source_blocks = SourceBlockTracker(2)
+        scheduler._w2_expected_checks = {}
         scheduler._w2_observation = self.observation()
         save_id, _ = scheduler._source_blocks.register([7])
         refs = {7: 2}  # one request ended: other request + this save pin remain
@@ -277,6 +279,7 @@ class TestSharedPoolW2(unittest.TestCase):
         scheduler._loading_req_ids = set()
         scheduler.num_speculative_blocks_by_group = {}
         scheduler._source_blocks = SourceBlockTracker(1)
+        scheduler._w2_expected_checks = {}
         scheduler._w2_observation = self.observation()
         pool = SimpleNamespace(blocks={7: 7, 8: 8}, touch=MagicMock())
         scheduler._block_pool = pool
@@ -372,6 +375,7 @@ class TestSharedPoolW2(unittest.TestCase):
         scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
         scheduler.shared_pool_w2 = True
         scheduler._source_blocks = SourceBlockTracker(1)
+        scheduler._w2_expected_checks = {}
         scheduler._source_blocks.register([7, 8])
         scheduler._w2_observation = self.observation()
         scheduler._loading_req_ids = set()
@@ -394,3 +398,89 @@ class TestSharedPoolW2(unittest.TestCase):
         legacy = AscendStoreKVConnectorWorkerMetadata({5: 2})
         self.assertEqual(a.aggregate(legacy).completed_events, {5: 2})
         self.assertEqual(legacy.aggregate(a).completed_events, {5: 2})
+
+    def test_allocator_observes_return_and_actual_reuse_with_shared_owner(self):
+        tracker = SourceBlockTracker(1)
+        obs = self.observation()
+        block = SimpleNamespace(block_id=7, ref_cnt=3, is_null=False)
+        pool = SimpleNamespace()
+        def free(blocks):
+            for item in blocks:
+                item.ref_cnt -= 1
+        def allocate(count):
+            self.assertEqual(block.ref_cnt, 0)
+            block.ref_cnt = 1
+            return [block]
+        pool.free_blocks, pool.get_new_blocks = free, allocate
+        monitor = BlockPoolObservation(pool, tracker, obs)
+        monitor.tracked.add(7)
+        save, _ = tracker.register([7])
+        pool.free_blocks([block])  # request finishes, shared request remains
+        self.assertEqual(obs.counts["allocator_returned"], 0)
+        tracker.acknowledge([(save, 7, 0)])
+        pool.free_blocks([block])  # release transfer reference
+        self.assertEqual(obs.counts["allocator_returned"], 0)
+        pool.free_blocks([block])  # last shared owner finishes
+        self.assertEqual(obs.counts["allocator_returned"], 1)
+        pool.get_new_blocks(1)
+        self.assertEqual(obs.counts["allocator_reused"], 1)
+        self.assertEqual(obs.counts["early_reuse"], 0)
+        monitor.detach()
+        self.assertIs(pool.free_blocks, free)
+        self.assertIs(pool.get_new_blocks, allocate)
+
+    def test_allocator_detects_return_while_source_is_still_inflight(self):
+        tracker = SourceBlockTracker(1)
+        obs = self.observation()
+        block = SimpleNamespace(block_id=7, ref_cnt=1, is_null=False)
+        pool = SimpleNamespace(
+            free_blocks=lambda blocks: setattr(block, "ref_cnt", 0),
+            get_new_blocks=lambda count: [block],
+        )
+        monitor = BlockPoolObservation(pool, tracker, obs)
+        monitor.tracked.add(7)
+        tracker.register([7])
+        with self.assertRaisesRegex(RuntimeError, "outstanding save"):
+            pool.free_blocks([block])
+        self.assertEqual(obs.counts["early_reuse"], 1)
+        monitor.detach()
+
+    def test_worker_output_boundary_reports_missing_save_not_as_success(self):
+        thread, _, request = self.make_thread()
+        worker = KVPoolWorker.__new__(KVPoolWorker)
+        worker.shared_pool_w2 = True
+        worker.w2_worker_rank = 0
+        worker.kv_send_thread = thread
+        worker._w2_observation = self.observation()
+        metadata = AscendConnectorMetadata(set(), set())
+        metadata.add_request(request)
+        output = worker.build_connector_worker_meta(metadata)
+        self.assertEqual(output.w2_save_checks, {(0, 0, False)})
+        request.can_save = False  # cancellation is not proof of publication
+        self.assertEqual(worker.build_connector_worker_meta(metadata).w2_save_checks, {(0, 0, False)})
+        request.can_save = True
+        request.w2_save_succeeded = True
+        output = worker.build_connector_worker_meta(metadata)
+        self.assertEqual(output.w2_save_checks, {(0, 0, True)})
+        self.assertEqual(output.aggregate(output).w2_save_checks, {(0, 0, True)})
+
+    def test_scheduler_checks_executor_output_before_unpinning(self):
+        scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+        scheduler.shared_pool_w2 = True
+        scheduler._source_blocks = SourceBlockTracker(1)
+        scheduler._source_blocks.register([7])
+        scheduler._w2_expected_checks = {0: set()}
+        scheduler._w2_observation = self.observation()
+        scheduler._loading_req_ids = set()
+        scheduler.sending_events, scheduler.sending_blocks = {}, {}
+        scheduler._block_pool = SimpleNamespace(blocks={7: 7}, free_blocks=MagicMock())
+        invalid = AscendStoreKVConnectorWorkerMetadata({}, {(0, 7, 0)}, {(0, 0, False)})
+        with self.assertRaisesRegex(RuntimeError, "before a successful save"):
+            scheduler.update_connector_output(SimpleNamespace(
+                finished_recving=set(), kv_connector_worker_meta=invalid
+            ))
+        scheduler._block_pool.free_blocks.assert_not_called()
+        valid = AscendStoreKVConnectorWorkerMetadata({}, {(0, 7, 0)}, {(0, 0, True)})
+        scheduler.update_connector_output(SimpleNamespace(finished_recving=set(), kv_connector_worker_meta=valid))
+        self.assertEqual(scheduler._w2_observation.counts["return_checked_jobs"], 1)
+        self.assertFalse(scheduler._w2_expected_checks)

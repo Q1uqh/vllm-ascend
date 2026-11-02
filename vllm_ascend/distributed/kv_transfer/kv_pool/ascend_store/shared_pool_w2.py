@@ -50,6 +50,7 @@ class SourceBlockTracker:
             raise ValueError("worker_count must be positive")
         self.workers = frozenset(range(worker_count))
         self.next_id = 0
+        self.active_blocks: Counter[int] = Counter()
         self.pending: dict[tuple[int, int], set[int]] = {}
 
     def register(self, blocks: Iterable[int]) -> tuple[int, tuple[int, ...]]:
@@ -58,6 +59,7 @@ class SourceBlockTracker:
         block_ids = tuple(sorted(set(blocks)))
         for block_id in block_ids:
             self.pending[save_id, block_id] = set()
+            self.active_blocks[block_id] += 1
         return save_id, block_ids
 
     def acknowledge(self, completions: Iterable[tuple[int, int, int]]) -> list[int]:
@@ -69,6 +71,9 @@ class SourceBlockTracker:
             seen.add(worker)
             if seen == self.workers:
                 del self.pending[save_id, block_id]
+                self.active_blocks[block_id] -= 1
+                if not self.active_blocks[block_id]:
+                    del self.active_blocks[block_id]
                 released.append(block_id)
         return released
 
@@ -118,3 +123,55 @@ class SharedPoolObservation:
             self.sequence += 1
             snapshot = dict(self.identity, sequence=self.sequence, final=final, counters=dict(self.counts), **gauges)
         logger.info("%s%s", SUMMARY_MARKER, json.dumps(snapshot, sort_keys=True))
+
+
+class BlockPoolObservation:
+    """Observe only one opted-in engine's allocator, without global patches.
+
+    Core request references and deferred frees remain the computation-lifetime
+    authority. We check real free-list transitions against outstanding saves;
+    reference release alone is never counted as physical reuse.
+    """
+
+    def __init__(self, pool, sources: SourceBlockTracker, observation: SharedPoolObservation):
+        self.pool, self.sources, self.observation = pool, sources, observation
+        self.tracked: set[int] = set()
+        self.returned: set[int] = set()
+        self.original_free = pool.free_blocks
+        self.original_get = pool.get_new_blocks
+
+        def free_blocks(blocks):
+            blocks = list(blocks)
+            self.original_free(blocks)
+            for block in {block.block_id: block for block in blocks}.values():
+                if block.block_id not in self.tracked:
+                    continue
+                observation.add(allocator_free_checked=1)
+                if block.ref_cnt == 0 and not block.is_null:
+                    self._check(block.block_id)
+                    self.returned.add(block.block_id)
+                    observation.add(allocator_returned=1)
+
+        def get_new_blocks(num_blocks):
+            blocks = self.original_get(num_blocks)
+            for block in blocks:
+                if block.block_id in self.tracked:
+                    self._check(block.block_id)
+                if block.block_id in self.returned:
+                    self.returned.remove(block.block_id)
+                    observation.add(allocator_reused=1)
+            return blocks
+
+        self.free_wrapper, self.get_wrapper = free_blocks, get_new_blocks
+        pool.free_blocks, pool.get_new_blocks = free_blocks, get_new_blocks
+
+    def _check(self, block_id: int) -> None:
+        if self.sources.active_blocks.get(block_id, 0):
+            self.observation.add(early_reuse=1)
+            raise RuntimeError("Shared-pool W2 allocator reused a source with an outstanding save")
+
+    def detach(self) -> None:
+        if self.pool.free_blocks is self.free_wrapper:
+            self.pool.free_blocks = self.original_free
+        if self.pool.get_new_blocks is self.get_wrapper:
+            self.pool.get_new_blocks = self.original_get

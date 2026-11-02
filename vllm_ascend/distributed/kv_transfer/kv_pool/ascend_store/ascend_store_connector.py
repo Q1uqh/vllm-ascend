@@ -234,8 +234,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     if getattr(self.connector_scheduler, "shared_pool_w2", False):
                         scheduler = self.connector_scheduler
                         scheduler._w2_observation.emit(
-                            logger, final=True, pending_source_refs=len(scheduler._source_blocks.pending)
+                            logger, final=True, pending_source_refs=len(scheduler._source_blocks.pending),
+                            pending_return_checks=len(scheduler._w2_expected_checks),
                         )
+                        if hasattr(scheduler, "_w2_allocator"):
+                            scheduler._w2_allocator.detach()
                     self.connector_scheduler.store_scheduler.close()
         finally:
             if hasattr(self, "lookup_server"):
@@ -535,6 +538,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
         assert self.connector_worker is not None
+        if getattr(self.connector_worker, "shared_pool_w2", False):
+            return self.connector_worker.build_connector_worker_meta(self._get_connector_metadata())
         return self.connector_worker.build_connector_worker_meta()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:

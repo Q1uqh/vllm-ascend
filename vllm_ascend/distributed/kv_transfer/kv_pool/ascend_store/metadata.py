@@ -1262,6 +1262,8 @@ class AscendStoreKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
     """key: event_id, value: completed worker count"""
     # (scheduler save generation, physical source block, global worker rank)
     source_block_completions: set[tuple[int, int, int]] = field(default_factory=set)
+    # save generation, worker rank, successful save job (including non-owner no-op)
+    w2_save_checks: set[tuple[int, int, bool]] = field(default_factory=set)
 
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
         assert isinstance(other, AscendStoreKVConnectorWorkerMetadata), (
@@ -1272,5 +1274,6 @@ class AscendStoreKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
         for event_id, count in (other.completed_events or {}).items():
             merged[event_id] = merged.get(event_id, 0) + count
         return AscendStoreKVConnectorWorkerMetadata(
-            merged, self.source_block_completions | other.source_block_completions
+            merged, self.source_block_completions | other.source_block_completions,
+            self.w2_save_checks | other.w2_save_checks
         )

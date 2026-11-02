@@ -90,20 +90,41 @@ pass every rank's log file; the script keeps the latest cumulative snapshot for
 each role/side/rank rather than summing snapshots over time. A missing rank,
 unreturned pin, malformed record or transfer error is reported explicitly.
 
-`OBSERVED_CHECKS_OK` covers only the counters actually measured. Physical
-allocator reuse, executor step/response ordering and model output accuracy are
-**not** established by these counters. The report labels them unobserved or
-unverified; never treat it as an end-to-end PASS. A finished request may retain
-shared prefix blocks legitimately. Pin/unpin balance does not prove zero HBM
-allocation, and missing final snapshots do not prove cleanup completed.
+`OBSERVED_CHECKS_OK` covers only the counters actually measured:
+
+- `returned` counts source blocks actually reaching zero references through the
+  opted-in BlockPool instance. `reused` counts those blocks later obtained via
+  `get_new_blocks`, rather than merely a transfer reference being dropped.
+- `early_reuse` checks both transitions against active source-save generations.
+  Core request references and deferred frees remain responsible for computation
+  lifetime; this observation does not independently audit device execution.
+- `return_checked` counts save jobs whose completion was checked at worker output
+  construction and acknowledged by every worker in the executor output received
+  by the scheduler. `return_before_save` records a premature/failed save result
+  at that boundary. This checks save ordering at the result boundary, not HTTP
+  response timing or independent network readback.
+- `return_pending` must drain to zero, and every scheduled save job must have a
+  checked return. Zero checks or no actual allocator reuse is INCONCLUSIVE.
+
+These hooks apply only to the bound W2 producer pool. They do not globally patch
+vLLM classes. Instance wrappers are removed on shutdown/rebind. They are temporary
+until upstream BlockPool offers callbacks for allocation/free observation, at
+which point the wrappers should be replaced by those callbacks.
+
+The report labels covered allocator and result checks `CHECKED_SOURCE_REFS` and
+`CHECKED_SAVE_JOBS`; output accuracy remains UNVERIFIED and HTTP timing is outside
+scope. Older logs without the new counters are not retroactively validated. A
+finished request may retain shared prefix blocks legitimately. Pin/unpin balance
+does not prove zero HBM allocation, and missing final snapshots do not prove
+cleanup completed.
 
 Run the ownership/failure tests, compare greedy outputs on Ascend, verify the
 P-to-D handoff and measure TTFT/TPOT/throughput before accepting a deployment.
 
 ## Local validation status (2026-11-02)
 
-The shared-pool and existing transfer test modules passed 69 CPU mock tests;
-the standalone summary-tool test passed separately.
+The shared-pool and existing transfer test modules passed 76 CPU mock tests;
+the standalone summary-tool passed two tests.
 Additional targeted ordinary-worker/TP-mismatch regressions passed. Tests exercise
 real connector methods against mocked backend/runtime dependencies; they are not
 NPU or network-transfer validation. On the development Mac, a temporary host-only
