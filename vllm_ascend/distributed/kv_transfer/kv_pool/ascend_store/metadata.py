@@ -1268,12 +1268,9 @@ class AscendStoreKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
             "aggregate worker metadata must be type of AscendStoreKVConnectorWorkerMetadata"
         )
 
-        merged: dict[int, int] = dict(self.completed_events)
-        for event_id in other.completed_events:
-            if event_id not in merged:
-                merged[event_id] = other.completed_events[event_id]
-            else:
-                merged[event_id] = merged[event_id] + other.completed_events[event_id]
+        merged: dict[int, int] = dict(self.completed_events or {})
+        for event_id, count in (other.completed_events or {}).items():
+            merged[event_id] = merged.get(event_id, 0) + count
         return AscendStoreKVConnectorWorkerMetadata(
             merged, self.source_block_completions | other.source_block_completions
         )

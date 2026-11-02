@@ -914,7 +914,7 @@ class KVPoolScheduler:
             self._w2_observation.add(source_unpins=len(released))
             self._w2_observation.emit(logger, pending_source_refs=len(self._source_blocks.pending))
 
-        for event_id, count in meta.completed_events.items():
+        for event_id, count in (meta.completed_events or {}).items():
             logger.debug("event %s update with %s", event_id, count)
             total = self.sending_events.get(event_id, -1)
             if total == -1:

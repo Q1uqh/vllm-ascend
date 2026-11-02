@@ -353,3 +353,44 @@ class TestSharedPoolW2(unittest.TestCase):
             self.assertIs(worker.kv_recv_thread.worker, worker if enabled else None)
             if enabled:
                 self.assertEqual(worker.kv_send_thread.get_source_block_completions(), set())
+
+    def test_real_worker_metadata_with_no_legacy_events_reaches_scheduler(self):
+        thread, _, request = self.make_thread()
+        batch = thread.add_save_batch([request])
+        self.drain(thread)
+        thread.wait_for_batch(batch)
+        # Real getter returns None when there are no old Mamba events.
+        self.assertIsNone(thread.get_completed_events())
+        worker = KVPoolWorker.__new__(KVPoolWorker)
+        worker.shared_pool_w2 = True
+        worker.kv_send_thread = thread
+        meta = worker.build_connector_worker_meta()
+        self.assertEqual(meta.completed_events, {})
+        self.assertEqual(meta.source_block_completions, {(0, 7, 0), (0, 8, 0)})
+        self.assertIsNone(worker.build_connector_worker_meta())
+
+        scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+        scheduler.shared_pool_w2 = True
+        scheduler._source_blocks = SourceBlockTracker(1)
+        scheduler._source_blocks.register([7, 8])
+        scheduler._w2_observation = self.observation()
+        scheduler._loading_req_ids = set()
+        scheduler.sending_events, scheduler.sending_blocks = {}, {}
+        scheduler._block_pool = SimpleNamespace(blocks={7: 7, 8: 8}, free_blocks=MagicMock())
+        # Simulate old/serialized metadata explicitly containing None as well.
+        meta.completed_events = None
+        scheduler.update_connector_output(SimpleNamespace(
+            finished_recving=set(), kv_connector_worker_meta=meta
+        ))
+        self.assertFalse(scheduler._source_blocks.pending)
+        scheduler._block_pool.free_blocks.assert_called_once()
+
+    def test_aggregation_accepts_legacy_none_with_w2_only_notifications(self):
+        a = AscendStoreKVConnectorWorkerMetadata(None, {(0, 7, 0)})
+        b = AscendStoreKVConnectorWorkerMetadata(None, {(0, 7, 1)})
+        merged = a.aggregate(b)
+        self.assertEqual(merged.completed_events, {})
+        self.assertEqual(merged.source_block_completions, {(0, 7, 0), (0, 7, 1)})
+        legacy = AscendStoreKVConnectorWorkerMetadata({5: 2})
+        self.assertEqual(a.aggregate(legacy).completed_events, {5: 2})
+        self.assertEqual(legacy.aggregate(a).completed_events, {5: 2})

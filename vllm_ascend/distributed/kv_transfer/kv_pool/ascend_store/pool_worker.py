@@ -1828,5 +1828,5 @@ class KVPoolWorker:
                 if getattr(self, "shared_pool_w2", False) else set()
             )
             if ce or completions:
-                return AscendStoreKVConnectorWorkerMetadata(ce, completions)
+                return AscendStoreKVConnectorWorkerMetadata(ce or {}, completions)
         return None
