@@ -42,6 +42,13 @@ def maybe_token_overlap(impl, query, metadata, output):
     worker = _active_worker(get_kv_transfer_group())
     if worker is None:
         return None
+    pipeline = worker._w2_token_pipeline
+    if pipeline.finished.is_set():
+        # All destination ranges are now resident. Later layers should use
+        # the existing fused attention rather than replaying tiny partitions.
+        # Check the result before allowing that path to read the full cache.
+        pipeline.finish()
+        return None
     if (impl.sinks is not None or impl.alibi_slopes is not None
             or metadata.model_runner_type == "pooling" or not metadata.causal
             or metadata.uses_pcp_sharded_layout):
@@ -59,7 +66,6 @@ def maybe_token_overlap(impl, query, metadata, output):
     # The page table is small; this eager reference path copies it once per
     # layer. This overhead is explicit and must be included in performance QA.
     tables = metadata.block_tables.cpu().tolist()
-    pipeline = worker._w2_token_pipeline
     block_tokens = key_cache.shape[2 if impl.use_bnsd_kv_cache else 1]
     qfirst = 0
     for row, qlast in enumerate(boundaries):

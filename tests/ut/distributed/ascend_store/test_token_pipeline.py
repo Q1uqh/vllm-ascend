@@ -197,3 +197,19 @@ class TestTokenPipeline(unittest.TestCase):
                 self.assertIn(f"expected_bytes=64, results=[{result}]", str(error.exception.__cause__))
                 self.assertFalse(reads[0].ready.is_set())
                 backend.batch_get_end.assert_called_once_with(["key"])
+
+    def test_completed_load_returns_to_fused_path_only_after_checking_success(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        done = threading.Event()
+        done.set()
+        pipeline = SimpleNamespace(finished=done, finish=MagicMock())
+        connector = SimpleNamespace(connector_worker=SimpleNamespace(_w2_token_pipeline=pipeline))
+        with patch.object(token_overlap, "has_kv_transfer_group", return_value=True), patch.object(
+            token_overlap, "get_kv_transfer_group", return_value=connector
+        ):
+            self.assertIsNone(token_overlap.maybe_token_overlap(None, None, None, None))
+            pipeline.finish.assert_called_once()
+            pipeline.finish.side_effect = RuntimeError("range failed")
+            with self.assertRaisesRegex(RuntimeError, "range failed"):
+                token_overlap.maybe_token_overlap(None, None, None, None)

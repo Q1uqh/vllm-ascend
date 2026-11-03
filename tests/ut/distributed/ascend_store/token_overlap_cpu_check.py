@@ -2,6 +2,7 @@
 
 import importlib.util
 import sys
+import threading
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +37,7 @@ for dtype in (torch.float16, torch.bfloat16):
                 scale=8**-0.5, sliding_window=window, _layer_name="layer.0",
             )
             calls = []
-            pipeline = SimpleNamespace(wait=lambda *args: calls.append(args), generation=1)
+            pipeline = SimpleNamespace(wait=lambda *args: calls.append(args), generation=1, finished=threading.Event())
             observer = SimpleNamespace(add=lambda **kwargs: None, trace=lambda *args, **kwargs: None)
             worker = SimpleNamespace(_w2_token_pipeline=pipeline, w2_token_batch_size=2, _w2_observation=observer)
             connector = SimpleNamespace(connector_worker=worker)

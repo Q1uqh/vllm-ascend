@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from dataclasses import dataclass, field
 
 
 TOKEN_READY_POLL_SECONDS = 0.01
+STALL_REPORT_SECONDS = 10.0
+MAX_STALL_REPORTS = 6
 
 
 @dataclass
@@ -67,13 +71,18 @@ class TokenLoadPipeline:
         self.enter_device = enter_device
         self.generation = generation
         self.error = None
+        self.progress = "starting"
+        self.completed_reads = 0
         self.observation.add(pending_load_batches=len(self.reads))
         self.finished = threading.Event()
+        self.closed = threading.Event()
         self.by_block = {}
         for read in self.reads:
             self.by_block.setdefault(read.block, []).append(read)
         self.thread = threading.Thread(target=self._run, name="w2-token-load", daemon=True)
         self.thread.start()
+        self.watchdog = threading.Thread(target=self._watch_progress, name="w2-token-progress", daemon=True)
+        self.watchdog.start()
 
     def _run(self):
         keys = list(dict.fromkeys(read.key for read in self.reads))
@@ -83,6 +92,7 @@ class TokenLoadPipeline:
             self.enter_device()
             # The session is only a read lease; no layerwise publication or put.
             started = True
+            self.progress = "acquiring_read_sessions"
             results = self.backend.batch_get_start(keys)
             if len(results) != len(keys) or any(code != 0 for code in results):
                 raise RuntimeError("W2-b token read session could not acquire every key")
@@ -90,6 +100,7 @@ class TokenLoadPipeline:
                 self.observation.trace("d_transfer_submit", generation=self.generation, request=read.request_id,
                                        batch=index, block=read.block,
                                        first=read.start, last=read.end)
+                self.progress = f"reading_block={read.block} tokens=[{read.start},{read.end})"
                 results = self.backend.batch_copy_get(
                     [read.key], [read.addresses], [read.sizes], [read.offsets]
                 )
@@ -111,12 +122,14 @@ class TokenLoadPipeline:
                                        first=read.start, last=read.end)
                 read.ready.set()
                 completed += 1
+                self.completed_reads = completed
                 self.observation.add(pending_load_batches=-1)
         except Exception as error:
             self.error = error
             self.observation.add(load_failed=1)
         finally:
             try:
+                self.progress = "closing_read_sessions"
                 if started and self.backend.batch_get_end(keys) != 0:
                     raise RuntimeError("W2-b failed to close token read session")
             except Exception as error:
@@ -126,6 +139,23 @@ class TokenLoadPipeline:
                 self.observation.add(pending_load_batches=-(len(self.reads) - completed),
                                      aborted_load_batches=len(self.reads) - completed)
             self.finished.set()
+
+    def _watch_progress(self):
+        started = time.monotonic()
+        while not self.closed.wait(STALL_REPORT_SECONDS):
+            # Bound diagnostics across all pipelines in this worker process.
+            with self.observation.lock:
+                count = self.observation.counts["token_wait_reports"]
+                if count >= MAX_STALL_REPORTS:
+                    return
+                self.observation.counts["token_wait_reports"] += 1
+                attention = self.observation.counts["partial_attention_batches"]
+            logging.getLogger("vllm").warning(
+                "W2_TOKEN_PROGRESS generation=%s elapsed_s=%.1f stage=%s reads=%s/%s partial_submits=%s",
+                self.generation, time.monotonic() - started,
+                "loads_complete_waiting_for_attention" if self.finished.is_set() else self.progress,
+                self.completed_reads, len(self.reads), attention,
+            )
 
     def wait(self, block, start, end):
         for read in self.by_block.get(block, ()):
@@ -138,5 +168,7 @@ class TokenLoadPipeline:
 
     def finish(self):
         self.thread.join()
+        self.closed.set()
+        self.watchdog.join()
         if self.error is not None:
             raise RuntimeError("W2-b token loading failed; no partial result may be published") from self.error

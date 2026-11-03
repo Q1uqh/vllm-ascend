@@ -182,6 +182,16 @@ slots are excluded from DMA, preventing a late read from overwriting the current
 reshape-and-cache write. Subsequent decode steps return to normal resident-cache
 attention. No history eviction after each partial computation is introduced.
 
+Once all ranges have loaded successfully, subsequent layers immediately resume
+the original fused attention path. They do not continue token partitioning just
+because a pipeline was used earlier in the forward. A failed completed pipeline
+still raises before the original attention can consume its cache.
+
+If execution takes over ten seconds, bounded `W2_TOKEN_PROGRESS` diagnostics
+report the loader stage, completed/total reads and cumulative partial submissions.
+At most six reports are emitted per worker process. These are progress evidence,
+not a device-overlap measurement, and no forced timeout/free is introduced.
+
 The initial attention implementation uses bounded-query FP32 tensor operations
 and stable log-sum-exp merging, with causal/sliding-window masks. It allocates
 small range intermediates rather than staging the entire cache. It is a
