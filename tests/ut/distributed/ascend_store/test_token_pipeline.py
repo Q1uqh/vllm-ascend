@@ -61,13 +61,13 @@ class TestTokenPipeline(unittest.TestCase):
             closed = False
             def batch_get_start(self, keys):
                 return [0]
-            def batch_copy_get(self, *args):
+            def batch_copy_get(self, keys, addresses, sizes, offsets):
                 self.calls += 1
                 if self.calls == 2:
                     entered.set()
                     if not release.wait(timeout=3):
                         raise RuntimeError("Test reader timed out")
-                return [0]
+                return [sum(row) for row in sizes]
             def batch_get_end(self, keys):
                 self.closed = True
                 return 0
@@ -139,7 +139,7 @@ class TestTokenPipeline(unittest.TestCase):
         worker.token_database.set_group_buffers({0: [1000]}, {0: [16]}, {0: [1]}, group_num_layers={0: 1})
         worker.m_store = MagicMock()
         worker.m_store.batch_get_start.side_effect = lambda keys: [0] * len(keys)
-        worker.m_store.batch_copy_get.return_value = [0]
+        worker.m_store.batch_copy_get.side_effect = lambda keys, addresses, sizes, offsets: [sum(row) for row in sizes]
         worker.m_store.batch_get_end.return_value = 0
         request = ReqMeta("r", token_len_chunk=32, block_ids=[7, 8], block_hashes=["a", "b"],
                           can_save=False, load_spec=LoadSpec(0, 31, True))
@@ -181,3 +181,19 @@ class TestTokenPipeline(unittest.TestCase):
         worker.m_store.close.assert_called_once()
         self.assertTrue(worker._closed)
         self.assertIsNone(worker._w2_token_pipeline)
+
+    def test_range_results_require_exact_bytes_not_status_zero_or_short_reads(self):
+        from unittest.mock import MagicMock
+        for result in (0, 63, 65, -1):
+            with self.subTest(result=result):
+                reads = list(dense_token_ranges("key", 1, 0, 4, 4, [(1000, 128, 2, 4, 2, False)], 8))
+                backend = MagicMock()
+                backend.batch_get_start.return_value = [0]
+                backend.batch_copy_get.return_value = [result]
+                backend.batch_get_end.return_value = 0
+                pipeline = TokenLoadPipeline(backend, reads, self.observation(), lambda: None)
+                with self.assertRaises(RuntimeError) as error:
+                    pipeline.finish()
+                self.assertIn(f"expected_bytes=64, results=[{result}]", str(error.exception.__cause__))
+                self.assertFalse(reads[0].ready.is_set())
+                backend.batch_get_end.assert_called_once_with(["key"])

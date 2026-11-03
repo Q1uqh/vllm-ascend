@@ -93,8 +93,15 @@ class TokenLoadPipeline:
                 results = self.backend.batch_copy_get(
                     [read.key], [read.addresses], [read.sizes], [read.offsets]
                 )
-                if len(results) != 1 or results[0] != 0:
-                    raise RuntimeError(f"W2-b range read failed for block {read.block}")
+                expected_bytes = sum(read.sizes)
+                # Unlike session start/end status codes, a range read returns
+                # transferred bytes on success and a negative error on failure.
+                if len(results) != 1 or results[0] != expected_bytes:
+                    raise RuntimeError(
+                        f"W2-b range read failed for block {read.block}, "
+                        f"tokens=[{read.start},{read.end}), "
+                        f"expected_bytes={expected_bytes}, results={results}"
+                    )
                 # The native range call completes the transfer before returning.
                 self.observation.add(token_range_batches=1, remote_read_bytes=sum(read.sizes))
                 self.observation.record_load(read.request_id, [f"{read.key}@{read.start}:{read.end}"],
