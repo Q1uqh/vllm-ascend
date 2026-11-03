@@ -3,8 +3,11 @@
 import json
 import logging
 import threading
+import tempfile
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
+from collections import deque
 from unittest.mock import MagicMock, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
@@ -23,6 +26,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.shared_pool_w2 import (
     BlockPoolObservation,
     SharedPoolObservation,
+    SourceCompletionChannel,
+    ComputeCompletionObserver,
     SourceBlockTracker,
     validate_shared_pool_w2,
 )
@@ -176,16 +181,10 @@ class TestSharedPoolW2(unittest.TestCase):
             waiter.join(timeout=3)
         self.assertTrue(returned.is_set())
 
-    def test_worker_wait_for_save_really_waits_only_when_enabled(self):
+    def test_worker_save_submission_never_waits_for_batch(self):
         for enabled in (False, True):
             thread, _, request = self.make_thread(enabled)
-            # Exercise the actual worker entry with a synchronous fake queue.
-            original_submit = thread.add_save_batch
-            def submit(requests):
-                batch = original_submit(requests)
-                self.drain(thread)
-                return batch
-            thread.add_save_batch = submit
+            # Keep the queue undrained: submitting must return before saving.
             thread.wait_for_batch = MagicMock(wraps=thread.wait_for_batch)
             worker = KVPoolWorker.__new__(KVPoolWorker)
             worker.shared_pool_w2 = enabled
@@ -195,7 +194,9 @@ class TestSharedPoolW2(unittest.TestCase):
             metadata = AscendConnectorMetadata(set(), set())
             metadata.add_request(request)
             worker.wait_for_save(metadata)
-            self.assertEqual(thread.wait_for_batch.call_count, int(enabled))
+            thread.wait_for_batch.assert_not_called()
+            self.assertFalse(worker._previous_save_batch.done.is_set())
+            self.drain(thread)
 
     def test_scheduler_returns_only_transfer_reference(self):
         # The core owns the request reference. Simulate a shared prefix: this
@@ -445,42 +446,139 @@ class TestSharedPoolW2(unittest.TestCase):
         self.assertEqual(obs.counts["early_reuse"], 1)
         monitor.detach()
 
-    def test_worker_output_boundary_reports_missing_save_not_as_success(self):
+    def test_worker_output_allows_pending_background_save(self):
         thread, _, request = self.make_thread()
         worker = KVPoolWorker.__new__(KVPoolWorker)
         worker.shared_pool_w2 = True
-        worker.w2_worker_rank = 0
         worker.kv_send_thread = thread
-        worker._w2_observation = self.observation()
         metadata = AscendConnectorMetadata(set(), set())
         metadata.add_request(request)
-        output = worker.build_connector_worker_meta(metadata)
-        self.assertEqual(output.w2_save_checks, {(0, 0, False)})
-        request.can_save = False  # cancellation is not proof of publication
-        self.assertEqual(worker.build_connector_worker_meta(metadata).w2_save_checks, {(0, 0, False)})
-        request.can_save = True
-        request.w2_save_succeeded = True
-        output = worker.build_connector_worker_meta(metadata)
-        self.assertEqual(output.w2_save_checks, {(0, 0, True)})
-        self.assertEqual(output.aggregate(output).w2_save_checks, {(0, 0, True)})
+        self.assertIsNone(worker.build_connector_worker_meta(metadata))
+        self.assertIsNone(request.w2_save_succeeded)
 
-    def test_scheduler_checks_executor_output_before_unpinning(self):
-        scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
-        scheduler.shared_pool_w2 = True
-        scheduler._source_blocks = SourceBlockTracker(1)
-        scheduler._source_blocks.register([7])
-        scheduler._w2_expected_checks = {0: set()}
-        scheduler._w2_observation = self.observation()
-        scheduler._loading_req_ids = set()
-        scheduler.sending_events, scheduler.sending_blocks = {}, {}
-        scheduler._block_pool = SimpleNamespace(blocks={7: 7}, free_blocks=MagicMock())
-        invalid = AscendStoreKVConnectorWorkerMetadata({}, {(0, 7, 0)}, {(0, 0, False)})
-        with self.assertRaisesRegex(RuntimeError, "before a successful save"):
-            scheduler.update_connector_output(SimpleNamespace(
-                finished_recving=set(), kv_connector_worker_meta=invalid
-            ))
-        scheduler._block_pool.free_blocks.assert_not_called()
-        valid = AscendStoreKVConnectorWorkerMetadata({}, {(0, 7, 0)}, {(0, 0, True)})
-        scheduler.update_connector_output(SimpleNamespace(finished_recving=set(), kv_connector_worker_meta=valid))
-        self.assertEqual(scheduler._w2_observation.counts["return_checked_jobs"], 1)
-        self.assertFalse(scheduler._w2_expected_checks)
+    def test_independent_channel_releases_and_reuses_while_second_put_is_blocked(self):
+        # Exercise framing and dispatch with an in-memory datagram transport;
+        # the local managed executor does not permit binding UNIX sockets.
+        messages = deque()
+        class Datagram:
+            def setblocking(self, value):
+                pass
+            def bind(self, path):
+                pass
+            def sendto(self, data, path):
+                messages.append(data)
+            def recv(self, size):
+                if not messages:
+                    raise BlockingIOError()
+                return messages.popleft()
+            def close(self):
+                pass
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.shared_pool_w2.socket.socket",
+            side_effect=lambda *args: Datagram(),
+        ):
+            path = str(Path(directory) / "completion.sock")
+            receiver = SourceCompletionChannel(path, receiver=True)
+            sender = SourceCompletionChannel(path, receiver=False)
+            thread, store, request = self.make_thread()
+            thread.worker._w2_channel = sender
+            scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+            scheduler._w2_channel = receiver
+            scheduler._source_blocks = SourceBlockTracker(1)
+            scheduler._source_blocks.register([7, 8])
+            scheduler._w2_observation = self.observation()
+            scheduler._w2_observation.trace("register", save=0, blocks=2, workers=1)
+            blocks = {i: SimpleNamespace(block_id=i, ref_cnt=1, is_null=False) for i in (7, 8)}
+            available = []
+            def free(items):
+                for block in items:
+                    block.ref_cnt -= 1
+                    if block.ref_cnt == 0:
+                        available.append(block)
+            def allocate(count):
+                result = available[:count]
+                del available[:count]
+                for block in result:
+                    block.ref_cnt = 1
+                return result
+            pool = SimpleNamespace(blocks=blocks, free_blocks=free, get_new_blocks=allocate,
+                                   get_num_free_blocks=lambda: len(available))
+            scheduler._block_pool = pool
+            monitor = BlockPoolObservation(pool, scheduler._source_blocks, scheduler._w2_observation,
+                                           scheduler.poll_source_completions)
+            monitor.tracked.update(blocks)
+            scheduler._w2_allocator = monitor
+            second_entered, release = threading.Event(), threading.Event()
+            def put(keys, *args):
+                if store.put.call_count == 2:
+                    second_entered.set()
+                    self.assertTrue(release.wait(timeout=3))
+                return [True] * len(keys)
+            store.put.side_effect = put
+            batch = thread.add_save_batch([request])
+            consumer = threading.Thread(target=lambda: self.drain(thread))
+            consumer.start()
+            try:
+                self.assertTrue(second_entered.wait(timeout=1))
+                self.assertFalse(batch.done.is_set())
+                # Polling happens before the admission/free-count decision.
+                self.assertEqual(pool.get_num_free_blocks(), 1)
+                self.assertEqual(pool.get_new_blocks(1)[0].block_id, 7)
+                self.assertIn((0, 8), scheduler._source_blocks.pending)
+                # The worker-output duplicate must not free the new owner.
+                scheduler._release_source_completions([(0, 7, 0)])
+                self.assertEqual(blocks[7].ref_cnt, 1)
+                self.assertEqual(scheduler._w2_observation.counts["early_reuse"], 0)
+            finally:
+                release.set()
+                consumer.join(timeout=3)
+                scheduler.poll_source_completions()
+                monitor.detach()
+                sender.close()
+                receiver.close()
+            self.assertFalse(scheduler._source_blocks.pending)
+            self.assertTrue(batch.done.is_set())
+
+    def test_w2_source_pins_remove_only_unnecessary_request_fence(self):
+        for enabled, scratch, waits in ((False, 0, True), (True, 0, False), (True, 1, True)):
+            worker = KVPoolWorker.__new__(KVPoolWorker)
+            worker.shared_pool_w2 = enabled
+            worker.num_speculative_blocks_by_group = {0: scratch}
+            worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+            worker.handle_released_saves({"old"})
+            self.assertEqual(worker.kv_send_thread.wait_for_requests_saved.called, waits)
+
+    def test_compute_observer_queries_event_without_synchronization(self):
+        observation = self.observation()
+        seen = threading.Event()
+        original = observation.trace
+        def trace(*args, **kwargs):
+            result = original(*args, **kwargs)
+            seen.set()
+            return result
+        observation.trace = trace
+        device_event = SimpleNamespace(query=lambda: True)
+        observer = ComputeCompletionObserver(observation, lambda: None)
+        try:
+            observer.submit(device_event, [7])
+            self.assertTrue(seen.wait(timeout=1))
+            self.assertEqual(observation.events[0]["event"], "compute_done")
+        finally:
+            observer.close()
+
+    def test_real_datagram_channel_when_host_permits_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "actual.sock")
+            try:
+                receiver = SourceCompletionChannel(path, receiver=True)
+            except PermissionError:
+                self.skipTest("Managed host forbids UNIX socket binding; fake-transport test still runs")
+            sender = SourceCompletionChannel(path, receiver=False)
+            try:
+                event = dict(event="source_done", save=123, block=7, rank=0, t=1)
+                self.assertTrue(sender.send(event))
+                self.assertEqual(receiver.drain(), [event])
+            finally:
+                sender.close()
+                receiver.close()
+            self.assertFalse(Path(path).exists())

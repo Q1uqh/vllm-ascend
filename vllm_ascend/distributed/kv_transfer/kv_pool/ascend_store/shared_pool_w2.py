@@ -5,13 +5,25 @@ No NPU dependencies: ownership and observation can be tested on a CPU host.
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import logging
+import socket
+import tempfile
 import threading
 import time
 import uuid
 from collections import Counter
 from collections.abc import Iterable
+from pathlib import Path
+
+
+MAX_NOTIFICATION_DRAIN = 4096
+MAX_NOTIFICATION_BYTES = 65536
+MAX_TRACE_EVENTS = 800
+MAX_COMPUTE_EVENTS = 128
+COMPUTE_POLL_SECONDS = 0.001
 
 SUMMARY_INTERVAL_SECONDS = 60.0
 SUMMARY_MARKER = "SHARED_POOL_W2 "
@@ -45,11 +57,11 @@ class SourceBlockTracker:
     remove another generation's reference, including after block-ID reuse.
     """
 
-    def __init__(self, worker_count: int):
+    def __init__(self, worker_count: int, initial_id: int = 0):
         if worker_count < 1:
             raise ValueError("worker_count must be positive")
         self.workers = frozenset(range(worker_count))
-        self.next_id = 0
+        self.next_id = initial_id
         self.active_blocks: Counter[int] = Counter()
         self.pending: dict[tuple[int, int], set[int]] = {}
 
@@ -92,6 +104,16 @@ class SharedPoolObservation:
         self.last_emit = 0.0
         self.sequence = 0
         self.loads: dict[str, set[str]] = {}
+        self.events: list[dict] = []
+
+    def trace(self, event: str, **values) -> dict:
+        record = dict(event=event, t=time.monotonic_ns(), rank=self.identity["rank"], **values)
+        with self.lock:
+            if len(self.events) < MAX_TRACE_EVENTS:
+                self.events.append(record)
+            else:
+                self.counts["trace_dropped"] += 1
+        return record
 
     def add(self, **values: int | float) -> None:
         with self.lock:
@@ -121,7 +143,8 @@ class SharedPoolObservation:
                 return
             self.last_emit = now
             self.sequence += 1
-            snapshot = dict(self.identity, sequence=self.sequence, final=final, counters=dict(self.counts), **gauges)
+            snapshot = dict(self.identity, sequence=self.sequence, final=final, counters=dict(self.counts),
+                            events=list(self.events), **gauges)
         logger.info("%s%s", SUMMARY_MARKER, json.dumps(snapshot, sort_keys=True))
 
 
@@ -133,12 +156,15 @@ class BlockPoolObservation:
     reference release alone is never counted as physical reuse.
     """
 
-    def __init__(self, pool, sources: SourceBlockTracker, observation: SharedPoolObservation):
+    def __init__(self, pool, sources: SourceBlockTracker, observation: SharedPoolObservation, poll=None):
         self.pool, self.sources, self.observation = pool, sources, observation
         self.tracked: set[int] = set()
         self.returned: set[int] = set()
         self.original_free = pool.free_blocks
         self.original_get = pool.get_new_blocks
+        self.original_count = getattr(pool, "get_num_free_blocks", None)
+        self.poll = poll
+        self.provenance: dict[int, int] = {}
 
         def free_blocks(blocks):
             blocks = list(blocks)
@@ -151,8 +177,11 @@ class BlockPoolObservation:
                     self._check(block.block_id)
                     self.returned.add(block.block_id)
                     observation.add(allocator_returned=1)
+                    observation.trace("reusable", block=block.block_id, save=self.provenance.get(block.block_id))
 
         def get_new_blocks(num_blocks):
+            if self.poll is not None:
+                self.poll()
             blocks = self.original_get(num_blocks)
             for block in blocks:
                 if block.block_id in self.tracked:
@@ -160,8 +189,17 @@ class BlockPoolObservation:
                 if block.block_id in self.returned:
                     self.returned.remove(block.block_id)
                     observation.add(allocator_reused=1)
+                    observation.trace("reuse", block=block.block_id, save=self.provenance.get(block.block_id))
             return blocks
 
+        def get_num_free_blocks():
+            if self.poll is not None:
+                self.poll()
+            return self.original_count()
+
+        self.count_wrapper = get_num_free_blocks
+        if self.original_count is not None and poll is not None:
+            pool.get_num_free_blocks = get_num_free_blocks
         self.free_wrapper, self.get_wrapper = free_blocks, get_new_blocks
         pool.free_blocks, pool.get_new_blocks = free_blocks, get_new_blocks
 
@@ -171,7 +209,126 @@ class BlockPoolObservation:
             raise RuntimeError("Shared-pool W2 allocator reused a source with an outstanding save")
 
     def detach(self) -> None:
+        if self.original_count is not None and self.pool.get_num_free_blocks is self.count_wrapper:
+            self.pool.get_num_free_blocks = self.original_count
         if self.pool.free_blocks is self.free_wrapper:
             self.pool.free_blocks = self.original_free
         if self.pool.get_new_blocks is self.get_wrapper:
             self.pool.get_new_blocks = self.original_get
+
+
+class SourceCompletionChannel:
+    """Local-engine datagrams; allocator changes stay on the scheduler thread.
+
+    A full/unavailable socket drops only the fast notification, never the
+    worker-output fallback. Pins remain held until either path is consumed.
+    """
+
+    def __init__(self, path: str, receiver: bool):
+        self.path = path
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.socket.setblocking(False)
+        self.receiver = receiver
+        self.closed = False
+        if receiver:
+            try:
+                try:
+                    self.socket.bind(path)
+                except OSError as error:
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                    # Never unlink a live engine's endpoint. A harmless probe
+                    # distinguishes a stale pathname after ungraceful shutdown.
+                    try:
+                        self.socket.sendto(b'{"event":"probe"}', path)
+                    except ConnectionRefusedError:
+                        Path(path).unlink(missing_ok=True)
+                        self.socket.bind(path)
+                    else:
+                        raise RuntimeError(f"Shared-pool W2 endpoint already active: {path}") from error
+            except Exception:
+                self.socket.close()
+                raise
+
+    def send(self, event: dict) -> bool:
+        try:
+            self.socket.sendto(json.dumps(event).encode(), self.path)
+            return True
+        except OSError:
+            return False
+
+    def drain(self) -> list[dict]:
+        events = []
+        for _ in range(MAX_NOTIFICATION_DRAIN):
+            try:
+                events.append(json.loads(self.socket.recv(MAX_NOTIFICATION_BYTES)))
+            except BlockingIOError:
+                break
+        return events
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.socket.close()
+        if self.receiver:
+            Path(self.path).unlink(missing_ok=True)
+
+
+def completion_channel_path(config, rpc_base_path: str) -> str:
+    # Use the existing per-engine lookup namespace, including serving DP index.
+    if getattr(config.parallel_config, "nnodes_within_dp", 1) != 1:
+        raise ValueError("Shared-pool W2 early release currently requires a single-node P engine")
+    extra = config.kv_transfer_config.kv_connector_extra_config
+    port = extra.get("lookup_rpc_port", extra.get("mooncake_rpc_port", 0))
+    namespace = f"{rpc_base_path}:{port}:{config.parallel_config.data_parallel_index}"
+    digest = hashlib.sha256(namespace.encode()).hexdigest()[:24]
+    return str(Path(tempfile.gettempdir()) / f"ascend-w2-{digest}.sock")
+
+
+class ComputeCompletionObserver:
+    """Poll already-recorded device events without synchronizing the device.
+
+    Observation only: unavailable/overflowed events reduce evidence coverage,
+    never block execution or change cache ownership.
+    """
+
+    def __init__(self, observation, enter_device):
+        self.observation = observation
+        self.enter_device = enter_device
+        self.pending = []
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="w2-compute-observer")
+        self.thread.start()
+
+    def submit(self, event, blocks):
+        with self.lock:
+            if len(self.pending) >= MAX_COMPUTE_EVENTS:
+                self.observation.add(compute_observation_dropped=1)
+                return
+            self.pending.append((event, tuple(blocks)))
+
+    def _run(self):
+        try:
+            self.enter_device()
+            while not self.stop_event.wait(COMPUTE_POLL_SECONDS):
+                with self.lock:
+                    pending, self.pending = self.pending, []
+                remaining = []
+                for event, blocks in pending:
+                    if event.query():
+                        for block in blocks:
+                            self.observation.trace("compute_done", block=block)
+                    else:
+                        remaining.append((event, blocks))
+                with self.lock:
+                    self.pending = remaining + self.pending
+        except Exception:
+            self.observation.add(compute_observation_errors=1)
+
+    def close(self):
+        self.stop_event.set()
+        self.thread.join()
+        with self.lock:
+            self.observation.add(compute_observation_pending=len(self.pending))

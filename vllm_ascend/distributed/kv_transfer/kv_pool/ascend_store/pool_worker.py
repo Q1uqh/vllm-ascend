@@ -24,6 +24,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.token_pipeline import (
+    TokenLoadPipeline, dense_token_ranges,
+)
+
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
@@ -68,6 +72,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.shared_pool_w2 import (
     SharedPoolObservation,
+    ComputeCompletionObserver,
+    SourceCompletionChannel,
+    completion_channel_path,
     validate_shared_pool_w2,
 )
 from vllm_ascend.distributed.utils import (
@@ -179,6 +186,14 @@ class KVPoolWorker:
             extra_config, self.kv_role, len(kv_cache_groups) if kv_cache_groups is not None else None
         )
         if self.shared_pool_w2:
+            delay_ms = extra_config.get("shared_pool_w2_test_delay_ms", 0)
+            if (isinstance(delay_ms, bool) or not isinstance(delay_ms, (int, float))
+                    or not 0 <= delay_ms <= 30000):
+                raise ValueError("shared_pool_w2_test_delay_ms must be between 0 and 30000")
+            self._w2_test_delay_seconds = delay_ms / 1000
+            self._w2_test_delay_used = False
+            if self.kv_role == "kv_producer":
+                self._w2_channel = SourceCompletionChannel(completion_channel_path(vllm_config, envs.VLLM_RPC_BASE_PATH), receiver=False)
             self.w2_worker_rank = vllm_config.parallel_config.rank % vllm_config.parallel_config.world_size
             self._w2_observation = SharedPoolObservation(
                 "worker", self.kv_role, self.w2_worker_rank, vllm_config.parallel_config.world_size
@@ -367,6 +382,14 @@ class KVPoolWorker:
         self.kv_send_thread: KVTransferThread | None = None
         self.kv_recv_thread: KVTransferThread | None = None
         self._previous_save_batch: KVCacheStoreBatch | None = None
+        self._w2_token_pipeline = None
+        self._w2_token_generation = 0
+        self.w2_token_batch_size = self._extra_config.get("shared_pool_w2_token_batch_size", 0)
+        if (isinstance(self.w2_token_batch_size, bool) or not isinstance(self.w2_token_batch_size, int)
+                or not 0 <= self.w2_token_batch_size <= 4096):
+            raise ValueError("shared_pool_w2_token_batch_size must be an integer between 0 and 4096")
+        if self.w2_token_batch_size and (not self.shared_pool_w2 or self.kv_role != "kv_consumer"):
+            raise ValueError("W2-b token batching is only supported on an enabled W2 consumer")
         self._transfer_threads_started = False
         self.external_slot_release_waiter: Callable[[int], None] | None = None
 
@@ -411,16 +434,27 @@ class KVPoolWorker:
     def shutdown(self) -> None:
         if self._closed:
             return
+        load_error = None
+        try:
+            self._finish_token_load()
+        except Exception as error:
+            load_error = error
         threads = [thread for thread in (self.kv_send_thread, self.kv_recv_thread) if thread is not None]
         for thread in threads:
             thread.stop()
         for thread in threads:
             if thread.is_alive():
                 thread.join()
+        if hasattr(self, "_w2_compute_observer"):
+            self._w2_compute_observer.close()
         if getattr(self, "shared_pool_w2", False):
             self._w2_observation.emit(logger, final=True)
+        if hasattr(self, "_w2_channel"):
+            self._w2_channel.close()
         self.m_store.close()
         self._closed = True
+        if load_error is not None:
+            raise load_error
 
     def set_external_slot_release_waiter(self, waiter: Callable[[int], None]) -> bool:
         return False
@@ -855,11 +889,73 @@ class KVPoolWorker:
                 self.sub_size_bytes,
             )
 
+        if self.w2_token_batch_size:
+            self._validate_token_overlap(kv_caches)
+
         # Register buffers before starting the transfer threads.
         self.m_store.register_buffer(ptrs, lengths)
         self._start_kv_transfer_threads()
 
+    def _validate_token_overlap(self, kv_caches):
+        if (not self.shared_pool_w2 or self.kv_role != "kv_consumer" or self.use_layerwise
+                or self.load_async or self.use_mla or self.use_sparse or self.tp_mismatch or self.use_kvpp
+                or self.pcp_size != 1 or self.dcp_size != 1
+                or getattr(self.vllm_config, "speculative_config", None) is not None
+                or not self.vllm_config.model_config.enforce_eager):
+            raise ValueError("W2-b token overlap requires eager dense consumer, matching TP, no CP/KVPP/speculation")
+        allowed = {
+            ("vllm_ascend.attention.attention_v1", "AscendAttentionBackendImpl"),
+            ("vllm_ascend.attention.fa_v1", "AscendFlashAttentionImpl"),
+            ("vllm_ascend.attention.fa3_v1", "AscendFAImpl"),
+        }
+        layers = self.vllm_config.compilation_config.static_forward_context
+        for layer_name in kv_caches:
+            impl = getattr(layers.get(layer_name), "impl", None)
+            if (impl is None or (type(impl).__module__, type(impl).__name__) not in allowed
+                    or impl.sinks is not None or impl.alibi_slopes is not None
+                    or impl.kv_sharing_target_layer_name is not None or impl.attn_type != "decoder"):
+                raise ValueError(f"W2-b unsupported attention implementation for {layer_name}")
+            for cache in self._as_cache_tuple(kv_caches[layer_name]):
+                if cache.shape[-1] != impl.head_size:
+                    raise ValueError("W2-b does not support padded head dimensions")
+        head_major = envs.VLLM_KV_CACHE_LAYOUT in ("LBHNC", "HND")
+        tensors = {}
+        for caches in kv_caches.values():
+            caches = self._as_cache_tuple(caches)
+            if len(caches) != 2:
+                raise ValueError("W2-b requires separate unquantized dense K/V tensors")
+            for cache in caches:
+                if (cache.ndim != 4 or cache.dtype not in (torch.float16, torch.bfloat16)
+                        or cache.shape[0] != self.num_blocks
+                        or cache.shape[2 if head_major else 1] != self.block_size
+                        or not cache[0].is_contiguous()):
+                    raise ValueError("W2-b does not support this cache layout or quantization")
+                tensors[cache.data_ptr()] = cache
+        self._w2_range_entries = []
+        for base, size, stride in zip(self.group_kv_caches_base_addr[0], self.group_block_len[0],
+                                      self.group_block_stride[0], strict=True):
+            cache = tensors.get(base)
+            if cache is None or size != cache[0].numel() * cache.element_size():
+                raise ValueError("W2-b requires ordinary unsegmented block objects")
+            self._w2_range_entries.append((base, stride, cache.shape[1 if head_major else 2],
+                                           cache.shape[-1], cache.element_size(), head_major))
+        self._w2_observation.add(w2b_enabled=1)
+        self.m_store.ensure_initialized()
+        for name in ("batch_get_session_start", "batch_get_into_multi_buffer_ranges", "batch_get_session_end"):
+            if not callable(getattr(self.m_store.store, name, None)):
+                raise RuntimeError(f"W2-b installed Mooncake client is missing {name}")
+
+    def _finish_token_load(self):
+        pipeline = getattr(self, "_w2_token_pipeline", None)
+        if pipeline is not None:
+            try:
+                pipeline.finish()
+            finally:
+                self._w2_token_pipeline = None
+
     def start_load_kv(self, metadata: AscendConnectorMetadata):
+        self._finish_token_load()
+        token_reads = []
         self.current_layer = 0
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
@@ -953,11 +1049,22 @@ class KVPoolWorker:
                         kv_cache_group_id=group_id,
                         block_id=block_id,
                     )
+                    if getattr(self, "w2_token_batch_size", 0):
+                        first = max(start, load_spec.vllm_cached_tokens) - start
+                        # The ordinary path may read one extra cached token
+                        # that the current query recomputes. Async DMA must not
+                        # overwrite the current step's reshape-and-cache write.
+                        last = min(end, load_spec.kvpool_cached_tokens) - start
+                        if first < last and block_id > 0:
+                            token_reads.extend(dense_token_ranges(
+                                key, block_id, first, last, self.w2_token_batch_size,
+                                self._w2_range_entries, self.block_size, request.req_id,
+                            ))
                     key_list.append(key)
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
-            if not key_list:
+            if not key_list or getattr(self, "w2_token_batch_size", 0):
                 continue
             key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
             addr_list_c = _circular_shift(addr_list, self.tp_rank % len(addr_list))
@@ -1023,6 +1130,14 @@ class KVPoolWorker:
                 load_group_ids,
                 len(key_list_c),
             )
+        if token_reads:
+            self._w2_token_generation += 1
+            device = torch.npu.current_device()
+            self._w2_token_pipeline = TokenLoadPipeline(
+                self.m_store, token_reads, self._w2_observation, lambda: torch.npu.set_device(device),
+                generation=self._w2_token_generation,
+            )
+
 
     def _record_kv_connector_operation(self, operation: str, duration_seconds: float, num_keys: int) -> None:
         with self._kv_stats_lock:
@@ -1081,10 +1196,16 @@ class KVPoolWorker:
             return
         send_thread.raise_if_failed()
         if isinstance(send_thread, KVCacheStoreSendingThread):
-            send_thread.wait_for_requests_saved(released_req_ids)
+            # Independent scheduler pins protect ordinary sources. Retain the
+            # original fence for unpinned speculative scratch and non-W2 paths.
+            if not getattr(self, "shared_pool_w2", False) or any(
+                getattr(self, "num_speculative_blocks_by_group", {}).values()
+            ):
+                send_thread.wait_for_requests_saved(released_req_ids)
         # Layerwise saves are already synchronized at each step's final layer.
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata) -> None:
+        self._finish_token_load()
         current_event = None
         assert self.kv_send_thread is not None
         send_thread = self.kv_send_thread
@@ -1114,16 +1235,16 @@ class KVPoolWorker:
         if not requests:
             return
 
+        if getattr(self, "shared_pool_w2", False) and hasattr(self, "_w2_channel"):
+            if not hasattr(self, "_w2_compute_observer"):
+                device = torch.npu.current_device()
+                self._w2_compute_observer = ComputeCompletionObserver(
+                    self._w2_observation, lambda: torch.npu.set_device(device)
+                )
+            blocks = {block for request in requests for group in request.block_ids_by_group
+                      for block in group if block > 0}
+            self._w2_compute_observer.submit(current_event, blocks)
         self._previous_save_batch = send_thread.add_save_batch(requests)
-        if getattr(self, "shared_pool_w2", False):
-            tick = time.perf_counter()
-            try:
-                send_thread.wait_for_batch(self._previous_save_batch)
-            except Exception:
-                self._w2_observation.add(step_save_failed=1)
-                self._w2_observation.emit(logger, final=True)
-                raise
-            self._w2_observation.add(step_save_done=1, wait_ms=(time.perf_counter() - tick) * 1000)
 
     def _make_sub_key_str(self, base_key: str, effective_rank: int) -> str:
         """Rewrite ``@head_or_tp_rank:<local>`` in serialized ``base_key`` to ``<effective_rank>``.
@@ -1423,8 +1544,8 @@ class KVPoolWorker:
                         send_thread.reset_saved_request(req_id)
                         self._retired_store_req_ids.discard(req_id)
             self.kv_send_thread.discard_finished_requests(meta.preempted_req_ids)
-            # Saves complete synchronously in wait_for_save(), so the scheduler
-            # never waits for a request-level finished_sending notification.
+            # Request-level finished_sending is unused; independent source
+            # completions release transfer pins, not core request references.
             self.kv_send_thread.get_and_clear_finished_requests()
             done_sending: set[str] = set()
         else:
@@ -1829,13 +1950,6 @@ class KVPoolWorker:
                 self.kv_send_thread.get_source_block_completions()
                 if getattr(self, "shared_pool_w2", False) else set()
             )
-            checks = set()
-            if getattr(self, "shared_pool_w2", False) and metadata is not None:
-                for request in metadata.requests:
-                    if request.source_save_id is not None:
-                        complete = request.w2_save_succeeded is True
-                        checks.add((request.source_save_id, self.w2_worker_rank, complete))
-                self._w2_observation.add(worker_return_checked_jobs=len(checks))
-            if ce or completions or checks:
-                return AscendStoreKVConnectorWorkerMetadata(ce or {}, completions, checks)
+            if ce or completions:
+                return AscendStoreKVConnectorWorkerMetadata(ce or {}, completions)
         return None

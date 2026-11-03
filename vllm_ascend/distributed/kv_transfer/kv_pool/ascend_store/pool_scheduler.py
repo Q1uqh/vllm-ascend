@@ -1,5 +1,6 @@
 import importlib
 import math
+import uuid
 from typing import Any
 
 import vllm.envs as envs
@@ -45,6 +46,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.shared_pool_w2 import (
     BlockPoolObservation,
     SharedPoolObservation,
+    SourceCompletionChannel,
+    completion_channel_path,
     SourceBlockTracker,
     validate_shared_pool_w2,
 )
@@ -151,8 +154,11 @@ class KVPoolScheduler:
         self.sending_events: dict[int, int] = {}
         self._expected_worker_count = vllm_config.parallel_config.world_size
         if self.shared_pool_w2:
-            self._source_blocks = SourceBlockTracker(self._expected_worker_count)
-            self._w2_expected_checks: dict[int, set[int]] = {}
+            self._source_blocks = SourceBlockTracker(
+                self._expected_worker_count, initial_id=uuid.uuid4().int >> 80
+            )
+            if self.kv_role == "kv_producer":
+                self._w2_channel = SourceCompletionChannel(completion_channel_path(vllm_config, envs.VLLM_RPC_BASE_PATH), receiver=True)
             self._w2_observation = SharedPoolObservation(
                 "scheduler", self.kv_role, vllm_config.parallel_config.rank, self._expected_worker_count
             )
@@ -843,20 +849,20 @@ class KVPoolScheduler:
                 if self._block_pool is None:
                     raise RuntimeError("Shared-pool W2 requires the bound BlockPool before save scheduling")
                 # Speculative align-state scratch must stay exclusively owned;
-                # the ordinary step fence protects these scratch buffers.
+                # retain the original ownership rules for these scratch buffers.
                 scratch = self.num_speculative_blocks_by_group.get(0, 0)
                 blocks = request.block_ids_by_group[0]
                 sources = blocks[:-scratch] if scratch else blocks
                 sources = sorted(set(block for block in sources if block > 0))
                 self._block_pool.touch([self._block_pool.blocks[block] for block in sources])
                 request.source_save_id, request.source_block_ids = self._source_blocks.register(sources)
-                self._w2_expected_checks[request.source_save_id] = set()
                 if hasattr(self, "_w2_allocator"):
                     self._w2_allocator.tracked.update(sources)
                 self._w2_observation.add(source_pins=len(sources), save_jobs=1)
+                self._w2_observation.trace("register", save=request.source_save_id,
+                                           blocks=len(sources), workers=len(self._source_blocks.workers))
             self._w2_observation.emit(
                 logger, pending_source_refs=len(self._source_blocks.pending),
-                pending_return_checks=len(self._w2_expected_checks),
             )
         return meta
 
@@ -902,10 +908,38 @@ class KVPoolScheduler:
         self.sending_blocks[using_event_id] = current_step_sending
 
     def has_pending_push_work(self) -> bool:
+        if getattr(self, "shared_pool_w2", False):
+            self.poll_source_completions()
         return bool(self.sending_events) or (
             getattr(self, "shared_pool_w2", False)
-            and bool(self._source_blocks.pending or self._w2_expected_checks)
+            and bool(self._source_blocks.pending)
         )
+
+    def poll_source_completions(self) -> None:
+        """Called only by the scheduler, including before admission free counts."""
+        channel = getattr(self, "_w2_channel", None)
+        if channel is None or self._block_pool is None:
+            return
+        events = channel.drain()
+        completions = []
+        for event in events:
+            if event["event"] == "source_done":
+                completions.append((event["save"], event["block"], event["rank"]))
+                self._w2_observation.trace("notify", save=event["save"], block=event["block"],
+                                           worker=event["rank"], source_t=event["t"])
+        self._release_source_completions(completions)
+
+    def _release_source_completions(self, completions) -> None:
+        # Remember generation before acknowledge removes it. The tracker makes
+        # worker-output duplicates and late datagrams harmless.
+        monitor = getattr(self, "_w2_allocator", None)
+        if monitor is not None:
+            for save, block, _ in completions:
+                if (save, block) in self._source_blocks.pending:
+                    monitor.provenance[block] = save
+        released = self._source_blocks.acknowledge(completions)
+        self._block_pool.free_blocks([self._block_pool.blocks[block] for block in released])
+        self._w2_observation.add(source_unpins=len(released))
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -918,26 +952,10 @@ class KVPoolScheduler:
             return
 
         if getattr(self, "shared_pool_w2", False):
-            # This callback receives the executor's actual model-runner output.
-            # Match each save's worker-side boundary checks by generation.
-            for save_id, rank, complete in meta.w2_save_checks:
-                seen = self._w2_expected_checks.get(save_id)
-                if seen is None or rank not in self._source_blocks.workers:
-                    continue
-                if not complete:
-                    self._w2_observation.add(return_before_save=1)
-                    self._w2_observation.emit(logger, final=True)
-                    raise RuntimeError("Shared-pool W2 executor output returned before a successful save")
-                seen.add(rank)
-                if seen == self._source_blocks.workers:
-                    del self._w2_expected_checks[save_id]
-                    self._w2_observation.add(return_checked_jobs=1)
-            released = self._source_blocks.acknowledge(meta.source_block_completions)
-            self._block_pool.free_blocks([self._block_pool.blocks[block] for block in released])
-            self._w2_observation.add(source_unpins=len(released))
+            self.poll_source_completions()
+            self._release_source_completions(meta.source_block_completions)
             self._w2_observation.emit(
                 logger, pending_source_refs=len(self._source_blocks.pending),
-                pending_return_checks=len(self._w2_expected_checks),
             )
 
         for event_id, count in (meta.completed_events or {}).items():
@@ -965,7 +983,7 @@ class KVPoolScheduler:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Allow the scheduler to free blocks after synchronous saving."""
+        """Allow core request cleanup; independent transfer references protect sources."""
         if getattr(self, "shared_pool_w2", False):
             self._w2_observation.add(requests_finished=1)
         return False, None
@@ -975,7 +993,7 @@ class KVPoolScheduler:
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Allow the scheduler to free all groups after synchronous saving."""
+        """Allow core request cleanup for all groups."""
         if getattr(self, "shared_pool_w2", False):
             self._w2_observation.add(requests_finished=1)
         return False, None
@@ -985,7 +1003,9 @@ class KVPoolScheduler:
         if getattr(self, "shared_pool_w2", False) and self.kv_role == "kv_producer":
             if hasattr(self, "_w2_allocator"):
                 self._w2_allocator.detach()
-            self._w2_allocator = BlockPoolObservation(gpu_block_pool, self._source_blocks, self._w2_observation)
+            self._w2_allocator = BlockPoolObservation(
+                gpu_block_pool, self._source_blocks, self._w2_observation, self.poll_source_completions
+            )
 
     def update_finished_recving(self, finished_recving: set[str] | None) -> None:
         if finished_recving:

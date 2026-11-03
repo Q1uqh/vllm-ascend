@@ -602,6 +602,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._source_completions.update(
                 (request.source_save_id, block, self.worker.w2_worker_rank) for block in completed
             )
+            for block in sorted(completed):
+                event = self.worker._w2_observation.trace(
+                    "source_done", save=request.source_save_id, block=block
+                )
+                channel = getattr(self.worker, "_w2_channel", None)
+                if channel is not None and not channel.send(event):
+                    self.worker._w2_observation.add(notification_fallback=1)
             remaining.difference_update(completed)
             if not remaining:
                 self._source_remaining.pop(request.source_save_id, None)
@@ -620,7 +627,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.raise_if_failed()
         failed = sum(request.w2_save_succeeded is not True for request in batch.requests)
         if failed:
-            self.worker._w2_observation.add(save_jobs_failed=failed)
             raise RuntimeError(f"Shared-pool W2 failed to publish {failed} save job(s); PD handoff aborted")
 
     def _put_shared_pool_blocks(self, request: ReqMeta, keys, addrs, sizes, block_ids) -> list[bool]:
@@ -635,7 +641,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
             indices_by_block.setdefault(block, []).extend(
                 index * partitions + shard for shard in range(partitions)
             )
-        for block, indices in indices_by_block.items():
+        for position, (block, indices) in enumerate(indices_by_block.items()):
+            delay = getattr(self.worker, "_w2_test_delay_seconds", 0)
+            if position == 1 and delay and not self.worker._w2_test_delay_used:
+                self.worker._w2_test_delay_used = True
+                self.worker._w2_observation.trace("test_delay", save=request.source_save_id, block=block)
+                if self._stopping.wait(delay):
+                    raise RuntimeError("Shared-pool W2 test delay interrupted by shutdown")
             block_keys = [keys[index] for index in indices]
             block_addrs = [addrs[index] for index in indices]
             block_sizes = [sizes[index] for index in indices]
@@ -811,6 +823,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
             finish_failed_request(queued_request)
             self.request_queue.task_done()
 
+    def _observe_save_result(self, request: ReqMeta, tracked: bool) -> None:
+        if not self.shared_pool_w2:
+            return
+        if not tracked or request.can_save is False:
+            self.worker._w2_observation.add(save_jobs_skipped=1)
+        elif request.w2_save_succeeded is True:
+            self.worker._w2_observation.add(save_jobs_done=1)
+        else:
+            self.worker._w2_observation.add(save_jobs_failed=1)
+
     def _handle_request(self, req_meta: ReqMeta | KVCacheStoreBatch):
         if isinstance(req_meta, KVCacheStoreBatch):
             req_meta.done.set()
@@ -834,6 +856,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._remember_retry_token_ids(req_meta)
                 logger.exception("Failed to store KV cache for TP-mismatch request %s", req_id)
             finally:
+                self._observe_save_result(req_meta, tracked_request)
                 self.complete_source_blocks(req_meta)
                 remaining = self.finish_store_job(req_meta) if tracked_request else None
                 if tracked_request and remaining == 0:
@@ -861,9 +884,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._remember_retry_token_ids(req_meta)
         except Exception:
             self._remember_retry_token_ids(req_meta)
-            if not self.shared_pool_w2:
-                logger.exception("Failed to store KV cache for request %s", req_id)
+            logger.exception("Failed to store KV cache for request %s", req_id)
         finally:
+            self._observe_save_result(req_meta, tracked_request)
             self.complete_source_blocks(req_meta)
             remaining = self.finish_store_job(req_meta) if tracked_request else None
             if tracked_request and remaining == 0:

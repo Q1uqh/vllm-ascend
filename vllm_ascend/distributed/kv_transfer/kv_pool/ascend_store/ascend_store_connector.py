@@ -233,9 +233,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 finally:
                     if getattr(self.connector_scheduler, "shared_pool_w2", False):
                         scheduler = self.connector_scheduler
+                        scheduler.poll_source_completions()
+                        if hasattr(scheduler, "_w2_channel"):
+                            scheduler._w2_channel.close()
                         scheduler._w2_observation.emit(
                             logger, final=True, pending_source_refs=len(scheduler._source_blocks.pending),
-                            pending_return_checks=len(scheduler._w2_expected_checks),
                         )
                         if hasattr(scheduler, "_w2_allocator"):
                             scheduler._w2_allocator.detach()
@@ -461,6 +463,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         cast(LayerwiseKVPoolWorker, self.connector_worker).save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):
+        if getattr(self.connector_worker, "_w2_token_pipeline", None) is not None:
+            self.connector_worker._finish_token_load()
         if not self.can_put:
             # A load-only consumer has no store thread to wait for.
             return
@@ -475,6 +479,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         metadata = self._get_connector_metadata()
+        if getattr(self.connector_worker, "_w2_token_pipeline", None) is not None:
+            self.connector_worker._finish_token_load()
         if self._current_step_has_real_forward:
             try:
                 self.connector_worker.m_store.ensure_initialized()
