@@ -81,3 +81,9 @@ def test_temporal_topology_for_dp_expert_parallel(pp, pcp, dcp, accepted):
     else:
         with pytest.raises(ValueError, match="PP, PCP and DCP"):
             dsv4_temporal_config(config)
+
+
+def test_snapshot_excludes_expired_pages_even_when_the_current_chunk_allocated_them():
+    ids = (list(range(1, 4097)), [4100, 4101, 4102])
+    pages = select_private_snapshot_pages(ids, [2, 4096], 8192, {0}, mutable_windows={0: 128})
+    assert pages == (tuple(range(4032, 4096)), ())

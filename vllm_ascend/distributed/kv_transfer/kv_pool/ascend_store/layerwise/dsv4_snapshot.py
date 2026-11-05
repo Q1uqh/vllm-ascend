@@ -63,12 +63,18 @@ class DSV4Snapshot:
         return cls(generation, end, tuple(tuple(row) for row in pages), replica)
 
 
+def mutable_snapshot_start(end_token: int, block_size: int, retained_tokens: int | None) -> int:
+    """Keep the full trailing window and any block overlapping its start."""
+    return 0 if retained_tokens is None else max(0, end_token - retained_tokens) // block_size
+
+
 def select_private_snapshot_pages(
     block_ids: tuple[list[int], ...],
     block_sizes: list[int],
     end_token: int,
     mutable_groups: set[int],
     history_ratios: dict[int, int] | None = None,
+    mutable_windows: dict[int, int] | None = None,
 ) -> tuple[tuple[int, ...], ...]:
     """Select the active private pages from the scheduler's live block table.
 
@@ -81,7 +87,11 @@ def select_private_snapshot_pages(
     selections = []
     for group, (ids, span) in enumerate(zip(block_ids, block_sizes, strict=True)):
         complete, tail = divmod(end_token, span)
-        start = 0 if group in mutable_groups else complete
+        start = (
+            mutable_snapshot_start(end_token, span, (mutable_windows or {}).get(group))
+            if group in mutable_groups
+            else complete
+        )
         ratio = (history_ratios or {}).get(group, 1)
         stop = complete + (tail >= ratio)
         selections.append(tuple(index for index in range(start, min(stop, len(ids))) if ids[index] != 0))

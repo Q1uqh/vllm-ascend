@@ -340,6 +340,7 @@ class TestMooncakeHybrid(unittest.TestCase):
         scheduler._dsv4_incoming = {}
         scheduler._dsv4_consumed = set()
         scheduler._dsv4_mutable_groups = {1}
+        scheduler._dsv4_mutable_windows = {}
         scheduler._dsv4_history_ratios = {0: 4}
         scheduler.grouped_block_size = [16, 4]
         live_ids = ([2, 3], [0, 0, 0, 4, 5, 6])

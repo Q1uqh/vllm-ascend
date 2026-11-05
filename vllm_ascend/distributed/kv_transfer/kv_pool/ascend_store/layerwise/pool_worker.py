@@ -48,6 +48,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tup
     dsv4_descriptor_predecessors,
     dsv4_history_ratios,
     dsv4_mutable_groups,
+    dsv4_mutable_windows,
     dsv4_temporal_config,
     uses_dsv4_snapshot_protocol,
 )
@@ -119,6 +120,9 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         self.dsv4_temporal = dsv4_temporal_config(vllm_config) is not None
         self._init_layerwise_config()
         self._dsv4_mutable_groups = dsv4_mutable_groups(kv_cache_config.kv_cache_groups) if kv_cache_config else set()
+        self._dsv4_mutable_windows = (
+            dsv4_mutable_windows(kv_cache_config.kv_cache_groups, self._dsv4_mutable_groups) if kv_cache_config else {}
+        )
         self._dsv4_history_ratios = (
             dsv4_history_ratios(kv_cache_config.kv_cache_groups, self._dsv4_mutable_groups)
             if kv_cache_config is not None and uses_dsv4_snapshot_protocol(vllm_config)

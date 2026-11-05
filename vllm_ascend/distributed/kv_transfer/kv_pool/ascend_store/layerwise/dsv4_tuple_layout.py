@@ -196,6 +196,22 @@ def dsv4_mutable_groups(groups: list[KVCacheGroupSpec]) -> set[int]:
     }
 
 
+def dsv4_mutable_windows(groups: list[KVCacheGroupSpec], mutable_groups: set[int]) -> dict[int, int]:
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+
+    windows = {}
+    for group_id in mutable_groups:
+        spec = groups[group_id].kv_cache_spec
+        components = tuple(spec.kv_cache_specs.values()) if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+        if components and all(isinstance(component, SlidingWindowSpec) for component in components):
+            windows[group_id] = max(
+                component.sliding_window + (getattr(component, "extra_retained_tokens", 0) or 0)
+                for component in components
+                if isinstance(component, SlidingWindowSpec)
+            )
+    return windows
+
+
 def dsv4_history_ratios(groups: list[KVCacheGroupSpec], mutable_groups: set[int]) -> dict[int, int]:
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 

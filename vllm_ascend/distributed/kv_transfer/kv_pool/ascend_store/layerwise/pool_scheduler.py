@@ -22,6 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_sna
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
     dsv4_history_ratios,
     dsv4_mutable_groups,
+    dsv4_mutable_windows,
     dsv4_producer_replica,
     dsv4_temporal_config,
     uses_dsv4_snapshot_protocol,
@@ -77,6 +78,9 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
                 raise ValueError("DSV4 temporal cache sharing requires grouped cache specs")
             self.layerwise_offload = True
             self._dsv4_mutable_groups = dsv4_mutable_groups(kv_cache_config.kv_cache_groups)
+            self._dsv4_mutable_windows = dsv4_mutable_windows(
+                kv_cache_config.kv_cache_groups, self._dsv4_mutable_groups
+            )
             self._dsv4_history_ratios = dsv4_history_ratios(kv_cache_config.kv_cache_groups, self._dsv4_mutable_groups)
         if self.use_layerwise_transfer:
             self._init_layerwise_offload(vllm_config, kv_cache_config, extra_config)
@@ -155,6 +159,7 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
                     request.target_token_len,
                     self._dsv4_mutable_groups,
                     self._dsv4_history_ratios,
+                    self._dsv4_mutable_windows,
                 ),
             )
             self._dsv4_snapshots[request.req_id] = request.dsv4_save_snapshot

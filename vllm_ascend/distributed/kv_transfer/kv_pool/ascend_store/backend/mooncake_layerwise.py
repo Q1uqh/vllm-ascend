@@ -14,7 +14,10 @@ from vllm.logger import logger
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.ascend_config import KVPPConfig
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_snapshot import public_history_suffix
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_snapshot import (
+    mutable_snapshot_start,
+    public_history_suffix,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
     dsv4_manifest_digest,
     uses_dsv4_snapshot_protocol,
@@ -376,6 +379,7 @@ def _prepare_temporal_group(worker, request, view, views, group, ids, hashes, sp
     restore = request.dsv4_restore_snapshot
     snapshot = request.dsv4_save_snapshot
     mutable = group in worker._dsv4_mutable_groups
+    window = worker._dsv4_mutable_windows.get(group)
 
     def public(index, checkpoint):
         if index >= len(hashes):
@@ -385,17 +389,19 @@ def _prepare_temporal_group(worker, request, view, views, group, ids, hashes, sp
 
     load = {}
     if restore is not None:
+        first = 0
         if not mutable:
             load.update((i, public(i, restore)) for i in range(min(restore.end_token // span, len(ids))) if ids[i])
         if mutable:
             stop = (restore.end_token + span - 1) // span
-            required = {i for i in range(min(stop, len(ids))) if ids[i]}
+            first = mutable_snapshot_start(restore.end_token, span, window)
+            required = {i for i in range(first, min(stop, len(ids))) if ids[i]}
             if not required.issubset(restore.private_pages[group]):
                 raise RuntimeError(f"DSV4 mutable checkpoint is incomplete group={group} end={restore.end_token}")
         for i in restore.private_pages[group]:
             # Pages dropped by the live scheduler window no longer have a
             # destination. In particular, block zero must never be written.
-            if i < len(ids) and ids[i]:
+            if first <= i < len(ids) and ids[i]:
                 load[i] = worker._make_layerwise_full_key(group, restore.suffix(group, i))
     elif snapshot is not None and request.load_spec is not None and request.load_spec.can_load:
         extent = request.load_spec.kvpool_cached_tokens
@@ -424,7 +430,7 @@ def _prepare_temporal_group(worker, request, view, views, group, ids, hashes, sp
     publish_mutable = snapshot.end_token == request.save_end_token and request.store_masks is not None
     public_entries = {}
     if not mutable or publish_mutable:
-        public_start = 0 if mutable else start
+        public_start = mutable_snapshot_start(snapshot.end_token, span, window) if mutable else start
         public_entries = {
             i: public(i, snapshot)
             for i in range(public_start, min(snapshot.end_token // span, len(ids)))
