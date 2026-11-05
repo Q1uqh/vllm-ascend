@@ -872,6 +872,8 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
         self._put_started_keys_lock = put_started_keys_lock or threading.Lock()
         self._session_tracker = session_tracker
         self.raise_on_transfer_failure = raise_on_transfer_failure
+        # Single writer, lock-free snapshot for a host thread waiting on PUT.
+        self.range_save_progress: tuple[str, int, int, int, int, float] | None = None
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
         self._active_put_keys: set[str] | None = None
@@ -924,7 +926,9 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
             if self._session_tracker is not None:
                 self._session_tracker.revoke_put_keys(keys)
 
-    def _handle_range_request(self, req_meta: LayerRangeReqMeta, final_group_layer: bool | None = None) -> None:
+    def _handle_range_request(
+        self, req_meta: LayerRangeReqMeta, final_group_layer: bool | None = None, *, group_id: int = 0
+    ) -> None:
         layer_id = req_meta.layer_id
         if self._active_put_keys is None or layer_id == 0:
             self._active_put_keys = set(req_meta.keys)
@@ -932,6 +936,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
         active_indices = [index for index, key in enumerate(req_meta.keys) if key in self._active_put_keys]
         active_keys = [req_meta.keys[index] for index in active_indices]
         if active_keys:
+            self.range_save_progress = ("device_event", layer_id, group_id, len(active_keys), 0, time.monotonic())
             self.sync_save_events[layer_id].synchronize()
             active_buffers = [req_meta.all_buffers[index] for index in active_indices]
             active_sizes = [req_meta.all_sizes[index] for index in active_indices]
@@ -945,6 +950,14 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                 self.max_transfer_blocks,
                 self.max_transfer_bytes,
             ):
+                self.range_save_progress = (
+                    "copy_put",
+                    layer_id,
+                    group_id,
+                    len(keys),
+                    sum(map(sum, sizes)),
+                    time.monotonic(),
+                )
                 results.extend(
                     require_aligned_batch_results(
                         "batch_copy_put",
@@ -972,6 +985,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
         active_keys = [key for key in req_meta.keys if key in self._active_put_keys]
         if active_keys:
             try:
+                self.range_save_progress = ("commit", layer_id, group_id, len(active_keys), 0, time.monotonic())
                 commit_results = require_aligned_batch_results(
                     "batch_commit", active_keys, self.m_store.batch_commit(active_keys)
                 )
@@ -1004,7 +1018,9 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                 req_meta.layer_id = layer_id
                 self._active_put_keys = self._group_put_keys.get(task.group_id)
                 try:
-                    self._handle_range_request(req_meta, task.final_group_layer or layer_id == self.final_layer_id)
+                    self._handle_range_request(
+                        req_meta, task.final_group_layer or layer_id == self.final_layer_id, group_id=task.group_id
+                    )
                 finally:
                     self._group_put_keys[task.group_id] = self._active_put_keys
                 for req_id in req_meta.req_ids:
@@ -1021,6 +1037,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
             self._group_put_keys.clear()
             raise
         finally:
+            self.range_save_progress = None
             self.layer_save_finished_events[layer_id].set()
             transfer_tasks.clear()
             self.request_queue.task_done()

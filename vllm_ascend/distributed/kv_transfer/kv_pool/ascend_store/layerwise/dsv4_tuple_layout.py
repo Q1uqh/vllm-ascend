@@ -239,11 +239,12 @@ def _validate_dsv4_snapshot_topology(config: VllmConfig) -> None:
             size != 1
             for size in (
                 parallel.pipeline_parallel_size,
+                parallel.prefill_context_parallel_size,
                 parallel.decode_context_parallel_size,
             )
         )
     ):
-        raise ValueError("DSV4 snapshot protocol requires eager MRV2 with PP and DCP equal to one")
+        raise ValueError("DSV4 snapshot protocol requires eager MRV2 with PP, PCP and DCP equal to one")
 
 
 def dsv4_producer_replica(config: VllmConfig) -> int | None:

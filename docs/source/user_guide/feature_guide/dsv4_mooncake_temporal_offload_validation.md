@@ -4,11 +4,11 @@
 
 ## 服务器配置
 
-以已验证可运行的 Ascend A5 DeepSeek V4 Flash 部署为起点。P 和 D 使用相同的模型路径、模型版本、KV 缓存数据类型和 TP 大小。启用 eager MRV2（`VLLM_USE_V2_MODEL_RUNNER=1` 和 `--enforce-eager`），P、D 使用相同的 DP、TP、PCP 和 EP 配置，PP 和 DCP 暂设为 1。
+以已验证可运行的 Ascend A5 DeepSeek V4 Flash 部署为起点。P 和 D 使用相同的模型路径、模型版本、KV 缓存数据类型和 TP 大小。启用 eager MRV2（`VLLM_USE_V2_MODEL_RUNNER=1` 和 `--enforce-eager`），P、D 使用相同的 DP、TP 和 EP 配置，PP、PCP、DCP 都设为 1。
 
-权重需要多卡时，首轮沿用已验证可加载权重的 `DP=4、TP=1 + EP`，PCP 先设为 1。P 和 D 各自设置 `--data-parallel-size 4 --data-parallel-size-local 4 --tensor-parallel-size 1 --enable-expert-parallel`。P 使用设备 `0,1,2,3`，D 使用设备 `4,5,6,7`。
+权重需要多卡时，首轮沿用已验证可加载权重的 `DP=4、TP=1 + EP`。P 和 D 各自设置 `--data-parallel-size 4 --data-parallel-size-local 4 --tensor-parallel-size 1 --enable-expert-parallel`。P 使用设备 `0,1,2,3`，D 使用设备 `4,5,6,7`。
 
-DP 模式下，公共历史按 P 副本隔离。D 按交接元数据中的 P 副本编号读取，不要求 P、D 的副本编号相同。PCP 大于 1 时，P、D 使用相同 PCP 大小，关闭 KVPP，并单独验证所有 PCP rank 的读取和清理。
+DP 模式下，公共历史按 P 副本隔离。D 按交接元数据中的 P 副本编号读取，不要求 P、D 的副本编号相同。
 
 vLLM 使用 `.github/vllm-main-verified.commit` 指定的提交。Mooncake 使用支持会话与范围传输 API 以及 `batch_remove` 的 DRAM 版本。记录实际使用的版本和每个 rank 的 KV 缓存预算。
 

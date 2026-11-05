@@ -50,7 +50,7 @@ def test_dp_producers_keep_public_history_separate():
 
 
 @pytest.mark.parametrize(
-    ("pp", "pcp", "dcp", "accepted"), [(1, 1, 1, True), (1, 2, 1, True), (2, 1, 1, False), (1, 1, 2, False)]
+    ("pp", "pcp", "dcp", "accepted"), [(1, 1, 1, True), (1, 2, 1, False), (2, 1, 1, False), (1, 1, 2, False)]
 )
 def test_temporal_topology_for_dp_expert_parallel(pp, pcp, dcp, accepted):
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
@@ -79,5 +79,5 @@ def test_temporal_topology_for_dp_expert_parallel(pp, pcp, dcp, accepted):
     if accepted:
         assert dsv4_temporal_config(config) == config.kv_transfer_config.kv_connector_extra_config
     else:
-        with pytest.raises(ValueError, match="PP and DCP"):
+        with pytest.raises(ValueError, match="PP, PCP and DCP"):
             dsv4_temporal_config(config)

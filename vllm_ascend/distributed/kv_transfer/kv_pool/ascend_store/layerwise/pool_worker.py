@@ -11,7 +11,6 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import (
-    get_pcp_group,
     get_tp_group,
 )
 from vllm.logger import logger
@@ -704,8 +703,6 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             )
             if self.tp_size > 1:
                 get_tp_group().barrier()
-            if self.pcp_size > 1:
-                get_pcp_group().barrier()
         for request in transfers:
             restore, save = request.dsv4_restore_snapshot, request.dsv4_save_snapshot
             if restore is not None:
@@ -797,7 +794,6 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                     "snapshot_prepare",
                     generation=snapshot.generation,
                     producer_replica=snapshot.producer_replica,
-                    pcp_rank=self.pcp_rank,
                     restore_end=restore.end_token if restore else None,
                     save_end=save.end_token if save else None,
                     private_pages=[len(pages) for pages in snapshot.private_pages],
@@ -2523,13 +2519,29 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         # Drain pending saves before clearing or reusing completion events.
         queue = send_thread.request_queue
         with queue.all_tasks_done:
-            waited_s = 0
+            next_report = time.monotonic() + 60
             while queue.unfinished_tasks:
                 send_thread.raise_if_failed()
                 queue.all_tasks_done.wait(timeout=1)
-                waited_s += 1
-                if waited_s % 60 == 0:
-                    logger.info("Layerwise save drain still waiting on %d queued PUT(s)", queue.unfinished_tasks)
+                now = time.monotonic()
+                if queue.unfinished_tasks and now >= next_report:
+                    progress = getattr(send_thread, "range_save_progress", None)
+                    if progress is None:
+                        logger.warning("Layerwise save drain waiting unfinished_puts=%d", queue.unfinished_tasks)
+                    else:
+                        phase, layer, group, keys, requested_bytes, started = progress
+                        logger.warning(
+                            "Layerwise save drain waiting unfinished_puts=%d phase=%s layer=%d group=%d "
+                            "keys=%d requested_bytes=%d phase_elapsed_s=%.1f",
+                            queue.unfinished_tasks,
+                            phase,
+                            layer,
+                            group,
+                            keys,
+                            requested_bytes,
+                            now - started,
+                        )
+                    next_report = now + 60
         while not save_finished_events[num_local - 1].wait(timeout=10):
             send_thread.raise_if_failed()
             logger.info("Layerwise %d save not done, keep waiting", num_local - 1)

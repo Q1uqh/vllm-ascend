@@ -86,8 +86,6 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
             vllm_config.cache_config.cache_dtype,
             parallel.tensor_parallel_size,
         )
-        if parallel.prefill_context_parallel_size > 1:
-            identity += ("pcp", parallel.prefill_context_parallel_size)
         if parallel.data_parallel_size > 1:
             # The DP rank is carried separately in handoff metadata so any D
             # replica can read the originating producer's public history.
