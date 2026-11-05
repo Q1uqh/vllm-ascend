@@ -180,7 +180,11 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
         if (dp_size == 1 and replica is not None) or (dp_size > 1 and (replica is None or replica >= dp_size)):
             raise ValueError("DSV4 handoff has an incompatible producer DP replica")
         if not num_computed_tokens <= snapshot.end_token < request.num_tokens:
-            raise ValueError("DSV4 handoff requires the complete prefill extent followed by a decode token")
+            raise ValueError(
+                "DSV4 handoff requires the complete prefill extent followed by a decode token "
+                f"(snapshot_end={snapshot.end_token}, request_tokens={request.num_tokens}, "
+                f"local_computed={num_computed_tokens})"
+            )
         self._validate_dsv4_snapshot_readable(snapshot)
         self._dsv4_incoming[request.request_id] = snapshot
         self.load_specs[request.request_id] = LoadSpec(num_computed_tokens, snapshot.end_token, can_load=True)

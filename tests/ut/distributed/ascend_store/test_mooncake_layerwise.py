@@ -167,7 +167,7 @@ class TestMooncakeLayerSaveSession(unittest.TestCase):
     def test_final_layer_commits_after_all_ranges(self):
         store = MagicMock()
         # Range APIs may return the positive number of bytes moved on success.
-        store.batch_copy_put.return_value = [30]
+        store.batch_copy_put.side_effect = lambda keys, buffers, sizes, offsets: [sum(row) for row in sizes]
         store.batch_commit.return_value = [0]
         tracker = LayerwiseSessionTracker()
         tracker.register_put_keys("r1", [("key", 0)])
@@ -186,21 +186,23 @@ class TestMooncakeLayerSaveSession(unittest.TestCase):
             layer_save_finished_events=save_finished,
             sync_save_events=[MagicMock(), MagicMock()],
             group_builders=[builder],
-            put_started_keys={"key"},
+            put_started_keys={"key", "second"},
+            max_transfer_blocks=1,
             session_tracker=tracker,
         )
-        request = ReqMeta("r1", block_ids=[2], block_hashes=[], is_last_chunk=True)
-        request.save_block_keys = ["key"]
+        request = ReqMeta("r1", block_ids=[2, 3], block_hashes=[], is_last_chunk=True)
+        request.save_block_keys = ["key", "second"]
+        tracker.register_put_keys("r1", [("second", 1)])
 
         for layer_id in range(2):
             task = LayerTransferTask(
                 layer_id=layer_id,
                 layer_idx_in_group=layer_id,
-                block_ranges=[LayerBlockRange(request, 0, 1)],
+                block_ranges=[LayerBlockRange(request, 0, 2)],
                 shared_block_data=builder.build_shared(
                     LayerTransferTask(
                         layer_id=layer_id,
-                        block_ranges=[LayerBlockRange(request, 0, 1)],
+                        block_ranges=[LayerBlockRange(request, 0, 2)],
                         use_key_major_ranges=True,
                     )
                 ),
@@ -210,9 +212,9 @@ class TestMooncakeLayerSaveSession(unittest.TestCase):
             thread.request_queue.put([task])
             thread._handle_request([task])
 
-        self.assertEqual(store.batch_copy_put.call_count, 2)
-        store.batch_commit.assert_called_once_with(["key"])
-        self.assertEqual(tracker.prepare_load_entries("r1", []), [("key", 0)])
+        self.assertEqual(store.batch_copy_put.call_count, 4)
+        self.assertEqual([item.args[0] for item in store.batch_commit.call_args_list], [["key"], ["second"]])
+        self.assertEqual(tracker.prepare_load_entries("r1", []), [("key", 0), ("second", 1)])
 
 
 class TestMooncakeWorkerSessionPreparation(unittest.TestCase):

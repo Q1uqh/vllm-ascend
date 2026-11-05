@@ -95,6 +95,9 @@ def emit_dsv4_transfer_event(event: str, **fields: Any) -> None:
         pass
 
 
+_DEFAULT_REQUIRED_COMMIT_BATCH_SIZE = 256
+
+
 def _circular_shift(lst: list, offset: int) -> list:
     if not lst or offset == 0:
         return lst
@@ -983,23 +986,25 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
         if not (layer_id == self.final_layer_id if final_group_layer is None else final_group_layer):
             return
         active_keys = [key for key in req_meta.keys if key in self._active_put_keys]
-        if active_keys:
-            try:
-                self.range_save_progress = ("commit", layer_id, group_id, len(active_keys), 0, time.monotonic())
-                commit_results = require_aligned_batch_results(
-                    "batch_commit", active_keys, self.m_store.batch_commit(active_keys)
-                )
-                _emit_commit_debug_event(layer_id, len(active_keys), commit_results)
-            except Exception:
-                self._revoke_range_keys(active_keys)
-                raise
-            failed_keys = [key for key, result in zip(active_keys, commit_results, strict=True) if result != 0]
+        batch_size = (
+            self.max_transfer_blocks
+            if self.max_transfer_blocks > 0
+            else (_DEFAULT_REQUIRED_COMMIT_BATCH_SIZE if self.raise_on_transfer_failure else max(1, len(active_keys)))
+        )
+        for start in range(0, len(active_keys), batch_size):
+            keys = active_keys[start : start + batch_size]
+            self.range_save_progress = ("commit", layer_id, group_id, len(keys), 0, time.monotonic())
+            commit_results = require_aligned_batch_results("batch_commit", keys, self.m_store.batch_commit(keys))
+            _emit_commit_debug_event(layer_id, len(keys), commit_results)
+            failed_keys = [key for key, result in zip(keys, commit_results, strict=True) if result != 0]
             if failed_keys:
                 self._revoke_range_keys(failed_keys)
-            committed_keys = [key for key, result in zip(active_keys, commit_results, strict=True) if result == 0]
+            committed_keys = [key for key, result in zip(keys, commit_results, strict=True) if result == 0]
+            # Later batches can fail. Exclude already published keys from
+            # the outer exception handler's pending-session revocation.
+            self._remove_started_keys(committed_keys)
             if self._session_tracker is not None:
                 self._session_tracker.commit_put_keys(committed_keys)
-            self._remove_started_keys(active_keys)
             if failed_keys and self.raise_on_transfer_failure:
                 raise RuntimeError(f"Required layerwise commit failed at layer {layer_id}")
         self._active_put_keys = None
