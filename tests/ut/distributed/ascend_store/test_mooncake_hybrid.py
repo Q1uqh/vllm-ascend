@@ -247,6 +247,7 @@ class TestMooncakeHybrid(unittest.TestCase):
         blocks = ([1, 2, 5], [3, 6], [0, 4, 7])
         hashes = [b"h0", b"h1"]
         generation = "0" * 32
+        producer_replica = 2
         previous = None
         for endpoint in (23, 36):
             request = ReqMeta(
@@ -260,7 +261,10 @@ class TestMooncakeHybrid(unittest.TestCase):
             )
             request.dsv4_restore_snapshot = previous
             request.dsv4_save_snapshot = DSV4Snapshot(
-                generation, endpoint, select_private_snapshot_pages(blocks, [16, 32, 16], endpoint, {2})
+                generation,
+                endpoint,
+                select_private_snapshot_pages(blocks, [16, 32, 16], endpoint, {2}),
+                producer_replica,
             )
             meta = AscendConnectorMetadata(set())
             meta.add_request(request)
@@ -289,6 +293,7 @@ class TestMooncakeHybrid(unittest.TestCase):
         consumer, _, resident, consumer_jobs, consumer_errors = self.make_hybrid()
         consumer.m_store = consumer.kv_recv_thread.m_store = store
         consumer.kv_role = "kv_consumer"
+        self.assertTrue(any("producer-dp:2:" in key for key in store.complete))
         consumer._dsv4_mutable_groups = {2}
         request = ReqMeta(
             "decoder",
@@ -327,6 +332,9 @@ class TestMooncakeHybrid(unittest.TestCase):
     def test_dsv4_scheduler_uses_live_group_ids_and_exact_restore_endpoint(self):
         scheduler = object.__new__(LayerwiseKVPoolScheduler)
         scheduler.dsv4_temporal = True
+        scheduler.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=4, data_parallel_index=2)
+        )
         scheduler._dsv4_snapshots = {}
         scheduler._dsv4_published = {}
         scheduler._dsv4_incoming = {}
@@ -354,6 +362,7 @@ class TestMooncakeHybrid(unittest.TestCase):
 
         first = build(17)
         self.assertIsNone(first.dsv4_restore_snapshot)
+        self.assertEqual(first.dsv4_save_snapshot.producer_replica, 2)
         self.assertEqual(first.dsv4_save_snapshot.private_pages, ((), (3, 4)))
         output.num_scheduled_tokens["r"] = 8
         second = build(25)

@@ -14,6 +14,7 @@ from vllm.logger import logger
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.ascend_config import KVPPConfig
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_snapshot import public_history_suffix
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
     dsv4_manifest_digest,
     uses_dsv4_snapshot_protocol,
@@ -85,6 +86,12 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
             vllm_config.cache_config.cache_dtype,
             parallel.tensor_parallel_size,
         )
+        if parallel.prefill_context_parallel_size > 1:
+            identity += ("pcp", parallel.prefill_context_parallel_size)
+        if parallel.data_parallel_size > 1:
+            # The DP rank is carried separately in handoff metadata so any D
+            # replica can read the originating producer's public history.
+            identity += (parallel.data_parallel_size, parallel.enable_expert_parallel)
         digest = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         return f"dsv4-snapshot-v1:{digest}"
     if parallel.pipeline_parallel_size == 1:
@@ -372,15 +379,16 @@ def _prepare_temporal_group(worker, request, view, views, group, ids, hashes, sp
     snapshot = request.dsv4_save_snapshot
     mutable = group in worker._dsv4_mutable_groups
 
-    def public(index):
+    def public(index, checkpoint):
         if index >= len(hashes):
             raise RuntimeError(f"DSV4 complete page has no hash group={group} page={index}")
-        return worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
+        suffix = public_history_suffix(block_hash_to_str(hashes[index]), checkpoint.producer_replica)
+        return worker._make_layerwise_full_key(group, suffix)
 
     load = {}
     if restore is not None:
         if not mutable:
-            load.update((i, public(i)) for i in range(min(restore.end_token // span, len(ids))) if ids[i])
+            load.update((i, public(i, restore)) for i in range(min(restore.end_token // span, len(ids))) if ids[i])
         if mutable:
             stop = (restore.end_token + span - 1) // span
             required = {i for i in range(min(stop, len(ids))) if ids[i]}
@@ -391,9 +399,11 @@ def _prepare_temporal_group(worker, request, view, views, group, ids, hashes, sp
             # destination. In particular, block zero must never be written.
             if i < len(ids) and ids[i]:
                 load[i] = worker._make_layerwise_full_key(group, restore.suffix(group, i))
-    elif request.load_spec is not None and request.load_spec.can_load:
+    elif snapshot is not None and request.load_spec is not None and request.load_spec.can_load:
         extent = request.load_spec.kvpool_cached_tokens
-        load.update((i, public(i)) for i in range(min(extent // span, len(ids))) if ids[i] and selected(load_mask, i))
+        load.update(
+            (i, public(i, snapshot)) for i in range(min(extent // span, len(ids))) if ids[i] and selected(load_mask, i)
+        )
 
     view.load_key_block_offset = 0
     view.load_block_keys = [load.get(i) for i in range(max(load, default=-1) + 1)]
@@ -418,7 +428,7 @@ def _prepare_temporal_group(worker, request, view, views, group, ids, hashes, sp
     if not mutable or publish_mutable:
         public_start = 0 if mutable else start
         public_entries = {
-            i: public(i)
+            i: public(i, snapshot)
             for i in range(public_start, min(snapshot.end_token // span, len(ids)))
             if ids[i] and (not mutable or selected(store_mask, i))
         }

@@ -16,11 +16,13 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cach
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_snapshot import (
     DSV4_HANDOFF_KEY,
     DSV4Snapshot,
+    public_history_suffix,
     select_private_snapshot_pages,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
     dsv4_history_ratios,
     dsv4_mutable_groups,
+    dsv4_producer_replica,
     dsv4_temporal_config,
     uses_dsv4_snapshot_protocol,
 )
@@ -146,6 +148,7 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
             request.dsv4_save_snapshot = DSV4Snapshot(
                 generation=previous.generation if previous else uuid4().hex,
                 end_token=request.target_token_len,
+                producer_replica=dsv4_producer_replica(self.vllm_config),
                 private_pages=select_private_snapshot_pages(
                     ids,
                     self.grouped_block_size,
@@ -172,6 +175,10 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
         ):
             raise ValueError("DSV4 handoff requires a resident Mooncake block-key hybrid consumer")
         snapshot = DSV4Snapshot.from_wire(payload, len(self.grouped_block_size))
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        replica = snapshot.producer_replica
+        if (dp_size == 1 and replica is not None) or (dp_size > 1 and (replica is None or replica >= dp_size)):
+            raise ValueError("DSV4 handoff has an incompatible producer DP replica")
         if not num_computed_tokens <= snapshot.end_token < request.num_tokens:
             raise ValueError("DSV4 handoff requires the complete prefill extent followed by a decode token")
         self._validate_dsv4_snapshot_readable(snapshot)
@@ -323,7 +330,10 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
                     continue
                 if lookup_mask is not None and not (block_idx < len(lookup_mask) and lookup_mask[block_idx]):
                     continue
-                keys_by_block.append(self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(block_hash)))
+                suffix = block_hash_to_str(block_hash)
+                if getattr(self, "dsv4_temporal", False):
+                    suffix = public_history_suffix(suffix, dsv4_producer_replica(self.vllm_config))
+                keys_by_block.append(self._make_layerwise_hit_check_keys(group_id, suffix))
                 allowed_hashes.append(block_hash)
             block_hits = self._query_layerwise_block_hits(keys_by_block)
             return [block_hash for block_hash, hit in zip(allowed_hashes, block_hits) if hit]

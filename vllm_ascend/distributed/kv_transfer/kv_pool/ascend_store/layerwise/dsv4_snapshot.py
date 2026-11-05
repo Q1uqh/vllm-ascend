@@ -10,6 +10,11 @@ DSV4_HANDOFF_KEY = "ascend_dsv4_snapshot"
 _SNAPSHOT_VERSION = 1
 
 
+def public_history_suffix(block_hash: str, producer_replica: int | None) -> str:
+    """Prevent concurrent DP writers from opening the same public object."""
+    return block_hash if producer_replica is None else f"producer-dp:{producer_replica}:{block_hash}"
+
+
 @dataclass(frozen=True)
 class DSV4Snapshot:
     generation: str
@@ -17,6 +22,7 @@ class DSV4Snapshot:
     # Each group names the logical page indices stored privately. Destination
     # block IDs come from the reader's live table and never enter the key.
     private_pages: tuple[tuple[int, ...], ...]
+    producer_replica: int | None = None
 
     def __post_init__(self) -> None:
         if UUID(hex=self.generation).hex != self.generation or self.end_token <= 0:
@@ -33,6 +39,7 @@ class DSV4Snapshot:
             "version": _SNAPSHOT_VERSION,
             "generation": self.generation,
             "end_token": self.end_token,
+            "producer_replica": self.producer_replica,
             "private_pages": [list(pages) for pages in self.private_pages],
         }
 
@@ -43,15 +50,17 @@ class DSV4Snapshot:
         pages = metadata.get("private_pages")
         end = metadata.get("end_token")
         generation = metadata.get("generation")
+        replica = metadata.get("producer_replica")
         if (
             not isinstance(pages, list)
             or len(pages) != group_count
             or any(not isinstance(row, list) or any(type(page) is not int for page in row) for row in pages)
             or type(end) is not int
             or not isinstance(generation, str)
+            or (replica is not None and (type(replica) is not int or replica < 0))
         ):
             raise ValueError("Malformed DSV4 snapshot metadata")
-        return cls(generation, end, tuple(tuple(row) for row in pages))
+        return cls(generation, end, tuple(tuple(row) for row in pages), replica)
 
 
 def select_private_snapshot_pages(

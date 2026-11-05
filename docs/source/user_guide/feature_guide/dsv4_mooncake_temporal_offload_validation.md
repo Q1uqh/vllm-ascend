@@ -1,22 +1,20 @@
-# DeepSeek V4 Flash Mooncake temporal offload validation
+# DeepSeek V4 Flash Mooncake KV Offload 服务器测试说明
 
-In eager Model Runner V2, a Mooncake producer can reuse DeepSeek V4 Flash
-device cache slots across compatible layers. The resident decoder restores the
-producer's final checkpoint. Chunk continuation restores immutable history
-from public keys and active SWA and compressor state from request snapshots.
+在 eager 模式的 Model Runner V2 中，Mooncake 的预填充节点（P）可以让兼容的层轮流使用同一设备缓存槽位。解码节点（D）使用驻留缓存，从 P 的最终检查点恢复。继续处理下一分块时，P 从公共键恢复已写完的历史页，并从请求专属快照恢复仍在使用的 SWA 缓存和压缩器状态。
 
-## Server setup
+## 服务器配置
 
-Start with a known-good DeepSeek V4 Flash deployment on Ascend A5. Use the
-same model path and revision, cache dtype, and TP size on P and D. Use eager
-MRV2 (`VLLM_USE_V2_MODEL_RUNNER=1`, `--enforce-eager`) with DP, PP, PCP and DCP equal to 1. Use the vLLM revision recorded in
-`.github/vllm-main-verified.commit` and a Mooncake DRAM build with session/range
-APIs and `batch_remove`. Record the resolved revisions and per-rank KV budget.
-Use a standalone `AscendStoreConnector`. Run P without speculative decoding,
-with `--no-async-scheduling` and `--no-enable-prefix-caching`. External public
-prefix lookup remains active with local prefix caching disabled.
+以已验证可运行的 Ascend A5 DeepSeek V4 Flash 部署为起点。P 和 D 使用相同的模型路径、模型版本、KV 缓存数据类型和 TP 大小。启用 eager MRV2（`VLLM_USE_V2_MODEL_RUNNER=1` 和 `--enforce-eager`），P、D 使用相同的 DP、TP、PCP 和 EP 配置，PP 和 DCP 暂设为 1。
 
-P configuration:
+权重需要多卡时，首轮沿用已验证可加载权重的 `DP=4、TP=1 + EP`，PCP 先设为 1。P 和 D 各自设置 `--data-parallel-size 4 --data-parallel-size-local 4 --tensor-parallel-size 1 --enable-expert-parallel`。P 使用设备 `0,1,2,3`，D 使用设备 `4,5,6,7`。
+
+DP 模式下，公共历史按 P 副本隔离。D 按交接元数据中的 P 副本编号读取，不要求 P、D 的副本编号相同。PCP 大于 1 时，P、D 使用相同 PCP 大小，关闭 KVPP，并单独验证所有 PCP rank 的读取和清理。
+
+vLLM 使用 `.github/vllm-main-verified.commit` 指定的提交。Mooncake 使用支持会话与范围传输 API 以及 `batch_remove` 的 DRAM 版本。记录实际使用的版本和每个 rank 的 KV 缓存预算。
+
+单独使用 `AscendStoreConnector`。P 端关闭推测解码，并设置 `--no-async-scheduling` 和 `--no-enable-prefix-caching`。关闭本地前缀缓存后，仍可查询 Mooncake 中的公共前缀。
+
+### P 端配置
 
 ```json
 {
@@ -32,7 +30,7 @@ P configuration:
 }
 ```
 
-D configuration:
+### D 端配置
 
 ```json
 {
@@ -46,24 +44,15 @@ D configuration:
 }
 ```
 
-Use `max_tokens=1` on P. Forward its returned `kv_transfer_params` to D
-together with the original prompt token IDs and the first token sampled by P.
-The decoder starts at the exact prefill extent and acknowledges the handoff by
-removing private objects after reads finish. Removal respects backend leases.
-Use sufficient Mooncake DRAM for active snapshots and history. Missing required
-objects fail the transfer, including eviction between chunks or before handoff.
-GET sessions protect active reads. Size the pool to retain data between
-sessions. If a handoff is abandoned before D can acknowledge it, the
-unacknowledged snapshot remains eligible for Mooncake eviction.
+向 P 发送请求时设置 `max_tokens=1`。将 P 返回的 `kv_transfer_params`、原始提示词 token ID 序列以及 P 采样出的第一个 token 一并传给 D。D 从 P 实际完成预填充的位置开始解码，并在读完后按后端租约规则删除私有对象，完成交接确认。
 
-## Compare with the resident deployment
+为活跃快照和历史数据预留足够的 Mooncake DRAM。GET 会话保护正在读取的对象，两次读取之间的数据保留依赖可用容量。必需对象在分块之间或交接前被驱逐时，传输会报错。如果交接在 D 确认前被放弃，未确认的快照仍可由 Mooncake 驱逐。
 
-For capacity comparisons, rerun P at the same budget with
-`layerwise_num_shared_buffers` omitted. For numerical comparison, use a
-known-good resident generation endpoint with the same model and runtime.
-Use a fresh Mooncake namespace or pool for cold runs. Set
-`--max-num-batched-tokens` below the length of at least one prompt to force
-multiple chunks. Supply a JSON array of prompt token-ID arrays.
+## 与驻留模式对照
+
+- **容量对照**：在相同 KV 缓存预算下重跑 P，省略 `layerwise_num_shared_buffers`，得到驻留模式的块数和显存基线。
+- **数值对照**：使用模型和运行配置相同、已验证可运行的驻留生成服务。冷启动用例使用新的 Mooncake 命名空间或存储池。
+- **分块用例**：将 `--max-num-batched-tokens` 设为小于至少一条提示词的 token 数，以触发多分块预填充。将测试输入写入 `prompts.json`，格式为 JSON 数组，每个元素是一条提示词的 token ID 数组。
 
 ```bash
 python3 tests/e2e/cases/features/kv_pool/dsv4_mooncake_temporal_smoke.py \
@@ -72,30 +61,18 @@ python3 tests/e2e/cases/features/kv_pool/dsv4_mooncake_temporal_smoke.py \
   --prompt-tokens prompts.json --output-tokens 8 --repeat 2 | tee smoke.log
 ```
 
-## Acceptance matrix
+## 验收项目
 
-- Compare token IDs and finite logprobs for cold, partial-hit, and warm
-  requests. Include interleaving, 32K and 128K inputs, and chunk endpoints
-  around 3/4/5, 127/128/129 and each actual group boundary.
-- Compare per-rank block counts, unique backing bytes, and HBM peaks.
-  Exercise buffer counts 1 through 4 and independent layers. Verify the
-  planner uses each group's actual page format and logical block table.
-- Delay PUT, GET, and commit independently. Check that no-load successors
-  and non-upload ranks wait for previous-layer device accesses and source
-  copy. Check that the next chunk and D read committed data only.
-- Test aligned and unaligned P/D handoff and delay D submission. Confirm
-  that final private objects survive until read completion and are removed
-  after active read leases permit removal.
-- Inject missing objects, short transfer responses, cancellation, and
-  preemption. Verify fail-stop and ownership-aware cleanup. Run 1,000
-  interleaved or multichunk requests or one hour of traffic.
-- Collect TTFT P50/P95, throughput, and HBM peak across at least three warmed
-  runs. Report actual copied bytes separately from requested bytes. The
-  smoke script reports request duration for diagnostics.
+- **输出正确性**：对比冷请求、部分命中和热请求的 token ID，并检查 logprobs 是否为有限值。覆盖交错请求、32K 和 128K 输入，以及 3/4/5、127/128/129 和各缓存组实际块边界附近的分块端点。
+- **容量和布局**：对比每个 rank 的块数、去重后的底层存储字节数和 HBM 峰值。测试共享缓冲区数量为 1 到 4 的配置及独立驻留层，核对规划器使用各组实际页格式和逻辑块表。
+- **异步时序**：分别延迟 PUT、GET 和 commit。确认无需 GET 的后继层及不负责上传的 rank 也会等待前一层设备访问和源数据复制完成。确认下一分块和 D 只读取已提交的数据。
+- **P/D 交接**：测试对齐和非对齐的预填充端点，并延迟向 D 提交请求。确认最终私有对象保留到 D 读完，并在读取租约允许后删除。
+- **失败和回收**：注入对象缺失、传输字节数不足、取消和抢占。确认遇到必需数据缺失时明确报错，且撤销只针对本端拥有的 PUT 会话。至少跑 1,000 个交错或多分块请求，或连续运行 1 小时。
+- **性能**：预热后至少测 3 轮，记录首 token 延迟（TTFT）的 P50/P95、吞吐和 HBM 峰值。分别报告请求传输字节数和实际复制字节数。冒烟脚本会记录请求耗时。
 
-Enable `kv_pool_range_debug` in Ascend additional config during diagnostics.
-Collect all P/D logs and the smoke report together. The script emits at most
-300 lines and preserves recent errors and failed transfer events:
+## 提取回传日志
+
+诊断时，在 Ascend additional config 中开启 `kv_pool_range_debug`。汇总 P 端日志、D 端日志和冒烟测试报告。脚本保留近期错误和失败传输事件，合计输出不超过 300 行。
 
 ```bash
 python3 tests/e2e/cases/features/kv_pool/summarize_mooncake_range_logs.py \

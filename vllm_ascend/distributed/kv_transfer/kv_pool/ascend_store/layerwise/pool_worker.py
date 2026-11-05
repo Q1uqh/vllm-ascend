@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import (
+    get_pcp_group,
     get_tp_group,
 )
 from vllm.logger import logger
@@ -703,6 +704,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             )
             if self.tp_size > 1:
                 get_tp_group().barrier()
+            if self.pcp_size > 1:
+                get_pcp_group().barrier()
         for request in transfers:
             restore, save = request.dsv4_restore_snapshot, request.dsv4_save_snapshot
             if restore is not None:
@@ -793,6 +796,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 emit_dsv4_transfer_event(
                     "snapshot_prepare",
                     generation=snapshot.generation,
+                    producer_replica=snapshot.producer_replica,
+                    pcp_rank=self.pcp_rank,
                     restore_end=restore.end_token if restore else None,
                     save_end=save.end_token if save else None,
                     private_pages=[len(pages) for pages in snapshot.private_pages],
