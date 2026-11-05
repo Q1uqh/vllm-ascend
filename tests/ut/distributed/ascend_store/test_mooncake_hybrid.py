@@ -564,13 +564,13 @@ class TestMooncakeHybrid(unittest.TestCase):
         self.assertFalse(errors)
         self.assertFalse(store.open_reads)
 
-    def test_failed_put_range_revokes_only_affected_group_keys(self):
+    def test_short_put_range_revokes_only_affected_group_keys(self):
         worker, store, arrays, jobs, errors = self.make_hybrid()
         real_put = store.batch_copy_put
 
         def put(keys, buffers, sizes, offsets):
             if all("@group:1@" in key for key in keys):
-                return [-1] * len(keys)
+                return [sum(row) - 1 for row in sizes]
             return real_put(keys, buffers, sizes, offsets)
 
         store.batch_copy_put = put
@@ -580,13 +580,13 @@ class TestMooncakeHybrid(unittest.TestCase):
         self.assertFalse(worker._put_started_keys)
         self.assertFalse(errors)
 
-    def test_failed_get_does_not_allow_incomplete_attention(self):
+    def test_short_get_does_not_allow_incomplete_attention(self):
         worker, store, arrays, jobs, errors = self.make_hybrid()
         request = self.save_prefix(worker)
         request.load_spec = LoadSpec(0, 64, can_load=True)
         request.can_save = False
         worker.kv_role = "kv_consumer"
-        store.batch_copy_get = lambda keys, *args: [-1] * len(keys)
+        store.batch_copy_get = lambda keys, buffers, sizes, offsets: [sum(row) - 1 for row in sizes]
         meta = AscendConnectorMetadata(set())
         meta.add_request(request)
         worker.prepare_layerwise_step(meta)
@@ -603,11 +603,16 @@ class TestMooncakeHybrid(unittest.TestCase):
         worker, store, arrays, jobs, errors = self.make_hybrid()
         real_start = store.batch_put_start
 
+        unconfirmed_keys = []
+
         def start(keys, sizes):
-            real_start(keys, sizes)
             if any("@group:1@" in key for key in keys):
+                # Simulate an overlapping writer whose keys become visible
+                # after the existence check, while this attempt fails.
+                real_start(keys, sizes)
+                unconfirmed_keys.extend(keys)
                 raise RuntimeError("allocator disconnected")
-            return [0] * len(keys)
+            return real_start(keys, sizes)
 
         store.batch_put_start = start
         with self.assertRaisesRegex(RuntimeError, "allocator disconnected"):
@@ -615,7 +620,8 @@ class TestMooncakeHybrid(unittest.TestCase):
         for job in jobs:
             job.join(timeout=2)
             self.assertFalse(job.is_alive())
-        self.assertFalse(store.objects)
+        self.assertTrue(unconfirmed_keys)
+        self.assertEqual(set(store.objects), set(unconfirmed_keys))
         self.assertFalse(worker._put_started_keys)
         self.assertFalse(errors)
 

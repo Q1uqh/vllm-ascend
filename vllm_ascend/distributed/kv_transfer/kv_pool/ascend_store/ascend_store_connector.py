@@ -134,6 +134,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.backend_class = get_backend_class(self.backend_name) if self.use_layerwise else None
         self.layerwise_data_plane = self.backend_class.layerwise_data_plane if self.backend_class is not None else None
         self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
+        if self.use_block_key_layerwise and "layerwise_num_shared_buffers" in extra_config:
+            raise NotImplementedError(
+                "Mooncake layerwise shared buffers require continuation snapshots and a "
+                "commit-aware P/D handoff. Omit layerwise_num_shared_buffers to use resident caches."
+            )
         self.save_decode_cache = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "save_decode_cache", False
         )

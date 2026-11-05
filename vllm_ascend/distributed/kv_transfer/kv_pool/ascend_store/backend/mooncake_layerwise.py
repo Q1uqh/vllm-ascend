@@ -301,11 +301,7 @@ def _prepare_group_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMet
                     )
                 new = missing
             if new:
-                try:
-                    codes = worker._start_layerwise_put_keys(new, sum(worker.group_block_len[group]))
-                except Exception:
-                    worker._queue_layerwise_revoke_keys(new)
-                    raise
+                codes = worker._start_layerwise_put_keys(new, sum(worker.group_block_len[group]))
                 started_now = {name for name, code in zip(new, codes, strict=True) if code == 0}
                 rejected = [name for name, code in zip(new, codes, strict=True) if code != 0]
                 if rejected:

@@ -822,14 +822,22 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
 
     def _start_layerwise_put_keys(self, keys: list[str], object_size: int) -> list[int]:
         results: list[int] = []
-        for key_batch in self._layerwise_key_batches(keys):
-            results.extend(
-                require_aligned_batch_results(
+        owned: list[str] = []
+        try:
+            for key_batch in self._layerwise_key_batches(keys):
+                batch_results = require_aligned_batch_results(
                     "batch_put_start",
                     key_batch,
                     self.m_store.batch_put_start(key_batch, [object_size] * len(key_batch)),
                 )
-            )
+                owned.extend(key for key, code in zip(key_batch, batch_results, strict=True) if code == 0)
+                results.extend(batch_results)
+        except Exception:
+            # A failed response proves nothing about ownership in that batch.
+            # Only earlier, acknowledged sessions can safely be revoked.
+            with self._put_started_keys_lock:
+                self._put_started_keys.update(owned)
+            raise
         return results
 
     def _start_layerwise_get_keys(self, keys: list[str]) -> list[int]:
@@ -938,8 +946,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             except Exception as exc:
                 logger.error("Layerwise batch_put_start failed keys=%s error=%s", new_keys, exc)
                 with self._put_started_keys_lock:
-                    self._put_started_keys.update(new_keys)
-                self._queue_layerwise_revoke_keys(new_keys)
+                    owned = [key for key in new_keys if key in self._put_started_keys]
+                self._queue_layerwise_revoke_keys(owned)
             else:
                 newly_started = {key for key, result in zip(new_keys, results, strict=True) if result == 0}
                 with self._put_started_keys_lock:

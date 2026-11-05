@@ -255,6 +255,26 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         self.assertEqual(request.save_key_block_offset, 1)
         self.assertEqual(request.save_block_keys, ["model@6831@0"])
 
+    def test_put_start_failure_revokes_only_acknowledged_sessions(self):
+        worker = self._make_worker()
+        worker.layerwise_max_transfer_blocks = 1
+        worker.m_store.batch_put_start.side_effect = [[0], [-1], RuntimeError("lost response")]
+        worker._queue_layerwise_revoke_keys = MagicMock()
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=48,
+            save_start_token=0,
+            save_end_token=48,
+            block_ids=[1, 2, 3],
+            block_hashes=[b"h0", b"h1", b"h2"],
+            can_save=True,
+        )
+
+        worker._prepare_layerwise_put_session(request)
+
+        worker._queue_layerwise_revoke_keys.assert_called_once_with(["model@6830@0"])
+        self.assertEqual(request.save_block_keys, [None, None, None])
+
     def test_full_remote_hit_loads_last_block_even_when_vllm_keeps_one_token(self):
         worker = self._make_worker()
         request = ReqMeta(

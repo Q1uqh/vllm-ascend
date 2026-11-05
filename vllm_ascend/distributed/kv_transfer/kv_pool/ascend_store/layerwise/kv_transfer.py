@@ -924,8 +924,15 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                     )
                 )
             _emit_range_debug_event("save", layer_id, active_sizes, active_offsets, results)
-            failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
+            failed_keys = [
+                key
+                for key, result, sizes in zip(active_keys, results, active_sizes, strict=True)
+                if result != sum(sizes)
+            ]
             if failed_keys:
+                logger.error(
+                    "Layerwise range PUT failed layer=%d keys=%d/%d", layer_id, len(failed_keys), len(active_keys)
+                )
                 self._revoke_range_keys(failed_keys)
                 self._active_put_keys.difference_update(failed_keys)
 
@@ -1221,8 +1228,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     )
                 )
             _emit_range_debug_event("load", layer_id, active_sizes, active_offsets, results)
-            failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
+            failed_indices = [
+                index
+                for index, result, sizes in zip(active_indices, results, active_sizes, strict=True)
+                if result != sum(sizes)
+            ]
             if failed_indices:
+                logger.error(
+                    "Layerwise range GET failed layer=%d keys=%d/%d", layer_id, len(failed_indices), len(active_keys)
+                )
                 self._mark_invalid_range_indices(req_meta, failed_indices)
                 self._active_load_indices.difference_update(failed_indices)
 
