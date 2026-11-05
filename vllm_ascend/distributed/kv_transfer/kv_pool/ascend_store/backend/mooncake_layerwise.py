@@ -14,6 +14,10 @@ from vllm.logger import logger
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.ascend_config import KVPPConfig
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
+    dsv4_manifest_digest,
+    uses_dsv4_snapshot_protocol,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
     block_hash_to_str,
@@ -65,6 +69,24 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
     kvpp_namespace = (
         f"kvpp-tp{parallel.tensor_parallel_size}-pcp{parallel.prefill_context_parallel_size}" if kvpp_size > 1 else ""
     )
+    if uses_dsv4_snapshot_protocol(vllm_config):
+        model = vllm_config.model_config
+        if kv_cache_config is None:
+            raise ValueError("DSV4 snapshot namespace requires a cache component manifest")
+        layout_digest = getattr(kv_cache_config, "dsv4_manifest_digest", None)
+        if layout_digest is None:
+            layout_digest = dsv4_manifest_digest(kv_cache_config.kv_cache_groups)
+        identity = (
+            layout_digest,
+            model.model,
+            model.revision,
+            model.compute_hash(),
+            str(model.dtype),
+            vllm_config.cache_config.cache_dtype,
+            parallel.tensor_parallel_size,
+        )
+        digest = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        return f"dsv4-snapshot-v1:{digest}"
     if parallel.pipeline_parallel_size == 1:
         # Owner-only objects have different sizes and layer offsets from the
         # ordinary replicated layout, even with the same model and TP size.
@@ -159,7 +181,8 @@ def hybrid_layout_id(kv_cache_config, tp_size: int = 1, *, namespace: str = "") 
     for group in kv_cache_config.kv_cache_groups:
         # PP projects global groups onto each stage. The model/partition hash
         # supplies the global identity; local membership must not split it.
-        groups.append(([] if namespace else sorted(group.layer_names), group_block_size_signature(group)))
+        hide_members = namespace and not namespace.startswith("dsv4-snapshot-v1:")
+        groups.append(([] if hide_members else sorted(group.layer_names), group_block_size_signature(group)))
     # No default= fallback on purpose: anything non-serializable here would have
     # to come from a repr that can differ per process, which is exactly the bug
     # this hash must never reacquire. Fail loudly instead.
@@ -218,7 +241,9 @@ def _prepare_group_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMet
                 and request.load_spec.kvpool_store_skip_tokens is not None
             ):
                 cached_tokens = request.load_spec.kvpool_store_skip_tokens
-        load_masks = worker._compute_reachable_load_masks(request, cached_tokens)
+        restore = request.dsv4_restore_snapshot
+        snapshot = request.dsv4_save_snapshot
+        load_masks = None if restore is not None else worker._compute_reachable_load_masks(request, cached_tokens)
         for group in worker.cacheable_group_ids:
             # Skip private rings before deriving token hashes: their physical
             # capacity need not even be divisible by the hash block size.
@@ -239,6 +264,13 @@ def _prepare_group_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMet
 
             def key(index, group=group, hashes=hashes):
                 return worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
+
+            if restore is not None or snapshot is not None:
+                load_entries = _prepare_temporal_group(
+                    worker, request, view, result[group], group, ids, hashes, block_size, load_mask, store_mask
+                )
+                get_slots.extend((view, name, ids[index], index) for name, index in load_entries)
+                continue
 
             start = request.load_spec.vllm_cached_tokens // block_size if request.load_spec is not None else 0
             entries = (
@@ -329,4 +361,103 @@ def _prepare_group_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMet
                 request.req_id, ((name, index) for name, index in key_indices if name in started), group_id=group
             )
     worker._open_layerwise_get_sessions(get_slots)
+    if any(request.dsv4_restore_snapshot is not None or request.dsv4_save_snapshot is not None for request in requests):
+        worker._check_hybrid_load_errors()
     return result
+
+
+def _prepare_temporal_group(worker, request, view, views, group, ids, hashes, span, load_mask, store_mask):
+    """Translate exact-endpoint snapshots and public history into group key slots."""
+    restore = request.dsv4_restore_snapshot
+    snapshot = request.dsv4_save_snapshot
+    mutable = group in worker._dsv4_mutable_groups
+
+    def public(index):
+        if index >= len(hashes):
+            raise RuntimeError(f"DSV4 complete page has no hash group={group} page={index}")
+        return worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
+
+    load = {}
+    if restore is not None:
+        if not mutable:
+            load.update((i, public(i)) for i in range(min(restore.end_token // span, len(ids))) if ids[i])
+        if mutable:
+            stop = (restore.end_token + span - 1) // span
+            required = {i for i in range(min(stop, len(ids))) if ids[i]}
+            if not required.issubset(restore.private_pages[group]):
+                raise RuntimeError(f"DSV4 mutable checkpoint is incomplete group={group} end={restore.end_token}")
+        for i in restore.private_pages[group]:
+            # Pages dropped by the live scheduler window no longer have a
+            # destination. In particular, block zero must never be written.
+            if i < len(ids) and ids[i]:
+                load[i] = worker._make_layerwise_full_key(group, restore.suffix(group, i))
+    elif request.load_spec is not None and request.load_spec.can_load:
+        extent = request.load_spec.kvpool_cached_tokens
+        load.update((i, public(i)) for i in range(min(extent // span, len(ids))) if ids[i] and selected(load_mask, i))
+
+    view.load_key_block_offset = 0
+    view.load_block_keys = [load.get(i) for i in range(max(load, default=-1) + 1)]
+    if restore is not None and not mutable:
+        tail = restore.end_token // span
+        if tail in restore.private_pages[group] and tail in load:
+            view.dsv4_partial_key_tokens = {load[tail]: restore.end_token % span}
+    if snapshot is None or not worker._is_layerwise_save_owner(group):
+        return [(key, i) for i, key in load.items()]
+
+    private = {
+        i: worker._make_layerwise_full_key(group, snapshot.suffix(group, i)) for i in snapshot.private_pages[group]
+    }
+    start = (restore.end_token if restore is not None else 0) // span
+    if restore is None and request.load_spec is not None and request.load_spec.can_load:
+        start = request.load_spec.kvpool_cached_tokens // span
+    # Publish mutable checkpoints only when the executed extent exactly
+    # matches the coordinator's public boundary. History is immutable as
+    # soon as its own group's page is full.
+    publish_mutable = snapshot.end_token == request.save_end_token and request.store_masks is not None
+    public_entries = {}
+    if not mutable or publish_mutable:
+        public_start = 0 if mutable else start
+        public_entries = {
+            i: public(i)
+            for i in range(public_start, min(snapshot.end_token // span, len(ids)))
+            if ids[i] and (not mutable or selected(store_mask, i))
+        }
+
+    names = list(public_entries.values()) + list(private.values())
+    missing = set(worker._filter_pool_existing_keys(names))
+    with worker._put_started_keys_lock:
+        started = set(names) & worker._put_started_keys
+    new = [name for name in names if name in missing and name not in started]
+    if new:
+        codes = worker._start_layerwise_put_keys(new, sum(worker.group_block_len[group]))
+        owned = {name for name, code in zip(new, codes, strict=True) if code == 0}
+        with worker._put_started_keys_lock:
+            worker._put_started_keys.update(owned)
+        started.update(owned)
+        rejected = [name for name in new if name not in owned]
+        if rejected and worker._filter_pool_existing_keys(rejected):
+            raise RuntimeError(f"Required DSV4 snapshot PUT session failed group={group}")
+
+    # The same live page can be published both as an exact private
+    # checkpoint and as a public aligned checkpoint. The range builder
+    # de-duplicates by object key, so emit a separate view for each set.
+    for entries in (private, public_entries):
+        if not entries:
+            continue
+        save_view = copy(view)
+        save_view.load_block_keys = []
+        save_view.dsv4_partial_key_tokens = None
+        if entries is private and not mutable:
+            tail = snapshot.end_token // span
+            if tail in private:
+                save_view.dsv4_partial_key_tokens = {private[tail]: snapshot.end_token % span}
+        save_view.save_key_block_offset = min(entries)
+        save_view.save_block_keys = [
+            entries.get(i) if entries.get(i) in started else None
+            for i in range(save_view.save_key_block_offset, max(entries) + 1)
+        ]
+        views.append(save_view)
+        worker._layerwise_session_tracker.register_put_keys(
+            request.req_id, ((key, i) for i, key in entries.items() if key in started), group_id=group
+        )
+    return [(key, i) for i, key in load.items()]

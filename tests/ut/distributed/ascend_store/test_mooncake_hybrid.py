@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.request import RequestStatus
 
 from tests.ut.distributed.ascend_store import test_pool_scheduler as scheduler_tests
 from tests.ut.distributed.ascend_store.test_pool_worker import make_worker
@@ -36,9 +37,15 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tr
     LayerwiseSessionTracker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVTransferThread
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_snapshot import (
+    DSV4_HANDOFF_KEY,
+    DSV4Snapshot,
+    select_private_snapshot_pages,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_transfer import _LayerRevokeTask
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_scheduler import LayerwiseKVPoolScheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, LoadSpec, ReqMeta
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import BaseKVPoolScheduler
 
 
 class MemoryRangeStore:
@@ -96,6 +103,11 @@ class MemoryRangeStore:
                 ctypes.memmove(addr, bytes(self.objects[key][start : start + length]), length)
         return [sum(row) for row in sizes]
 
+    def remove_snapshot_keys(self, keys):
+        if self.open_reads.intersection(keys):
+            raise AssertionError("Snapshot removal raced an active reader")
+        return self.batch_revoke(keys)
+
     def batch_get_end(self, keys):
         self.open_reads.difference_update(keys)
         return 0
@@ -124,6 +136,7 @@ class TestMooncakeHybrid(unittest.TestCase):
         use_mla=False,
         pcp_size=1,
         pcp_rank=0,
+        temporal=False,
     ):
         groups = [
             KVCacheGroupSpec(
@@ -183,6 +196,12 @@ class TestMooncakeHybrid(unittest.TestCase):
         for group, spec in enumerate(groups):
             for layer, name in enumerate(spec.layer_names):
                 arrays[name] = np.full((8, 8 + group * 4), 1 + group * 16 + layer, dtype=np.uint8)
+        if temporal:
+            arrays["model.layers.2.kv"] = arrays["model.layers.0.kv"]
+            worker.dsv4_temporal = True
+            worker.layerwise_offload = True
+            worker.prefetch_layer_map = {2: 0}
+            worker._dsv4_mutable_groups = {2}
         with (
             patch.object(KVTransferThread, "start", lambda thread: thread.ready_event.set()),
             patch.object(worker, "_align_kv_ptrs"),
@@ -222,6 +241,132 @@ class TestMooncakeHybrid(unittest.TestCase):
         worker.token_database.store_mask = MagicMock(return_value=masks)
         worker.token_database.load_mask = MagicMock(return_value=masks)
         return worker, store, arrays, jobs, errors
+
+    def test_dsv4_temporal_restores_aliased_layers_and_partial_checkpoint(self):
+        worker, store, arrays, jobs, errors = self.make_hybrid(temporal=True)
+        blocks = ([1, 2, 5], [3, 6], [0, 4, 7])
+        hashes = [b"h0", b"h1"]
+        generation = "0" * 32
+        previous = None
+        for endpoint in (23, 36):
+            request = ReqMeta(
+                "temporal",
+                target_token_len=endpoint,
+                save_end_token=32 if endpoint >= 32 else 0,
+                block_ids_by_group=[list(group) for group in blocks],
+                block_hashes=hashes,
+                can_save=True,
+                is_last_chunk=endpoint == 36,
+            )
+            request.dsv4_restore_snapshot = previous
+            request.dsv4_save_snapshot = DSV4Snapshot(
+                generation, endpoint, select_private_snapshot_pages(blocks, [16, 32, 16], endpoint, {2})
+            )
+            meta = AscendConnectorMetadata(set())
+            meta.add_request(request)
+            worker.prepare_layerwise_step(meta)
+            for layer in range(4):
+                worker.wait_for_layer_load()
+                name = f"model.layers.{layer}.kv"
+                if name in arrays and previous is not None:
+                    np.testing.assert_array_equal(arrays[name][1:3], 40 + layer)
+                if name in arrays:
+                    # The full history page is immutable across chunks.
+                    arrays[name][1] = 40 + layer
+                    arrays[name][2] = (40 if previous is None else 70) + layer
+                with attention_transfer_window():
+                    pass
+                worker.save_kv_layer(meta)
+            worker._finish_dsv4_snapshots(meta)
+            previous = request.dsv4_save_snapshot
+            self.assertTrue(
+                all(
+                    worker._make_layerwise_full_key(group, previous.suffix(group, page)) in store.complete
+                    for group, pages in enumerate(previous.private_pages)
+                    for page in pages
+                )
+            )
+        consumer, _, resident, consumer_jobs, consumer_errors = self.make_hybrid()
+        consumer.m_store = consumer.kv_recv_thread.m_store = store
+        consumer.kv_role = "kv_consumer"
+        consumer._dsv4_mutable_groups = {2}
+        request = ReqMeta(
+            "decoder",
+            target_token_len=37,
+            block_ids_by_group=[list(group) for group in blocks],
+            block_hashes=hashes,
+            can_save=False,
+            is_last_chunk=True,
+        )
+        request.dsv4_restore_snapshot = DSV4Snapshot.from_wire(previous.to_wire(), 3)
+        meta = AscendConnectorMetadata(set())
+        meta.add_request(request)
+        consumer.prepare_layerwise_step(meta)
+        for _ in range(4):
+            consumer.wait_for_layer_load()
+            with attention_transfer_window():
+                pass
+        for layer in (0, 2):
+            np.testing.assert_array_equal(resident[f"model.layers.{layer}.kv"][1], 40 + layer)
+            np.testing.assert_array_equal(resident[f"model.layers.{layer}.kv"][2], 70 + layer)
+        private_keys = {
+            consumer._make_layerwise_full_key(group, previous.suffix(group, page))
+            for group, pages in enumerate(previous.private_pages)
+            for page in pages
+        }
+        self.assertTrue(private_keys <= store.complete)
+        consumer._finish_dsv4_snapshots(meta)
+        self.assertFalse(private_keys & store.complete)
+        self.assertTrue(all("snapshot-v1" not in key for key in store.complete))
+        for job in jobs + consumer_jobs:
+            job.join(timeout=2)
+            self.assertFalse(job.is_alive())
+        self.assertFalse(errors + consumer_errors)
+        self.assertFalse(store.open_reads)
+
+    def test_dsv4_scheduler_uses_live_group_ids_and_exact_restore_endpoint(self):
+        scheduler = object.__new__(LayerwiseKVPoolScheduler)
+        scheduler.dsv4_temporal = True
+        scheduler._dsv4_snapshots = {}
+        scheduler._dsv4_published = {}
+        scheduler._dsv4_incoming = {}
+        scheduler._dsv4_consumed = set()
+        scheduler._dsv4_mutable_groups = {1}
+        scheduler._dsv4_history_ratios = {0: 4}
+        scheduler.grouped_block_size = [16, 4]
+        live_ids = ([2, 3], [0, 0, 0, 4, 5, 6])
+        output = SimpleNamespace(
+            num_scheduled_tokens={"r": 17},
+            finished_req_ids=set(),
+            kv_connector_block_state=SimpleNamespace(get_block_ids=lambda _: live_ids),
+        )
+
+        def build(end):
+            meta = AscendConnectorMetadata(set())
+            req = ReqMeta(
+                "r", target_token_len=end, block_ids_by_group=[[99], [98]], can_save=True, num_prompt_tokens=25
+            )
+            meta.add_request(req)
+            with patch.object(BaseKVPoolScheduler, "build_connector_meta", return_value=meta):
+                self.assertIs(scheduler.build_connector_meta(output), meta)
+            self.assertEqual(req.block_ids_by_group, [list(ids) for ids in live_ids])
+            return req
+
+        first = build(17)
+        self.assertIsNone(first.dsv4_restore_snapshot)
+        self.assertEqual(first.dsv4_save_snapshot.private_pages, ((), (3, 4)))
+        output.num_scheduled_tokens["r"] = 8
+        second = build(25)
+        self.assertEqual(second.dsv4_restore_snapshot, first.dsv4_save_snapshot)
+        self.assertEqual(second.dsv4_save_snapshot.generation, first.dsv4_save_snapshot.generation)
+        self.assertEqual(second.dsv4_save_snapshot.private_pages, ((1,), (3, 4, 5)))
+        finished = SimpleNamespace(request_id="r", num_computed_tokens=25, status=RequestStatus.FINISHED_LENGTH_CAPPED)
+        scheduler._validate_dsv4_snapshot_readable = MagicMock()
+        delay, payload = scheduler.request_finished_all_groups(finished, live_ids)
+        self.assertFalse(delay)
+        self.assertEqual(DSV4Snapshot.from_wire(payload[DSV4_HANDOFF_KEY], 2), second.dsv4_save_snapshot)
+        scheduler._validate_dsv4_snapshot_readable.assert_called_once_with(second.dsv4_save_snapshot)
+        self.assertEqual(scheduler._dsv4_published["r"], second.dsv4_save_snapshot.generation)
 
     def test_multigroup_roundtrip_sparse_masks_and_group_commit_boundaries(self):
         self._roundtrip()

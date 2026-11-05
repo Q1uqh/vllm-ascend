@@ -27,6 +27,13 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.core.kv_cache_interface import (
     is_prefix_cacheable,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
+    DSV4TuplePlan,
+    build_dsv4_temporal_plan,
+    dsv4_manifest_digest,
+    dsv4_temporal_config,
+    uses_dsv4_snapshot_protocol,
+)
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
@@ -559,11 +566,51 @@ def _get_deepseek_v4_cache_layout(
     return page_sizes, bucketed, mtp_layer_names, mtp_page_size, num_layer_tuples
 
 
+def _get_dsv4_temporal_plan(vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]) -> DSV4TuplePlan | None:
+    # The platform patch already owns DSV4 tuple placement. Move this call to
+    # the model's placement hook once upstream exposes temporal aliases there.
+    extra = dsv4_temporal_config(vllm_config)
+    if extra is None:
+        return None
+    if tq_cache.uses_turboquant_groups(groups):
+        raise ValueError("DSV4 temporal cache sharing does not support TurboQuant cache specs")
+    return build_dsv4_temporal_plan(vllm_config, groups)
+
+
 def _get_kv_cache_config_deepseek_v4_main(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> tuple[int, list[KVCacheTensor]]:
+    plan = _get_dsv4_temporal_plan(vllm_config, kv_cache_groups)
+    if plan is not None:
+        max_blocks = available_memory // plan.bytes_per_block
+        num_blocks = may_override_num_blocks(vllm_config, max_blocks)
+        if not 0 < num_blocks <= max_blocks:
+            raise ValueError(
+                f"DSV4 temporal layout requires a positive block count within budget "
+                f"(requested={num_blocks}, maximum={max_blocks})"
+            )
+        size = num_blocks * plan.bytes_per_block
+        logger.info(
+            "DSV4 temporal cache plan groups=%d slots=%d aliases=%d bytes_per_block=%d blocks=%d backing_bytes=%d",
+            len(kv_cache_groups),
+            plan.num_slots,
+            len(plan.predecessors),
+            plan.bytes_per_block,
+            num_blocks,
+            size,
+        )
+        return num_blocks, [
+            KVCacheTensor(
+                size=size,
+                layers=list(region.layers),
+                offset=plan.region_offset(region, num_blocks),
+                layer_stride=0,
+                block_stride=region.page_size,
+            )
+            for region in plan.regions
+        ]
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.cache_config(vllm_config, kv_cache_groups, available_memory)
     (
@@ -666,6 +713,9 @@ def _ascend_pool_bytes_per_block(  # type: ignore[misc]
     if not _is_deepseek_v4_groups(kv_cache_groups):
         return _orig_pool_bytes_per_block(vllm_config, kv_cache_groups)
 
+    plan = _get_dsv4_temporal_plan(vllm_config, kv_cache_groups)
+    if plan is not None:
+        return plan.bytes_per_block
     page_sizes, _, _, _, num_layer_tuples = _get_deepseek_v4_cache_layout(kv_cache_groups)
     return sum(page_sizes) * num_layer_tuples
 
@@ -723,6 +773,13 @@ if vllm_version_is("0.32.0"):
         if not _is_deepseek_v4_groups(kv_cache_groups):
             return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
 
+        plan = _get_dsv4_temporal_plan(vllm_config, kv_cache_groups)
+        if plan is not None:
+            return plan.bytes_per_block * sum(
+                group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+                for group in kv_cache_groups
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            )
         assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups)
         full_mla_spec = kv_cache_groups[0].kv_cache_spec
         assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
@@ -767,6 +824,13 @@ else:
                 return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
             return _orig_max_memory_usage_bytes_from_groups(builder, vllm_config, kv_cache_groups)
 
+        plan = _get_dsv4_temporal_plan(vllm_config, kv_cache_groups)
+        if plan is not None:
+            return plan.bytes_per_block * sum(
+                group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+                for group in kv_cache_groups
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            )
         assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups)
         full_mla_spec = kv_cache_groups[0].kv_cache_spec
         assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
@@ -810,6 +874,8 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
+    if uses_dsv4_snapshot_protocol(vllm_config) and kv_cache_groups and not _is_deepseek_v4_groups(kv_cache_groups):
+        raise ValueError("DSV4 snapshot protocol requires DeepSeek V4 shared-tuple cache groups")
     qwen_config = (
         None
         if vllm_version_is("0.28.0")
@@ -836,6 +902,10 @@ def _ascend_get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
         )
     kv_cache_config.kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if uses_dsv4_snapshot_protocol(vllm_config) and kv_cache_groups:
+        # The scheduler projects uniform groups to a representative spec.
+        # Preserve the full logical format for key namespaces before that copy.
+        kv_cache_config.dsv4_manifest_digest = dsv4_manifest_digest(kv_cache_groups)
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is not None and speculative_config.method == "dspark":
         from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import resident_mla_context_group_ids

@@ -149,6 +149,7 @@ class SharedBlockData:
     req_ids: list[str]
     is_last_chunks: list[bool | None]
     block_keys: list[str] | None = None
+    block_valid_tokens: list[int | None] | None = None
     save_keys: list[str] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
 
@@ -178,6 +179,7 @@ class LayerLoadTask:
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
     attention_start_gate: AttentionComputeStartGate | None = None
+    use_key_major_ranges: bool = False
 
 
 @dataclass(init=False)

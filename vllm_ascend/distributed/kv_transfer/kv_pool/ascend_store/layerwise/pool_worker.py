@@ -43,6 +43,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cach
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVTransferThread,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_snapshot import DSV4Snapshot
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
+    dsv4_descriptor_predecessors,
+    dsv4_history_ratios,
+    dsv4_mutable_groups,
+    dsv4_temporal_config,
+    uses_dsv4_snapshot_protocol,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_transfer import (
     KVCacheStoreKeyLayerRecvingThread,
     KVCacheStoreKeyLayerSendingThread,
@@ -50,6 +58,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_trans
     KVCacheStoreLayerSendingThread,
     KVCacheStoreLayerSendingThreadBase,
     LayerBatchBuilder,
+    emit_dsv4_transfer_event,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     LayerwiseReuseLayout,
@@ -107,7 +116,36 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         kv_cache_config: KVCacheConfig | None = None,
     ) -> None:
         super().__init__(vllm_config, use_layerwise, kv_cache_config)
+        self.dsv4_temporal = dsv4_temporal_config(vllm_config) is not None
         self._init_layerwise_config()
+        self._dsv4_mutable_groups = dsv4_mutable_groups(kv_cache_config.kv_cache_groups) if kv_cache_config else set()
+        self._dsv4_history_ratios = (
+            dsv4_history_ratios(kv_cache_config.kv_cache_groups, self._dsv4_mutable_groups)
+            if kv_cache_config is not None and uses_dsv4_snapshot_protocol(vllm_config)
+            else {}
+        )
+        if uses_dsv4_snapshot_protocol(vllm_config) and (
+            kv_cache_config is None
+            or not self.block_key_hybrid
+            or len(self.cacheable_group_ids) != self.num_kv_cache_groups
+        ):
+            raise ValueError("DSV4 snapshot protocol requires a grouped block-key layout without private rings")
+        if self.dsv4_temporal:
+            assert kv_cache_config is not None
+            self.layerwise_offload = True
+            predecessors = dsv4_descriptor_predecessors(kv_cache_config.kv_cache_tensors)
+            aliases = set(predecessors) | set(predecessors.values())
+            self.prefetch_layer_map, self.independent_layers = self._remap_layout_to_stage_local(
+                predecessors,
+                sorted(self._global_to_local_layer.keys() - aliases),
+                sorted(self._global_to_local_layer),
+            )
+            logger.info(
+                "DSV4 temporal slots target_layers=%d predecessors=%s independent=%s",
+                self.num_layers,
+                self.prefetch_layer_map,
+                self.independent_layers,
+            )
 
     def _init_kv_transfer_config(self, vllm_config, extra_config, use_layerwise, kv_cache_config) -> None:
         backend_name = extra_config.get("backend", "mooncake").lower()
@@ -178,6 +216,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         self._layerwise_session_tracker = LayerwiseSessionTracker()
         self._current_layerwise_request_ids: set[str] = set()
         self._current_layerwise_last_chunk_req_ids: set[str] = set()
+        self._dsv4_active_snapshots: dict[str, DSV4Snapshot] = {}
+        self._dsv4_cleanup_keys: set[str] = set()
         # (tag, req_id, group_id, start_block, end_block) -> runs, cleared per
         # step in process_layer_data(). masked_block_runs inputs are
         # layer-invariant, so only the first layer pays the O(blocks) scan.
@@ -413,6 +453,7 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                     group_num_layers,
                     group_id=group_id,
                     layer_byte_offset=layer_byte_offset,
+                    history_ratio=getattr(self, "_dsv4_history_ratios", {}).get(group_id),
                 )
             )
         return builders
@@ -469,7 +510,7 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         externally supplied slot-release callback, so the gate lives here
         (at the data-plane consumer) instead of at the connector proxy.
         """
-        if not self.use_layerwise_transfer:
+        if not self.use_layerwise_transfer and not getattr(self, "dsv4_temporal", False):
             return False
         self.external_slot_release_waiter = waiter
         # The receive thread snapshots the waiter at construction; if it is
@@ -484,6 +525,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             self.m_store.ensure_initialized()
         elif self.use_block_key_layerwise:
             self.m_store.validate_layerwise_support()
+            if uses_dsv4_snapshot_protocol(self.vllm_config):
+                self.m_store.validate_snapshot_support()
         if len(self.layer_load_tasks) != self.num_layers:
             self.layer_load_tasks = [[] for _ in range(self.num_layers)]
             self.layer_save_tasks = [[] for _ in range(self.num_layers)]
@@ -633,7 +676,67 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 logger.error("AscendStore lease cleanup returned %s; backend TTL will reclaim leases", result)
         if self.use_block_key_layerwise:
             self._release_layerwise_requests_terminal(finished_req_ids | meta.preempted_req_ids)
+        if (
+            any(req.dsv4_restore_snapshot or req.dsv4_save_snapshot for req in meta.requests)
+            or getattr(self, "dsv4_temporal", False)
+            or getattr(self, "_dsv4_cleanup_keys", None)
+        ):
+            self._finish_dsv4_snapshots(meta)
         return super().get_finished(finished_req_ids, meta)
+
+    def _finish_dsv4_snapshots(self, metadata: AscendConnectorMetadata) -> None:
+        # All local payload reads finished before retiring any object. Other
+        # TP ranks can read the same replicated object, so also fence peers.
+        active = self._dsv4_active_snapshots
+        retire = []
+        for req_id in metadata.released_req_ids:
+            snapshot = active.pop(req_id, None)
+            if snapshot is not None and snapshot.generation not in metadata.dsv4_handoff_generations:
+                retire.append(snapshot)
+        transfers = [
+            request for request in metadata.requests if request.dsv4_restore_snapshot or request.dsv4_save_snapshot
+        ]
+        if transfers:
+            self._drain_attention_transfers(full=True)
+            self._release_layerwise_requests_for_retry(
+                {request.req_id for request in transfers if request.dsv4_restore_snapshot is not None}
+            )
+            if self.tp_size > 1:
+                get_tp_group().barrier()
+        for request in transfers:
+            restore, save = request.dsv4_restore_snapshot, request.dsv4_save_snapshot
+            if restore is not None:
+                retire.append(restore)
+            if save is not None:
+                emit_dsv4_transfer_event("snapshot_committed", generation=save.generation, end_token=save.end_token)
+                active[request.req_id] = save
+            else:
+                assert restore is not None
+                emit_dsv4_transfer_event(
+                    "handoff_read_complete", generation=restore.generation, end_token=restore.end_token
+                )
+                active.pop(request.req_id, None)
+        for snapshot in retire:
+            for group, pages in enumerate(snapshot.private_pages):
+                if self._is_layerwise_save_leader() or self.group_uses_align_state[group]:
+                    self._dsv4_cleanup_keys.update(
+                        self._make_layerwise_full_key(group, snapshot.suffix(group, page)) for page in pages
+                    )
+        if self._dsv4_cleanup_keys:
+            for batch in self._layerwise_key_batches(list(self._dsv4_cleanup_keys)):
+                try:
+                    results = self.m_store.remove_snapshot_keys(batch)
+                except Exception:
+                    logger.exception("DSV4 snapshot removal failed keys=%d", len(batch))
+                    continue
+                emit_dsv4_transfer_event("snapshot_remove", key_count=len(batch), results=results)
+                # A session can leave a backend lease after GET end. Retry on
+                # the next scheduler tick and leave force deletion disabled.
+                self._dsv4_cleanup_keys.difference_update(
+                    key for key, code in zip(batch, results, strict=True) if code == 0
+                )
+            if self._dsv4_cleanup_keys:
+                logger.debug("DSV4 snapshot cleanup pending keys=%d", len(self._dsv4_cleanup_keys))
 
     def _build_lookup_keys(
         self,
@@ -665,7 +768,11 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         # The final-layer fence drains this rank only. Readers of replicated
         # KV must also wait for the writer before querying the previous step.
         # Use configuration, never local requests/tasks, to gate the collective.
-        if self.use_layerwise_transfer and self.layerwise_offload and self.tp_size > 1:
+        if (
+            (self.use_layerwise_transfer or getattr(self, "dsv4_temporal", False))
+            and self.layerwise_offload
+            and self.tp_size > 1
+        ):
             get_tp_group().barrier()
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
@@ -680,6 +787,16 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.load_disabled.clear()
         self.process_layer_data(metadata.requests)
+        for request in metadata.requests:
+            restore, save = request.dsv4_restore_snapshot, request.dsv4_save_snapshot
+            if snapshot := save or restore:
+                emit_dsv4_transfer_event(
+                    "snapshot_prepare",
+                    generation=snapshot.generation,
+                    restore_end=restore.end_token if restore else None,
+                    save_end=save.end_token if save else None,
+                    private_pages=[len(pages) for pages in snapshot.private_pages],
+                )
 
     def _is_layerwise_save_leader(self) -> bool:
         """Exactly one rank per (pcp, dcp, head_or_tp) group saves/allocates.
@@ -1091,6 +1208,11 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         request_block_ranges = []
         for request in requests:
             if request.can_save is None or not request.can_save:
+                continue
+            if request.dsv4_save_snapshot is not None:
+                if any(key is not None for key in request.save_block_keys):
+                    start = request.save_key_block_offset
+                    request_block_ranges.append(LayerBlockRange(request, start, start + len(request.save_block_keys)))
                 continue
             save_start_block = request.save_start_token // block_size
             group_block_hashes = get_block_hashes(
@@ -1569,6 +1691,14 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         request_block_ranges = []
         for request in requests:
             if self.use_block_key_layerwise:
+                if (
+                    request.dsv4_save_snapshot is not None
+                    and request.dsv4_restore_snapshot is not None
+                    and layer_id in self.independent_layers
+                ):
+                    # This is a continuation on P with the original live
+                    # block IDs. A resident layer was never overwritten.
+                    continue
                 # Block-key sessions retain committed block ownership across
                 # chunked-prefill steps.  A later chunk can therefore have no
                 # new load_spec while still needing to restore the previously
@@ -2128,7 +2258,12 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         else:
             num_local = self.num_layers
         for request in requests:
-            request.store_masks = self._compute_reachable_store_masks(request)
+            snapshot = request.dsv4_save_snapshot
+            if snapshot is not None and snapshot.end_token != request.save_end_token:
+                # The latest mutable state cannot serve an earlier aligned boundary.
+                request.store_masks = None
+            else:
+                request.store_masks = self._compute_reachable_store_masks(request)
         group_requests = {}
         if self.use_block_key_layerwise:
             group_requests = self._prepare_layerwise_sessions(requests)
@@ -2245,6 +2380,7 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
+                    use_key_major_ranges=self.use_block_key_layerwise,
                 )
             )
             return True
@@ -2289,7 +2425,7 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 layer_id = self.current_layer
                 # Conv/recurrent state is updated inside attention, after this
                 # entry event. Preserve its post-compute save hook.
-                if layer_id not in self._recurrent_layers:
+                if layer_id not in self._recurrent_layers and not self.layerwise_offload:
                     gate.on_start = lambda: self._submit_attention_save(layer_id)
                 gate.on_finish = self._finish_attention_window
             if getattr(self, "block_key_hybrid", False) and self.next_layer_to_submit <= self.current_layer:
@@ -2364,7 +2500,7 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             # Recurrent and record-only paths do not exit an attention window.
             self._finish_attention_window()
         if self.current_layer == num_local - 1:
-            if _LW_DEFER_LAST_SAVE:
+            if _LW_DEFER_LAST_SAVE and not (self.use_block_key_layerwise and self.layerwise_offload):
                 # PERF-TUNE(2): move the last layer's save drain off the forward
                 # critical path. The drain (host wait + event reset) runs at the
                 # start of the NEXT step's start_load_kv, absorbing the send

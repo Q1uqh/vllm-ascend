@@ -594,6 +594,20 @@ class MooncakeBackend(Backend):
             return
         self.store.remove_all(force=True)
 
+    def validate_snapshot_support(self) -> None:
+        self.ensure_initialized()
+        if self.config.enable_ssd_offload:
+            raise ValueError("DSV4 temporal snapshot protocol requires Mooncake DRAM storage")
+        if self.store is None or not callable(getattr(self.store, "batch_remove", None)):
+            raise RuntimeError("DSV4 temporal snapshot protocol requires Mooncake batch_remove")
+
+    def remove_snapshot_keys(self, keys: list[str]) -> list[int]:
+        """Acknowledge private snapshots without forcing removal past read leases."""
+        self.ensure_initialized()
+        if self.store is None:
+            raise RuntimeError("Mooncake snapshot cleanup requires an initialized store")
+        return require_aligned_batch_results("batch_remove", keys, self.store.batch_remove(keys))
+
     def batch_is_readable(self, keys: list[str]) -> list[bool]:
         """Map committed Mooncake objects to the common readability contract."""
         states = require_aligned_batch_results("batch_is_exist", keys, self.batch_is_exist(keys))

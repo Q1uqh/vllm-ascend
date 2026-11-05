@@ -86,6 +86,15 @@ def _emit_commit_debug_event(layer_id: int, key_count: int, results: list[int]) 
         pass
 
 
+def emit_dsv4_transfer_event(event: str, **fields: Any) -> None:
+    try:
+        if get_ascend_config().kv_pool_range_debug:
+            payload = {"event": event, **fields}
+            logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        pass
+
+
 def _circular_shift(lst: list, offset: int) -> list:
     if not lst or offset == 0:
         return lst
@@ -105,11 +114,14 @@ class LayerBatchBuilder:
         num_layers: int,
         group_id: int = 0,
         layer_byte_offset: int = 0,
+        history_ratio: int | None = None,
     ) -> None:
         self.page_size_bytes = page_size_bytes
         self.num_layers = num_layers
         self.group_id = group_id
         self.layer_byte_offset = layer_byte_offset
+        self.history_ratio = history_ratio
+        self.group_token_span = token_database.get_block_size(group_id) if history_ratio is not None else None
         self._block_len_np = np.asarray(token_database.group_block_len[group_id], dtype=np.int64)
         self._kv_caches_base_addr_np = np.asarray(
             token_database.group_kv_caches_base_addr[group_id],
@@ -382,6 +394,7 @@ class LayerBatchBuilder:
         """Build block-key rows shared by all backend layer ranges."""
         block_ids: list[int] = []
         block_keys: list[str] = []
+        valid_tokens: list[int | None] = []
         req_ids: list[str] = []
         is_last_chunks: list[bool | None] = []
         all_load_keys: list[str] = []
@@ -422,6 +435,7 @@ class LayerBatchBuilder:
                     continue
                 block_ids.append(block_id)
                 block_keys.append(key)
+                valid_tokens.append((request.dsv4_partial_key_tokens or {}).get(key))
                 if is_save:
                     seen_save_keys.add(key)
 
@@ -432,6 +446,7 @@ class LayerBatchBuilder:
                 if last_block_key is not None and (not is_save or last_block_key not in seen_save_keys):
                     block_ids.append(request_block_ids[partial_block_index])
                     block_keys.append(last_block_key)
+                    valid_tokens.append(None)
                     if is_save:
                         seen_save_keys.add(last_block_key)
 
@@ -439,6 +454,7 @@ class LayerBatchBuilder:
             block_ids_arr=np.asarray(block_ids, dtype=np.int64),
             block_gvas_arr=None,
             block_keys=block_keys,
+            block_valid_tokens=valid_tokens if self.history_ratio is not None else None,
             req_ids=req_ids,
             is_last_chunks=is_last_chunks,
             load_keys=all_load_keys,
@@ -465,13 +481,26 @@ class LayerBatchBuilder:
             all_buffers = [
                 (layer_base_addrs + block_id * layer_block_stride).tolist() for block_id in shared.block_ids_arr
             ]
+            sizes_by_block = [sizes.copy() for _ in shared.block_ids_arr]
+            if shared.block_valid_tokens is not None:
+                assert self.group_token_span is not None and self.history_ratio is not None
+                rows = self.group_token_span // self.history_ratio
+                if not rows or self.group_token_span % self.history_ratio or any(size % rows for size in sizes):
+                    raise ValueError("DSV4 history ranges require whole, contiguous compressed rows")
+                for index, token_count in enumerate(shared.block_valid_tokens):
+                    if token_count is None:
+                        continue
+                    valid_rows = token_count // self.history_ratio
+                    if not 0 < valid_rows < rows:
+                        raise ValueError("DSV4 partial history key has no valid compressed tail")
+                    sizes_by_block[index] = [size // rows * valid_rows for size in sizes]
             return LayerRangeReqMeta(
                 req_ids=shared.req_ids,
                 layer_id=layer_id,
                 block_ids=shared.block_ids_arr.tolist(),
                 keys=shared.block_keys,
                 all_buffers=all_buffers,
-                all_sizes=[sizes.copy() for _ in shared.block_ids_arr],
+                all_sizes=sizes_by_block,
                 all_offsets=[offsets.copy() for _ in shared.block_ids_arr],
                 load_keys=shared.load_keys,
             )
@@ -935,6 +964,8 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                 )
                 self._revoke_range_keys(failed_keys)
                 self._active_put_keys.difference_update(failed_keys)
+                if self.raise_on_transfer_failure:
+                    raise RuntimeError(f"Required layerwise PUT failed at layer {layer_id}")
 
         if not (layer_id == self.final_layer_id if final_group_layer is None else final_group_layer):
             return
@@ -955,6 +986,8 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
             if self._session_tracker is not None:
                 self._session_tracker.commit_put_keys(committed_keys)
             self._remove_started_keys(active_keys)
+            if failed_keys and self.raise_on_transfer_failure:
+                raise RuntimeError(f"Required layerwise commit failed at layer {layer_id}")
         self._active_put_keys = None
 
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
@@ -1251,12 +1284,19 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         try:
             wait_for_save = data.wait_for_save_layer
             if wait_for_save is not None:
+                begin = time.monotonic()
                 if not self._wait_for_event(self.layer_save_finished_events[wait_for_save], self.save_failure_checker):
                     return
                 if self.save_failure_checker is not None:
                     self.save_failure_checker()
                 self.sync_save_events[wait_for_save].synchronize()
                 self.layer_save_finished_events[wait_for_save].clear()
+                emit_dsv4_transfer_event(
+                    "overwrite_fence",
+                    layer_id=layer_id,
+                    predecessor=wait_for_save,
+                    wait_ms=round((time.monotonic() - begin) * 1000, 3),
+                )
 
             if data.attention_start_gate is not None:
                 if not self._wait_for_event(data.attention_start_gate):
@@ -1305,7 +1345,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
     ):
-        if data.transfer_tasks and data.transfer_tasks[0].use_key_major_ranges:
+        if data.use_key_major_ranges or (data.transfer_tasks and data.transfer_tasks[0].use_key_major_ranges):
             self._handle_range_layer_task(data)
             return
         try:

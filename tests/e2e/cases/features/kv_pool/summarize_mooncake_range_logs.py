@@ -11,12 +11,14 @@ from pathlib import Path
 
 _MARKER = "[KVPOOL_RANGE_DEBUG]"
 _ERROR = re.compile(r"\b(ERROR|CRITICAL|Traceback|failed|rejected|short transfer)\b", re.IGNORECASE)
-_CONFIG = re.compile(r"layerwise config|layerwise group|shared buffers require|num_gpu_blocks|KV cache size", re.I)
+_CONFIG = re.compile(r"layerwise config|layerwise group|DSV4 temporal|DSV4_ACCEPT|num_gpu_blocks|KV cache size", re.I)
 
 
 def summarize(paths: list[Path]) -> list[str]:
     events: Counter[tuple[str, str]] = Counter()
     byte_counts: Counter[str] = Counter()
+    copied_counts: Counter[str] = Counter()
+    max_fence_wait_ms = 0.0
     errors: deque[str] = deque(maxlen=120)
     config: deque[str] = deque(maxlen=60)
     failures: deque[str] = deque(maxlen=80)
@@ -44,11 +46,16 @@ def summarize(paths: list[Path]) -> list[str]:
                         requested = [requested]
                     requested_bytes = sum(requested)
                     if event == "range":
+                        copied_counts[direction] += sum(max(0, result) for result in results)
                         failed = len(results) != len(requested) or any(
                             result != expected for result, expected in zip(results, requested)
                         )
                     else:
-                        failed = any(result != 0 if event == "commit" else result < 0 for result in results)
+                        if event == "overwrite_fence":
+                            max_fence_wait_ms = max(max_fence_wait_ms, float(record.get("wait_ms", 0)))
+                        failed = any(
+                            result != 0 if event in ("commit", "snapshot_remove") else result < 0 for result in results
+                        )
                 except (AttributeError, TypeError, ValueError):
                     malformed += 1
                     continue
@@ -61,9 +68,13 @@ def summarize(paths: list[Path]) -> list[str]:
     return [
         f"files={len(paths)} events={sum(events.values())} malformed={malformed} "
         f"transfer_failures={failure_count} error_lines={error_count}",
-        f"retained_config={len(config)} retained_errors={len(errors)} retained_transfer_failures={len(failures)}",
+        f"retained_config={len(config)} retained_errors={len(errors)} retained_transfer_failures={len(failures)} "
+        f"max_overwrite_wait_ms={max_fence_wait_ms:.3f}",
         *(f"event={event} direction={direction} count={count}" for (event, direction), count in events.most_common(20)),
-        *(f"direction={direction} requested_bytes={total}" for direction, total in byte_counts.most_common(10)),
+        *(
+            f"direction={direction} requested_bytes={total} copied_bytes={copied_counts[direction]}"
+            for direction, total in byte_counts.most_common(10)
+        ),
         *config,
         *errors,
         *failures,

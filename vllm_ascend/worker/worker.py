@@ -92,6 +92,11 @@ from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_sfa_dspark_kv_transfer
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
+    DSV4_CACHE_ALIGNMENT,
+    build_dsv4_temporal_plan,
+    dsv4_temporal_config,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
@@ -781,6 +786,20 @@ class NPUWorker(WorkerBase):
         derives a num_blocks (and block pool) small enough for the per-layer
         buffers to fit.
         """
+        if dsv4_temporal_config(self.vllm_config) is not None:
+            # Reserve the allocator's leading alignment once, before rank
+            # normalization converts the common block count back to bytes.
+            budget = max(0, available_memory - DSV4_CACHE_ALIGNMENT)
+            override = self.cache_config.num_gpu_blocks_override
+            if override is not None:
+                groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+                cost = build_dsv4_temporal_plan(self.vllm_config, groups).bytes_per_block
+                if not 0 < override <= budget // cost:
+                    raise ValueError(
+                        f"DSV4 temporal block override {override} exceeds the physical budget "
+                        f"of {budget // cost} blocks"
+                    )
+            return budget
         kv_cache_spec = self.get_kv_cache_spec()
         if not isinstance(kv_cache_spec, dict):
             return available_memory

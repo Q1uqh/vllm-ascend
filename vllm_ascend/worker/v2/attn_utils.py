@@ -88,6 +88,10 @@ from vllm_ascend.core.kv_cache_interface import (
     supports_component_major_mla_pd,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
+    DSV4_CACHE_ALIGNMENT,
+    dsv4_temporal_config,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     allocate_shared_indexer_cache,
     get_layerwise_reuse_config,
@@ -1163,7 +1167,7 @@ def _allocate_kv_cache(
     # init kv cache tensors
     kv_cache_raw_tensors: dict[str, Any] = {}
     # prefill disaggregation need the addr of cache tensor be aligned with 2M
-    alignment = 2 * 1024 * 1024
+    alignment = DSV4_CACHE_ALIGNMENT
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     attn_layers: dict[str, AttentionLayerBase] | None = None
     # Gemma 4 full/sliding groups share one pool while retaining contiguous
@@ -1282,6 +1286,17 @@ def _allocate_kv_cache(
 
         if not dsv4_regions:
             raise ValueError("DeepSeek-V4 KV cache config has no materializable layers.")
+        if dsv4_temporal_config(vllm_config) is not None:
+            materialized = {name for name, _, _ in dsv4_regions}
+            if materialized != layer_kv_cache_spec.keys() or len(materialized) != len(dsv4_regions):
+                raise ValueError("DSV4 temporal cache descriptors must cover each cache component exactly once")
+            logger.info(
+                "DSV4 temporal allocation blocks=%d backing_bytes=%d alignment_reserve=%d components=%d",
+                kv_cache_config.num_blocks,
+                backing_size,
+                alignment,
+                len(materialized),
+            )
         dsv4_backing = _allocate_int8_cache_tensor(
             backing_size,
             alignment,

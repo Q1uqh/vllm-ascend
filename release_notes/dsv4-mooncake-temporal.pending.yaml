@@ -1,0 +1,7 @@
+# Move into fragments/<PR number>.yaml and set pr when a PR is opened.
+entries:
+  - category: feature
+    model: DeepSeek-V4-Flash
+    text: >-
+      Added opt-in Mooncake temporal KV cache sharing on eager Model Runner V2
+      prefill workers with exact chunk continuation and resident decode handoff.

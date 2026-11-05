@@ -1,16 +1,29 @@
 from collections.abc import Sequence
 from typing import Any
+from uuid import uuid4
 
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     get_backend_class,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_snapshot import (
+    DSV4_HANDOFF_KEY,
+    DSV4Snapshot,
+    select_private_snapshot_pages,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_tuple_layout import (
+    dsv4_history_ratios,
+    dsv4_mutable_groups,
+    dsv4_temporal_config,
+    uses_dsv4_snapshot_protocol,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
@@ -18,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwis
     get_layerwise_reuse_config,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendConnectorMetadata,
     LoadSpec,
     RequestTracker,
     block_hash_to_str,
@@ -51,6 +65,17 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
         self.dspark_draft_only_group_ids = frozenset(getattr(kv_cache_config, "dspark_draft_only_group_ids", ()))
         super().__init__(vllm_config, use_layerwise, kv_cache_config)
         self.load_async = False
+        self.dsv4_temporal = dsv4_temporal_config(vllm_config) is not None
+        self._dsv4_snapshots: dict[str, DSV4Snapshot] = {}
+        self._dsv4_incoming: dict[str, DSV4Snapshot] = {}
+        self._dsv4_consumed: set[str] = set()
+        self._dsv4_published: dict[str, str] = {}
+        if self.dsv4_temporal:
+            if kv_cache_config is None or not self.use_hybrid:
+                raise ValueError("DSV4 temporal cache sharing requires grouped cache specs")
+            self.layerwise_offload = True
+            self._dsv4_mutable_groups = dsv4_mutable_groups(kv_cache_config.kv_cache_groups)
+            self._dsv4_history_ratios = dsv4_history_ratios(kv_cache_config.kv_cache_groups, self._dsv4_mutable_groups)
         if self.use_layerwise_transfer:
             self._init_layerwise_offload(vllm_config, kv_cache_config, extra_config)
         self.block_key_hybrid = self.use_block_key_layerwise and self.use_hybrid
@@ -76,6 +101,105 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
             and len(cacheable_block_sizes) != len(self.original_block_size)
         ):
             raise ValueError("AscendStore private KV state requires Mooncake block-key or non-layerwise transfer")
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> AscendConnectorMetadata:
+        meta = super().build_connector_meta(scheduler_output)
+        assert isinstance(meta, AscendConnectorMetadata)
+        if not self.dsv4_temporal and not self._dsv4_incoming and not self._dsv4_consumed:
+            return meta
+        self._dsv4_consumed.difference_update(scheduler_output.finished_req_ids)
+        for req_id in meta.released_req_ids:
+            self._dsv4_snapshots.pop(req_id, None)
+            self._dsv4_incoming.pop(req_id, None)
+            if generation := self._dsv4_published.pop(req_id, None):
+                meta.dsv4_handoff_generations.add(generation)
+        if not self.dsv4_temporal and not self._dsv4_incoming:
+            return meta
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        for request in meta.requests:
+            if not self.dsv4_temporal and request.req_id not in self._dsv4_incoming:
+                continue
+            count = scheduler_output.num_scheduled_tokens.get(request.req_id, 0)
+            if not count:
+                continue
+            ids = block_state.get_block_ids(request.req_id) if block_state is not None else None
+            if ids is None:
+                raise RuntimeError("DSV4 temporal transfer requires the scheduler's live grouped block table")
+            request.block_ids_by_group = [list(group_ids) for group_ids in ids]
+            request.block_ids_by_group_np = None
+            request.block_ids_np = None
+            if not self.dsv4_temporal:
+                request.dsv4_restore_snapshot = self._dsv4_incoming.pop(request.req_id)
+                self._dsv4_consumed.add(request.req_id)
+                if request.target_token_len - count != request.dsv4_restore_snapshot.end_token:
+                    raise RuntimeError(f"DSV4 handoff endpoint mismatch for request {request.req_id}")
+                continue
+            if request.num_prompt_tokens is None or request.target_token_len > request.num_prompt_tokens:
+                raise RuntimeError("DSV4 temporal producer can only execute prefill")
+            previous = self._dsv4_snapshots.get(request.req_id)
+            start = request.target_token_len - count
+            if previous is not None and previous.end_token != start:
+                raise RuntimeError(f"DSV4 continuation endpoint mismatch for request {request.req_id}")
+            if previous is None and start and (request.load_spec is None or not request.load_spec.can_load):
+                raise RuntimeError(f"DSV4 cache hit has no external restore plan for request {request.req_id}")
+            request.dsv4_restore_snapshot = previous
+            request.dsv4_save_snapshot = DSV4Snapshot(
+                generation=previous.generation if previous else uuid4().hex,
+                end_token=request.target_token_len,
+                private_pages=select_private_snapshot_pages(
+                    ids,
+                    self.grouped_block_size,
+                    request.target_token_len,
+                    self._dsv4_mutable_groups,
+                    self._dsv4_history_ratios,
+                ),
+            )
+            self._dsv4_snapshots[request.req_id] = request.dsv4_save_snapshot
+        return meta
+
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
+        params = getattr(request, "kv_transfer_params", None) or {}
+        payload = params.get(DSV4_HANDOFF_KEY)
+        if payload is None or request.request_id in self._dsv4_consumed:
+            if self.dsv4_temporal and request.max_tokens != 1:
+                raise ValueError("DSV4 temporal producer requires a prefill request with max_tokens=1")
+            return super().get_num_new_matched_tokens(request, num_computed_tokens)
+        if (
+            self.kv_role != "kv_consumer"
+            or not self.block_key_hybrid
+            or not isinstance(payload, dict)
+            or not uses_dsv4_snapshot_protocol(self.vllm_config)
+        ):
+            raise ValueError("DSV4 handoff requires a resident Mooncake block-key hybrid consumer")
+        snapshot = DSV4Snapshot.from_wire(payload, len(self.grouped_block_size))
+        if not num_computed_tokens <= snapshot.end_token < request.num_tokens:
+            raise ValueError("DSV4 handoff requires the complete prefill extent followed by a decode token")
+        self._validate_dsv4_snapshot_readable(snapshot)
+        self._dsv4_incoming[request.request_id] = snapshot
+        self.load_specs[request.request_id] = LoadSpec(num_computed_tokens, snapshot.end_token, can_load=True)
+        return snapshot.end_token - num_computed_tokens, False
+
+    def _validate_dsv4_snapshot_readable(self, snapshot: DSV4Snapshot) -> None:
+        keys = [
+            self._make_layerwise_hit_check_keys(group, snapshot.suffix(group, page))
+            for group, pages in enumerate(snapshot.private_pages)
+            for page in pages
+        ]
+        if keys and not all(self._query_layerwise_block_hits(keys)):
+            raise RuntimeError(f"DSV4 snapshot is unavailable at endpoint {snapshot.end_token}")
+
+    def request_finished_all_groups(self, request: Request, block_ids: tuple[list[int], ...]):
+        if self.dsv4_temporal and request.status in (
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        ):
+            snapshot = self._dsv4_snapshots.get(request.request_id)
+            if snapshot is None or snapshot.end_token != request.num_computed_tokens:
+                raise RuntimeError(f"DSV4 prefill has no final snapshot for request {request.request_id}")
+            self._validate_dsv4_snapshot_readable(snapshot)
+            self._dsv4_published[request.request_id] = snapshot.generation
+            return False, {DSV4_HANDOFF_KEY: snapshot.to_wire()}
+        return super().request_finished_all_groups(request, block_ids)
 
     def _process_hit_without_alloc(self, store_skip_tokens: int) -> bool:
         return store_skip_tokens > 0
@@ -130,6 +254,10 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
     def _lookup_external_hit_tokens(self, request: Request, num_computed_tokens: int) -> int | None:
         prompt_token_len = len(request.prompt_token_ids)
         if self.use_block_key_layerwise:
+            if self.dsv4_temporal:
+                # Preserve one actual prompt token to sample the prefill
+                # output. External restore points must stay group-aligned.
+                prompt_token_len = max(prompt_token_len - 1, 0)
             token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
             if not self.use_eagle and len(self.cacheable_group_ids) != len(self.original_block_size):
                 token_len = self._floor_to_cache_transfer_granularity(max(prompt_token_len - 1, 0))

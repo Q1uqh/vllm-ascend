@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
 from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_snapshot import DSV4Snapshot
 
 if TYPE_CHECKING:
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import LayerPoolKey
@@ -1090,6 +1091,10 @@ class ReqMeta:
     # the coordinator is unavailable).
     store_masks: tuple[Sequence[bool] | None, ...] | None = None
     load_masks: tuple[Sequence[bool] | None, ...] | None = None
+    # Scheduler-generated identities for DSV4 block-key continuation.
+    dsv4_restore_snapshot: DSV4Snapshot | None = None
+    dsv4_save_snapshot: DSV4Snapshot | None = None
+    dsv4_partial_key_tokens: dict[str, int] | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -1241,6 +1246,7 @@ class AscendConnectorMetadata(KVConnectorMetadata):
         # Requests whose blocks became reusable since the previous step
         # (finished + preempted); the worker fences their in-flight saves.
         self.released_req_ids: set[str] = set(preempted_req_ids or ())
+        self.dsv4_handoff_generations: set[str] = set()
 
     def add_request(self, req_meta: ReqMeta) -> None:
         """Add a request to the metadata."""

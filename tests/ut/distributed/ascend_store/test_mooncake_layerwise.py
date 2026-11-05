@@ -126,6 +126,28 @@ class TestMooncakeLayerBatchBuilder(unittest.TestCase):
         self.assertEqual(result.all_sizes, [[30]])
         self.assertEqual(result.all_offsets, [[30]])
 
+    def test_snapshot_tail_copies_only_whole_compressed_rows(self):
+        request = ReqMeta("r1", block_ids=[2], block_hashes=[])
+        request.save_block_keys = ["private"]
+        request.dsv4_partial_key_tokens = {"private": 5}
+        task = LayerTransferTask(
+            layer_id=0,
+            block_ranges=[LayerBlockRange(request, 0, 1)],
+            use_key_major_ranges=True,
+        )
+        database = make_token_database()
+        database.get_block_size = lambda _: 12
+        database.group_block_len[0] = [12, 24, 30]
+        builder = LayerBatchBuilder(database, page_size_bytes=60, num_layers=2, history_ratio=4)
+
+        result = builder.build(task)
+
+        assert isinstance(result, LayerRangeReqMeta)
+        # One of three compressed rows. Use separate lengths and preserve the
+        # reserved object offset of the second (scale) component.
+        self.assertEqual(result.all_sizes, [[4, 8]])
+        self.assertEqual(result.all_offsets, [[0, 12]])
+
     def test_range_limits_split_rows_and_large_segments(self):
         batches = KVTransferThread._range_transfer_batches(
             ["k0", "k1"],

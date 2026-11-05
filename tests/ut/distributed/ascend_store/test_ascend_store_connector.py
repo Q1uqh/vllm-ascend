@@ -631,18 +631,18 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
                     expected,
                 )
 
-    def test_mooncake_rejects_unimplemented_temporal_sharing(self):
+    def test_mooncake_rejects_temporal_sharing_on_consumer(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
         config = MagicMock()
-        config.kv_transfer_config.kv_role = "kv_producer"
+        config.kv_transfer_config.kv_role = "kv_consumer"
         config.kv_transfer_config.kv_connector = "AscendStoreConnector"
         config.kv_transfer_config.kv_connector_extra_config = {
             "backend": "mooncake",
             "use_layerwise": True,
             "layerwise_num_shared_buffers": 2,
         }
-        with self.assertRaisesRegex(NotImplementedError, "continuation snapshots"):
+        with self.assertRaisesRegex(ValueError, "requires a kv_producer"):
             self.connector_mod.AscendStoreConnector(vllm_config=config, role=KVConnectorRole.WORKER)
 
     def test_layerwise_worker_paths(self):
