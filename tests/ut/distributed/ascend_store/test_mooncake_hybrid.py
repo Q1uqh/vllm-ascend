@@ -43,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.dsv4_sna
     select_private_snapshot_pages,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_transfer import _LayerRevokeTask
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import LayerLoadTask
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_scheduler import LayerwiseKVPoolScheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, LoadSpec, ReqMeta
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import BaseKVPoolScheduler
@@ -779,6 +780,31 @@ class TestMooncakeHybrid(unittest.TestCase):
         self.assertEqual(set(store.objects), set(unconfirmed_keys))
         self.assertFalse(worker._put_started_keys)
         self.assertFalse(errors)
+
+    def test_aborted_range_prefetch_does_not_wait_for_unsubmitted_save(self):
+        worker, store, _, jobs, errors = self.make_hybrid()
+        recv = worker.kv_recv_thread
+        waiting = threading.Event()
+        predecessor = recv.layer_save_finished_events[0]
+        original_wait = predecessor.wait
+
+        def wait_for_predecessor(timeout):
+            waiting.set()
+            return original_wait(timeout)
+
+        with patch.object(predecessor, "wait", side_effect=wait_for_predecessor):
+            recv.add_request(LayerLoadTask(0, [], 2, use_key_major_ranges=True))
+            try:
+                self.assertTrue(waiting.wait(timeout=2))
+                worker._layer_load_aborted.set()
+                jobs[-1].join(timeout=2)
+                self.assertFalse(jobs[-1].is_alive())
+                self.assertEqual(recv.request_queue.unfinished_tasks, 0)
+                self.assertFalse(errors)
+                self.assertFalse(store.open_reads)
+            finally:
+                predecessor.set()
+                jobs[-1].join(timeout=2)
 
     def test_fatal_recv_with_queued_work_does_not_hang_drain(self):
         worker, store, arrays, jobs, errors = self.make_hybrid()

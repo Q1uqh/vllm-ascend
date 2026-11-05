@@ -115,10 +115,12 @@ class KVTransferThread(threading.Thread):
         self,
         event: threading.Event | AttentionComputeStartGate,
         failure_checker: Callable[[], None] | None = None,
+        *,
+        abort_event: threading.Event | None = None,
     ) -> bool:
-        while not self._stopping.is_set():
+        while not self._stopping.is_set() and (abort_event is None or not abort_event.is_set()):
             if event.wait(timeout=_TRANSFER_SHUTDOWN_POLL_S):
-                return not self._stopping.is_set()
+                return not self._stopping.is_set() and (abort_event is None or not abort_event.is_set())
             if failure_checker is not None:
                 failure_checker()
         return False

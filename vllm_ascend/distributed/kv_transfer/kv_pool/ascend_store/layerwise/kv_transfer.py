@@ -991,6 +991,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
             if self.max_transfer_blocks > 0
             else (_DEFAULT_REQUIRED_COMMIT_BATCH_SIZE if self.raise_on_transfer_failure else max(1, len(active_keys)))
         )
+        commit_started = time.monotonic()
         for start in range(0, len(active_keys), batch_size):
             keys = active_keys[start : start + batch_size]
             self.range_save_progress = ("commit", layer_id, group_id, len(keys), 0, time.monotonic())
@@ -1007,6 +1008,14 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                 self._session_tracker.commit_put_keys(committed_keys)
             if failed_keys and self.raise_on_transfer_failure:
                 raise RuntimeError(f"Required layerwise commit failed at layer {layer_id}")
+        if active_keys:
+            emit_dsv4_transfer_event(
+                "range_commit_complete",
+                layer_id=layer_id,
+                group=group_id,
+                key_count=len(active_keys),
+                elapsed_ms=round((time.monotonic() - commit_started) * 1000, 3),
+            )
         self._active_put_keys = None
 
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
@@ -1304,10 +1313,16 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
         try:
+            if self._load_abort_event.is_set():
+                return
             wait_for_save = data.wait_for_save_layer
             if wait_for_save is not None:
                 begin = time.monotonic()
-                if not self._wait_for_event(self.layer_save_finished_events[wait_for_save], self.save_failure_checker):
+                if not self._wait_for_event(
+                    self.layer_save_finished_events[wait_for_save],
+                    self.save_failure_checker,
+                    abort_event=self._load_abort_event,
+                ):
                     return
                 if self.save_failure_checker is not None:
                     self.save_failure_checker()
@@ -1321,7 +1336,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 )
 
             if data.attention_start_gate is not None:
-                if not self._wait_for_event(data.attention_start_gate):
+                if not self._wait_for_event(data.attention_start_gate, abort_event=self._load_abort_event):
                     return
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)

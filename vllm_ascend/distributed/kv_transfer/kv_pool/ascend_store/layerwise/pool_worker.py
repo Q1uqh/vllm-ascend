@@ -2314,6 +2314,11 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             self._drain_attention_transfers()
         except Exception:
             self._layer_load_aborted.set()
+            # A range GET already inside Mooncake must leave before its
+            # session closes. Queued prefetch tasks observe the abort flag.
+            if self.use_block_key_layerwise:
+                with suppress(Exception):
+                    self._drain_attention_transfers(drain_recv=True, full=True)
             self._finish_current_layerwise_load_sessions()
             raise
 
