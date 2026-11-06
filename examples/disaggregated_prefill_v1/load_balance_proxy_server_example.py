@@ -135,6 +135,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
+from anyio import CancelScope
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -702,7 +703,7 @@ def cleanup_manager_config(proxy_port: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dsv4-snapshot-handoff", action="store_true", help="Enable non-streaming DSV4 KV handoff")
+    parser.add_argument("--dsv4-snapshot-handoff", action="store_true", help="Enable DSV4 KV handoff")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--prefiller-hosts", type=str, nargs="+", default=["localhost"])
@@ -1074,7 +1075,105 @@ async def _replay_first_chunk(first_chunk: bytes, gen: Any):
         yield chunk
 
 
-async def finish_dsv4_handoff(client, api, request, prefill, request_id):
+class DSV4StreamingResponse(StreamingResponse):
+    def __init__(self, chunks, cleanup):
+        super().__init__(chunks, media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
+        self.cleanup = cleanup
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    await self.cleanup()
+
+
+async def stream_dsv4_handoff(client, chat, request, prefill, choice, decode, request_id):
+    def event(choices, usage=None, prompt_token_ids=None):
+        chunk = {key: prefill[key] for key in ("id", "created", "model")}
+        chunk["object"] = "chat.completion.chunk" if chat else "text_completion"
+        chunk["choices"] = choices
+        if include_usage:
+            chunk["usage"] = usage
+        if prompt_token_ids is not None:
+            chunk["prompt_token_ids"] = prompt_token_ids
+        return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    options = request.get("stream_options") or {}
+    include_usage = bool(options.get("include_usage"))
+    continuous_usage = include_usage and bool(options.get("continuous_usage_stats"))
+    usage = prefill["usage"].copy()
+    first_choice = {
+        "index": 0,
+        "finish_reason": choice.get("finish_reason") if decode is None else None,
+        "logprobs": None,
+    }
+    if decode is None:
+        first_choice["stop_reason"] = choice.get("stop_reason")
+    if chat:
+        message = choice["message"]
+        first_choice["delta"] = {
+            key: message[key] for key in ("role", "content", "reasoning", "reasoning_content")
+            if message.get(key) is not None
+        }
+    else:
+        first_choice["text"] = choice["text"]
+    prompt_token_ids = None
+    if request.get("return_token_ids"):
+        first_choice["token_ids"] = choice["token_ids"]
+        if chat:
+            prompt_token_ids = prefill["prompt_token_ids"]
+        else:
+            first_choice["prompt_token_ids"] = choice["prompt_token_ids"]
+    yield event([first_choice], usage if continuous_usage else None, prompt_token_ids)
+
+    if decode is not None:
+        # D's prompt includes P's first output token. Only count D's new output.
+        decode["stream_options"] = {"include_usage": True, "continuous_usage_stats": continuous_usage}
+        finished = saw_done = saw_usage = False
+        try:
+            async with client.stream(
+                "POST", "/completions", json=decode, headers=auth_headers(request_id)
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line.removeprefix("data:").strip()
+                    if data == "[DONE]":
+                        saw_done = True
+                        break
+                    chunk = json.loads(data)
+                    if "error" in chunk:
+                        raise RuntimeError("D returned a streaming error")
+                    if (decode_usage := chunk.get("usage")) is not None:
+                        usage["completion_tokens"] = prefill["usage"]["completion_tokens"] + decode_usage[
+                            "completion_tokens"
+                        ]
+                        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                        saw_usage = True
+                    for continued in chunk.get("choices", []):
+                        continued.pop("prompt_token_ids", None)
+                        if chat:
+                            continued["delta"] = {"content": continued.pop("text")}
+                        finished = finished or continued.get("finish_reason") is not None
+                        yield event([continued], usage if continuous_usage else None)
+            if not saw_done or not finished or (include_usage and not saw_usage):
+                raise RuntimeError("D returned an incomplete stream")
+        except Exception:
+            logger.exception("DSV4 proxy decode stream failed request_id=%s", request_id)
+            # Headers and the first token have already been sent. Abort the
+            # response so clients cannot mistake partial output for success.
+            raise
+    if include_usage:
+        yield event([], usage)
+    yield "data: [DONE]\n\n"
+
+
+async def finish_dsv4_handoff(client, api, request, prefill, request_id, *, cleanup=None):
     """Continue from P's exact token boundary and retain the public API shape."""
     chat = api.endswith("/chat/completions")
     choice = (prefill.get("choices") or [{}])[0]
@@ -1093,6 +1192,7 @@ async def finish_dsv4_handoff(client, api, request, prefill, request_id):
         return JSONResponse({"error": {"message": "P returned an invalid DSV4 KV handoff"}}, status_code=502)
 
     budget = request.get("max_completion_tokens") or request.get("max_tokens") or 16
+    decode = None
     if budget > 1 and choice.get("finish_reason") != "stop":
         decode = request.copy()
         for name in (
@@ -1117,7 +1217,7 @@ async def finish_dsv4_handoff(client, api, request, prefill, request_id):
             min_tokens=max(0, (request.get("min_tokens") or 0) - 1),
             add_special_tokens=False,
             echo=False,
-            stream=False,
+            stream=bool(request.get("stream")),
             return_token_ids=bool(request.get("return_token_ids")),
         )
         logger.info(
@@ -1126,6 +1226,11 @@ async def finish_dsv4_handoff(client, api, request, prefill, request_id):
             len(prompt),
             len(decode["prompt"]),
         )
+    if request.get("stream"):
+        chunks = stream_dsv4_handoff(client, chat, request, prefill, choice, decode, request_id)
+        return DSV4StreamingResponse(chunks, cleanup)
+
+    if decode is not None:
         response = await client.post("/completions", json=decode, headers=auth_headers(request_id))
         response.raise_for_status()
         result = response.json()
@@ -1157,8 +1262,7 @@ async def handle_completions_impl(api: str, request: Request):
     try:
         req_data = await request.json()
         if args.dsv4_snapshot_handoff and (
-            req_data.get("stream")
-            or req_data.get("tools")
+            req_data.get("tools")
             or req_data.get("response_format")
             or req_data.get("structured_outputs")
             or req_data.get("use_beam_search")
@@ -1170,7 +1274,7 @@ async def handle_completions_impl(api: str, request: Request):
             or req_data.get("best_of", 1) not in (None, 1)
         ):
             return JSONResponse(
-                {"error": {"message": "DSV4 handoff supports one non-streaming text completion without logprobs"}},
+                {"error": {"message": "DSV4 handoff supports one text completion without logprobs"}},
                 status_code=400,
             )
         if args.enable_prefill_affinity and (session_id := request.headers.get("X-Session-Id")):
@@ -1181,14 +1285,26 @@ async def handle_completions_impl(api: str, request: Request):
         request_length = len(req_body)
         instance_info = await assign_instances(api, req_data, request_length, is_initial_request=True)
         if instance_info.dsv4_prefill_response is not None:
+            async def finish_dsv4_request():
+                await _finish_instance(runtime, instance_info, release_prefill_kv=True)
+
+            streaming_response = False
             try:
                 decoder_client = await runtime.get_client(ServerRole.DECODE, instance_info.decoder_key)
-                return await finish_dsv4_handoff(
-                    decoder_client, api, req_data, instance_info.dsv4_prefill_response, instance_info.request_id
+                result = await finish_dsv4_handoff(
+                    decoder_client,
+                    api,
+                    req_data,
+                    instance_info.dsv4_prefill_response,
+                    instance_info.request_id,
+                    cleanup=finish_dsv4_request,
                 )
+                streaming_response = isinstance(result, DSV4StreamingResponse)
+                return result
             finally:
                 request_released = True
-                await _finish_instance(runtime, instance_info, release_prefill_kv=True)
+                if not streaming_response:
+                    await finish_dsv4_request()
         stream_flag = bool(req_data.get("stream", False))
         chat_flag = "messages" in req_data
 
