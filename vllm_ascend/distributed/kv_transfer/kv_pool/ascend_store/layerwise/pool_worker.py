@@ -119,9 +119,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
     ) -> None:
         super().__init__(vllm_config, use_layerwise, kv_cache_config)
         self.dsv4_temporal = dsv4_temporal_config(vllm_config) is not None
-        self._trace_dsv4_slot_reuse = (
-            self.dsv4_temporal and (vllm_config.additional_config or {}).get("kv_pool_range_debug") is True
-        )
+        self._dsv4_debug = (vllm_config.additional_config or {}).get("kv_pool_range_debug") is True
+        self._trace_dsv4_slot_reuse = self.dsv4_temporal and self._dsv4_debug
         self._init_layerwise_config()
         self._dsv4_mutable_groups = dsv4_mutable_groups(kv_cache_config.kv_cache_groups) if kv_cache_config else set()
         self._dsv4_mutable_windows = (
@@ -715,23 +714,36 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             request for request in metadata.requests if request.dsv4_restore_snapshot or request.dsv4_save_snapshot
         ]
         if transfers:
+            drain_started = time.monotonic()
             self._drain_attention_transfers(full=True)
             self._release_layerwise_requests_for_retry(
                 {request.req_id for request in transfers if request.dsv4_restore_snapshot is not None}
             )
             if self.tp_size > 1:
                 get_tp_group().barrier()
+            drain_ms = round((time.monotonic() - drain_started) * 1000, 3)
         for request in transfers:
             restore, save = request.dsv4_restore_snapshot, request.dsv4_save_snapshot
             if restore is not None:
                 retire.append(restore)
             if save is not None:
-                emit_dsv4_transfer_event("snapshot_committed", generation=save.generation, end_token=save.end_token)
+                emit_dsv4_transfer_event(
+                    "snapshot_committed",
+                    enabled=self._dsv4_debug,
+                    generation=save.generation,
+                    end_token=save.end_token,
+                    restore_generation=restore.generation if restore else None,
+                    restore_end=restore.end_token if restore else None,
+                    step_drain_ms=drain_ms,
+                )
                 active[request.req_id] = save
             else:
                 assert restore is not None
                 emit_dsv4_transfer_event(
-                    "handoff_read_complete", generation=restore.generation, end_token=restore.end_token
+                    "handoff_read_complete",
+                    enabled=self._dsv4_debug,
+                    generation=restore.generation,
+                    end_token=restore.end_token,
                 )
                 active.pop(request.req_id, None)
         for snapshot in retire:
@@ -741,20 +753,29 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                         self._make_layerwise_full_key(group, snapshot.suffix(group, page)) for page in pages
                     )
         if self._dsv4_cleanup_keys:
+            attempted = len(self._dsv4_cleanup_keys)
             for batch in self._layerwise_key_batches(list(self._dsv4_cleanup_keys)):
                 try:
                     results = self.m_store.remove_snapshot_keys(batch)
                 except Exception:
                     logger.exception("DSV4 snapshot removal failed keys=%d", len(batch))
                     continue
-                emit_dsv4_transfer_event("snapshot_remove", key_count=len(batch), results=results)
+                emit_dsv4_transfer_event(
+                    "snapshot_remove", enabled=self._dsv4_debug, key_count=len(batch), results=results
+                )
                 # A session can leave a backend lease after GET end. Retry on
                 # the next scheduler tick and leave force deletion disabled.
                 self._dsv4_cleanup_keys.difference_update(
                     key for key, code in zip(batch, results, strict=True) if code == 0
                 )
-            if self._dsv4_cleanup_keys:
-                logger.debug("DSV4 snapshot cleanup pending keys=%d", len(self._dsv4_cleanup_keys))
+            pending = len(self._dsv4_cleanup_keys)
+            emit_dsv4_transfer_event(
+                "snapshot_cleanup",
+                enabled=self._dsv4_debug,
+                attempted_keys=attempted,
+                removed_keys=attempted - pending,
+                pending_keys=pending,
+            )
 
     def _build_lookup_keys(
         self,
@@ -810,6 +831,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             if snapshot := save or restore:
                 emit_dsv4_transfer_event(
                     "snapshot_prepare",
+                    enabled=self._dsv4_debug,
+                    restore_generation=restore.generation if restore else None,
                     generation=snapshot.generation,
                     producer_replica=snapshot.producer_replica,
                     restore_end=restore.end_token if restore else None,
@@ -838,6 +861,12 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             if groups:
                 emit_dsv4_transfer_event(
                     "handoff_bulk_h2d",
+                    enabled=self._dsv4_debug,
+                    generations=[
+                        request.dsv4_restore_snapshot.generation
+                        for request in metadata.requests
+                        if request.dsv4_restore_snapshot is not None
+                    ],
                     direction="h2d",
                     groups=len(groups),
                     key_count=key_count,

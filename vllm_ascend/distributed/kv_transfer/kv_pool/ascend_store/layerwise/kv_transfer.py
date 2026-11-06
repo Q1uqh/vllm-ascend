@@ -86,9 +86,11 @@ def _emit_commit_debug_event(layer_id: int, key_count: int, results: list[int]) 
         pass
 
 
-def emit_dsv4_transfer_event(event: str, **fields: Any) -> None:
+def emit_dsv4_transfer_event(event: str, *, enabled: bool | None = None, **fields: Any) -> None:
     try:
-        if get_ascend_config().kv_pool_range_debug:
+        if enabled is None:
+            enabled = get_ascend_config().kv_pool_range_debug
+        if enabled:
             payload = {"event": event, **fields}
             logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
     except Exception:
