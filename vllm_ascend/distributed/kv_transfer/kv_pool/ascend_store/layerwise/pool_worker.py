@@ -119,8 +119,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
     ) -> None:
         super().__init__(vllm_config, use_layerwise, kv_cache_config)
         self.dsv4_temporal = dsv4_temporal_config(vllm_config) is not None
-        self._dsv4_debug = (vllm_config.additional_config or {}).get("kv_pool_range_debug") is True
-        self._trace_dsv4_slot_reuse = self.dsv4_temporal and self._dsv4_debug
+        requested_debug = (vllm_config.additional_config or {}).get("kv_pool_range_debug")
+        self._dsv4_debug = requested_debug is True
         self._init_layerwise_config()
         self._dsv4_mutable_groups = dsv4_mutable_groups(kv_cache_config.kv_cache_groups) if kv_cache_config else set()
         self._dsv4_mutable_windows = (
@@ -153,15 +153,18 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 self.prefetch_layer_map,
                 self.independent_layers,
             )
-            if self._trace_dsv4_slot_reuse:
-                effective_debug = None
-                with suppress(RuntimeError):
-                    effective_debug = get_ascend_config().kv_pool_range_debug
-                logger.info(
-                    "DSV4_SLOT_TRACE requested_debug=True effective_debug=%s expected_edges=%d",
-                    effective_debug,
-                    len(self.prefetch_layer_map),
-                )
+            effective_debug = None
+            with suppress(RuntimeError):
+                effective_debug = get_ascend_config().kv_pool_range_debug
+            logger.info(
+                "DSV4_SLOT_TRACE source=%s requested_debug=%r requested_debug_type=%s "
+                "effective_debug=%r expected_edges=%d",
+                __file__,
+                requested_debug,
+                type(requested_debug).__name__,
+                effective_debug,
+                len(self.prefetch_layer_map),
+            )
 
     def _init_kv_transfer_config(self, vllm_config, extra_config, use_layerwise, kv_cache_config) -> None:
         backend_name = extra_config.get("backend", "mooncake").lower()
@@ -623,7 +626,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 invalid_block_ids_lock=self._invalid_block_ids_lock,
                 load_abort_event=self._layer_load_aborted,
                 raise_on_transfer_failure=self.layerwise_offload or self.num_kv_cache_groups > 1,
-                trace_slot_reuse=self._trace_dsv4_slot_reuse,
+                # Log each fence once for temporal workers even if debug config was lost.
+                trace_slot_reuse=self.dsv4_temporal,
             )
         else:
             self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
