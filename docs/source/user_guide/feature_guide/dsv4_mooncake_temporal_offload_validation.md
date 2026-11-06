@@ -90,6 +90,32 @@ ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 vllm serve "$model" "${common[@]}" \
 
 为活跃快照和历史数据预留足够的 Mooncake DRAM。GET 会话保护正在读取的对象，两次读取之间的数据保留依赖可用容量。必需对象在分块之间或交接前被驱逐时，传输会报错。如果交接在 D 确认前被放弃，未确认的快照仍可由 Mooncake 驱逐。
 
+### 通过代理发请求
+
+在代理所在服务器使用本分支的 `load_balance_proxy_server_example.py`。假设代理在 `141.61.133.128`，P、D 都在 `141.61.133.129`，按下面方式启动。 `--host` 是代理所在机器的监听地址。
+
+```bash
+python3 examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py \
+  --dsv4-snapshot-handoff \
+  --host 141.61.133.128 --port 1999 \
+  --prefiller-hosts 141.61.133.129 --prefiller-ports 8099 \
+  --decoder-hosts 141.61.133.129 --decoder-ports 8066
+```
+
+```bash
+curl -sS http://141.61.133.128:1999/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "dsv4",
+    "messages": [{"role": "user", "content": "请用一句话解释什么是 KV 缓存。"}],
+    "max_tokens": 8,
+    "temperature": 0,
+    "stream": false
+  }'
+```
+
+此代理模式用于单候选非流式文本请求。代理在 P 返回的提示词 ID 后追加首个输出 token，带上快照参数向 D 请求剩余 token，并合并回复。用 D 端的 `handoff_bulk_h2d` 和 `handoff_read_complete` 确认实际完成交接。
+
 ## 与驻留模式对照
 
 - **容量对照**：在相同 KV 缓存预算下重跑 P，省略 `layerwise_num_shared_buffers`，得到驻留模式的块数和显存基线。

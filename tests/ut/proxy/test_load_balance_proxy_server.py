@@ -157,6 +157,8 @@ def _create_mock_backend_app():
         chunk_delay: float = 0.0
         mid_stream_error: str = ""
         error_after: int = 0
+        expected_request: dict = field(default_factory=dict)
+        expected_path: str = ""
 
     class ScriptQueue:
         def __init__(self):
@@ -205,6 +207,11 @@ def _create_mock_backend_app():
     @app.post("/v1/completions")
     async def handle(req: Request):
         item = queue.pop()
+        if item.expected_path:
+            assert req.url.path == item.expected_path
+        if item.expected_request:
+            payload = await req.json()
+            assert {key: payload.get(key) for key in item.expected_request} == item.expected_request
         if item.kind == "json":
             if isinstance(item.body, dict):
                 return JSONResponse(status_code=item.status, content=item.body)
@@ -237,7 +244,7 @@ if __name__ == "__main__" and "--mock-backend" in sys.argv:
 # Pytest fixture: start mock backends + proxy
 # --------------------------------------------------------------------------- #
 @pytest.fixture(scope="module")
-def proxy_server():
+def proxy_server(request):
     """Start mock backends + proxy as subprocesses, yield proxy URL, teardown."""
     test_file = str(Path(__file__).resolve())
     procs = []
@@ -286,6 +293,7 @@ def proxy_server():
                     "127.0.0.1",
                     "--decoder-ports",
                     str(MOCK_DECODE_PORT),
+                    *(["--dsv4-snapshot-handoff"] if getattr(request, "param", False) else []),
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -550,3 +558,57 @@ def test_usage_cached_tokens(proxy_server):
     assert st == 200
     # The proxy should have added cached_tokens to the usage chunk
     assert b"cached_tokens" in body
+
+
+@pytest.mark.parametrize("proxy_server", [True], indirect=True)
+def test_dsv4_snapshot_proxy_handoff(proxy_server):
+    transfer = {"ascend_dsv4_snapshot": {"end_token": 3, "generation": "example"}}
+    _set_script(
+        MOCK_PREFILL_PORT,
+        [
+            {
+                "expected_path": "/v1/chat/completions",
+                "expected_request": {"max_tokens": 1, "return_token_ids": True},
+                "body": {
+                    "prompt_token_ids": [10, 11, 12],
+                    "choices": [{"message": {"content": "A"}, "token_ids": [13], "finish_reason": "length"}],
+                    "kv_transfer_params": transfer,
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+                },
+            }
+        ],
+    )
+    _set_script(
+        MOCK_DECODE_PORT,
+        [
+            {
+                "expected_path": "/v1/completions",
+                "expected_request": {
+                    "prompt": [10, 11, 12, 13],
+                    "kv_transfer_params": transfer,
+                    "max_tokens": 2,
+                    "add_special_tokens": False,
+                },
+                "body": {
+                    "choices": [{"text": "BC", "finish_reason": "length"}],
+                    "usage": {"completion_tokens": 2},
+                },
+            }
+        ],
+    )
+    status, body = _post(proxy_server, _chat_req(max_tokens=3))
+    assert status == 200
+    result = json.loads(body)
+    assert result["choices"][0]["message"]["content"] == "ABC"
+    assert result["usage"]["total_tokens"] == 6
+    assert "kv_transfer_params" not in result
+    assert "token_ids" not in result["choices"][0]
+
+    _set_script(MOCK_PREFILL_PORT, [{"body": {"kv_transfer_params": transfer}}])
+    status, body = _post(proxy_server, _chat_req(max_tokens=3))
+    assert status == 502
+    assert b"invalid DSV4 KV handoff" in body
+
+    status, body = _post(proxy_server, _chat_req(stream=True))
+    assert status == 400
+    assert b"non-streaming" in body

@@ -161,7 +161,9 @@ def test_session_header_precedence_only_when_enabled(monkeypatch, enabled):
         raise RuntimeError("stop after inspecting routing input")
 
     monkeypatch.setattr(proxy, "get_runtime", lambda: None)
-    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(enable_prefill_affinity=enabled))
+    monkeypatch.setattr(
+        proxy, "get_global_args", lambda: SimpleNamespace(enable_prefill_affinity=enabled, dsv4_snapshot_handoff=False)
+    )
     monkeypatch.setattr(proxy, "assign_instances", capture_assignment)
     request = Request({"type": "http", "headers": [(b"x-session-id", b"header-session")]}, receive)
     with pytest.raises(RuntimeError, match="stop after inspecting"):
