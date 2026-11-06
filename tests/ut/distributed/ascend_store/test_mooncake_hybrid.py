@@ -307,11 +307,12 @@ class TestMooncakeHybrid(unittest.TestCase):
         request.dsv4_restore_snapshot = DSV4Snapshot.from_wire(previous.to_wire(), 3)
         meta = AscendConnectorMetadata(set())
         meta.add_request(request)
-        consumer.prepare_layerwise_step(meta)
-        for _ in range(4):
-            consumer.wait_for_layer_load()
-            with attention_transfer_window():
-                pass
+        with patch.object(store, "batch_copy_get", wraps=store.batch_copy_get) as get:
+            consumer.restore_dsv4_bulk(meta)
+        self.assertGreater(get.call_count, 0)
+        self.assertTrue(any(len(offsets) > 1 for call in get.call_args_list for offsets in call.args[3]))
+        self.assertEqual(consumer.current_layer, 0)
+        self.assertFalse(store.open_reads)
         for layer in (0, 2):
             np.testing.assert_array_equal(resident[f"model.layers.{layer}.kv"][1], 40 + layer)
             np.testing.assert_array_equal(resident[f"model.layers.{layer}.kv"][2], 70 + layer)
@@ -754,6 +755,26 @@ class TestMooncakeHybrid(unittest.TestCase):
             self.assertFalse(job.is_alive())
         self.assertTrue(worker.get_block_ids_with_load_errors())
         self.assertFalse(store.open_reads)
+
+    def test_bulk_short_get_releases_sessions_before_failing(self):
+        worker, store, _, jobs, errors = self.make_hybrid()
+        request = self.save_prefix(worker)
+        request.load_spec = LoadSpec(0, 64, can_load=True)
+        request.can_save = False
+        worker.kv_role = "kv_consumer"
+        meta = AscendConnectorMetadata(set())
+        meta.add_request(request)
+        with (
+            patch.object(store, "batch_copy_get", side_effect=lambda *args: [sum(row) - 1 for row in args[2]]),
+            self.assertRaisesRegex(RuntimeError, "bulk H2D range GET failed"),
+        ):
+            worker.restore_dsv4_bulk(meta)
+        self.assertTrue(worker.get_block_ids_with_load_errors())
+        self.assertFalse(store.open_reads)
+        self.assertFalse(errors)
+        for job in jobs:
+            job.join(timeout=2)
+            self.assertFalse(job.is_alive())
 
     def test_put_start_failure_rolls_back_earlier_groups(self):
         worker, store, arrays, jobs, errors = self.make_hybrid()

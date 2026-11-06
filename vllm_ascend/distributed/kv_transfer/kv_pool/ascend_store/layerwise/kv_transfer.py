@@ -1258,6 +1258,61 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(req_meta.block_ids[index] for index in indices)
 
+    def _copy_get_ranges(
+        self, keys: list[str], buffers: list[list[int]], sizes: list[list[int]], offsets: list[list[int]]
+    ) -> list[int]:
+        results: list[int] = []
+        for batch_keys, batch_buffers, batch_sizes, batch_offsets in self._range_transfer_batches(
+            keys, buffers, sizes, offsets, self.max_transfer_blocks, self.max_transfer_bytes
+        ):
+            results.extend(
+                require_aligned_batch_results(
+                    "batch_copy_get",
+                    batch_keys,
+                    self.m_store.batch_copy_get(batch_keys, batch_buffers, batch_sizes, batch_offsets),
+                )
+            )
+        return results
+
+    def restore_bulk_group(self, tasks: list[LayerTransferTask]) -> tuple[int, int]:
+        """Copy every layer's ranges for this cache group into resident KV."""
+        builder = self.group_builders[tasks[0].group_id] if self.group_builders else self.layer_batch_builder
+        bulk = None
+        for task in tasks:
+            if task.shared_block_data is None:
+                continue
+            layer = builder.build_addrs(task.shared_block_data, task.layer_idx_in_group)
+            if not isinstance(layer, LayerRangeReqMeta):
+                raise TypeError(f"Expected Mooncake range metadata, got {type(layer).__name__}")
+            if bulk is None:
+                bulk = layer
+                continue
+            if bulk.keys != layer.keys or bulk.block_ids != layer.block_ids:
+                raise RuntimeError("DSV4 H2D layers disagree on cache group rows")
+            for buffers, sizes, offsets, layer_buffers, layer_sizes, layer_offsets in zip(
+                bulk.all_buffers,
+                bulk.all_sizes,
+                bulk.all_offsets,
+                layer.all_buffers,
+                layer.all_sizes,
+                layer.all_offsets,
+                strict=True,
+            ):
+                buffers.extend(layer_buffers)
+                sizes.extend(layer_sizes)
+                offsets.extend(layer_offsets)
+        if bulk is None or not bulk.keys:
+            return 0, 0
+        results = self._copy_get_ranges(bulk.keys, bulk.all_buffers, bulk.all_sizes, bulk.all_offsets)
+        expected = [sum(row) for row in bulk.all_sizes]
+        failed = [index for index, (actual, size) in enumerate(zip(results, expected, strict=True)) if actual != size]
+        if failed:
+            self._mark_invalid_range_indices(bulk, failed)
+            raise RuntimeError(
+                f"DSV4 bulk H2D range GET failed group={tasks[0].group_id} keys={len(failed)}/{len(bulk.keys)}"
+            )
+        return len(results), sum(expected)
+
     def _handle_range_request(self, req_meta: LayerRangeReqMeta, shared: SharedBlockData) -> None:
         layer_id = req_meta.layer_id
         if self._active_load_indices is None or layer_id == 0:
@@ -1275,22 +1330,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             active_buffers = [req_meta.all_buffers[index] for index in active_indices]
             active_sizes = [req_meta.all_sizes[index] for index in active_indices]
             active_offsets = [req_meta.all_offsets[index] for index in active_indices]
-            results: list[int] = []
-            for keys, buffers, sizes, offsets in self._range_transfer_batches(
-                active_keys,
-                active_buffers,
-                active_sizes,
-                active_offsets,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
-            ):
-                results.extend(
-                    require_aligned_batch_results(
-                        "batch_copy_get",
-                        keys,
-                        self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
-                    )
-                )
+            results = self._copy_get_ranges(active_keys, active_buffers, active_sizes, active_offsets)
             _emit_range_debug_event("load", layer_id, active_sizes, active_offsets, results)
             failed_indices = [
                 index

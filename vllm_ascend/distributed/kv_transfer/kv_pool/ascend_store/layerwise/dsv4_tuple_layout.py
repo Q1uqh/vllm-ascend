@@ -282,12 +282,8 @@ def uses_dsv4_snapshot_protocol(config: VllmConfig) -> bool:
     extra = transfer.kv_connector_extra_config
     if extra.get("layerwise_dsv4_handoff") is not True:
         return False
-    if (
-        transfer.kv_role != "kv_consumer"
-        or str(extra.get("backend", "mooncake")).lower() != "mooncake"
-        or not extra.get("use_layerwise")
-    ):
-        raise ValueError("layerwise_dsv4_handoff requires a resident Mooncake layerwise consumer")
+    if transfer.kv_role != "kv_consumer" or str(extra.get("backend", "mooncake")).lower() != "mooncake":
+        raise ValueError("layerwise_dsv4_handoff requires a resident Mooncake consumer")
     _validate_dsv4_snapshot_topology(config)
     return True
 

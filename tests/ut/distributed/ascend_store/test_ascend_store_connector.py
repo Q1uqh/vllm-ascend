@@ -184,6 +184,7 @@ class TestAscendStoreConnector(unittest.TestCase):
             with self.subTest(use_layerwise=use_layerwise):
                 connector = AscendStoreConnector.__new__(AscendStoreConnector)
                 connector.use_layerwise = use_layerwise
+                connector._dsv4_bulk_handoff = False
                 connector.connector_worker = MagicMock()
                 old_bufs = object()
                 connector._mamba_copy_bufs = old_bufs
@@ -211,6 +212,26 @@ class TestAscendStoreConnector(unittest.TestCase):
                 connector.bind_connector_metadata(metadata)
                 connector.start_load_kv(None)
                 self.assertFalse(connector._current_step_has_real_forward)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.LayerwiseKVPoolWorker")
+    def test_dsv4_consumer_restores_at_bind_without_layer_hooks(self, worker_cls):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        config = self._make_vllm_config(
+            kv_role="kv_consumer",
+            extra_config={"use_layerwise": False, "layerwise_dsv4_handoff": True},
+        )
+        config.use_v2_model_runner = True
+        config.model_config.enforce_eager = True
+        config.parallel_config.pipeline_parallel_size = 1
+        config.parallel_config.prefill_context_parallel_size = 1
+        config.parallel_config.decode_context_parallel_size = 1
+        connector = AscendStoreConnector(config, KVConnectorRole.WORKER)
+        meta = AscendConnectorMetadata(set())
+        connector.bind_connector_metadata(meta)
+        connector.wait_for_layer_load("model.layers.0")
+        worker_cls.return_value.restore_dsv4_bulk.assert_called_once_with(meta)
+        worker_cls.return_value.wait_for_layer_load.assert_not_called()
 
     def _make_vllm_config(self, kv_role="kv_producer", extra_config=None):
         config = MagicMock()
@@ -762,6 +783,7 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
 
         connector = AscendStoreConnector.__new__(AscendStoreConnector)
         connector.use_layerwise = True
+        connector._dsv4_bulk_handoff = False
         connector._mamba_copy_bufs = None
         connector._mamba_state = MagicMock()
         connector._loaded_layer = None
@@ -858,6 +880,7 @@ def _scheduler_connector(backend="mooncake", use_layerwise=False):
     connector._role = KVConnectorRole.SCHEDULER
     connector.backend_name = backend
     connector.use_layerwise = use_layerwise
+    connector._dsv4_bulk_handoff = False
     scheduler = MagicMock()
     scheduler.load_specs = {"req-a": object()}
     scheduler.sending_events = {}

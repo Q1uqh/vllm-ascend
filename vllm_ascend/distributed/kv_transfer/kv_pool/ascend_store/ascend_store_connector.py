@@ -124,25 +124,29 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         AscendStore requires PIECEWISE CUDA graph mode when layerwise
         operations are enabled.
         """
-        return extra_config.get("use_layerwise", False)
+        return extra_config.get("use_layerwise", False) and extra_config.get("layerwise_dsv4_handoff") is not True
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role
 
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        self.use_layerwise = extra_config.get("use_layerwise", False)
+        self._dsv4_bulk_handoff = extra_config.get("layerwise_dsv4_handoff") is True
+        self.use_layerwise = extra_config.get("use_layerwise", False) and not self._dsv4_bulk_handoff
+        uses_grouped_worker = self.use_layerwise or self._dsv4_bulk_handoff
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self.backend_name = extra_config.get("backend", "mooncake").lower()
-        self.backend_class = get_backend_class(self.backend_name) if self.use_layerwise else None
+        self.backend_class = get_backend_class(self.backend_name) if uses_grouped_worker else None
         self.layerwise_data_plane = self.backend_class.layerwise_data_plane if self.backend_class is not None else None
-        self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
-        if self.use_block_key_layerwise:
+        self.use_block_key_layerwise = uses_grouped_worker and self.layerwise_data_plane == "block_key"
+        if self.use_block_key_layerwise or self._dsv4_bulk_handoff:
             uses_dsv4_snapshot_protocol(vllm_config)
         self.save_decode_cache = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "save_decode_cache", False
         )
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or self.consumer_is_to_put or self.save_decode_cache
+        if self._dsv4_bulk_handoff and self.can_put:
+            raise ValueError("DSV4 H2D handoff requires a read-only Mooncake consumer")
         if (
             self.kv_role == "kv_consumer"
             and self.save_decode_cache
@@ -173,7 +177,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self._loaded_layer: int | None = None
         self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
         # Opt in only for synchronous bulk loads, not background retrieval.
-        self.requires_mamba_state_copy_after_load = not self.use_layerwise and not extra_config.get("load_async", False)
+        self.requires_mamba_state_copy_after_load = not uses_grouped_worker and not extra_config.get(
+            "load_async", False
+        )
 
         self.connector_scheduler: BaseKVPoolScheduler | None = None
         self.connector_worker: KVPoolWorker | None = None
@@ -181,15 +187,15 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None
-            self.connector_scheduler = create_kv_pool_scheduler(vllm_config, self.use_layerwise, kv_cache_config)
+            self.connector_scheduler = create_kv_pool_scheduler(vllm_config, uses_grouped_worker, kv_cache_config)
         else:
             self.connector_worker = create_kv_pool_worker(
                 vllm_config,
-                self.use_layerwise,
+                uses_grouped_worker,
                 kv_cache_config,
             )
             assert self.connector_worker is not None
-            if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
+            if not uses_grouped_worker and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
 
     def configure_dspark_prefix_cache(self, vllm_config: VllmConfig) -> bool:
@@ -358,7 +364,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         super().bind_connector_metadata(connector_metadata)
-        if self.use_layerwise:
+        if self._dsv4_bulk_handoff:
+            assert self.connector_worker is not None
+            # The runner may defer start_load_kv until after forward.
+            cast(LayerwiseKVPoolWorker, self.connector_worker).restore_dsv4_bulk(connector_metadata)
+        elif self.use_layerwise:
             assert self.connector_worker is not None
             # Layerwise hooks need this step's tasks before target forward.
             # If scheduler_output.has_sync_kv_loads is False (e.g. save-only
@@ -526,7 +536,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         if self.backend_name != "mooncake":
             return None
-        if self.use_layerwise:
+        if self.use_layerwise or self._dsv4_bulk_handoff:
             logger.error("AscendStoreConnector reset_cache does not support Mooncake layerwise.")
             return False
         assert self.connector_scheduler is not None

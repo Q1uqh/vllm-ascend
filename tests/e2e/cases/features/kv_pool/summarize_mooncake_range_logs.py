@@ -19,6 +19,7 @@ def summarize(paths: list[Path]) -> list[str]:
     byte_counts: Counter[str] = Counter()
     copied_counts: Counter[str] = Counter()
     max_fence_wait_ms = 0.0
+    max_bulk_h2d_ms = 0.0
     errors: deque[str] = deque(maxlen=120)
     config: deque[str] = deque(maxlen=60)
     failures: deque[str] = deque(maxlen=80)
@@ -50,13 +51,19 @@ def summarize(paths: list[Path]) -> list[str]:
                         failed = len(results) != len(requested) or any(
                             result != expected for result, expected in zip(results, requested)
                         )
+                    elif event == "handoff_bulk_h2d":
+                        copied = int(record["copied_bytes"])
+                        requested_bytes = copied
+                        copied_counts[direction] += copied
+                        max_bulk_h2d_ms = max(max_bulk_h2d_ms, float(record["elapsed_ms"]))
+                        failed = False
                     else:
                         if event == "overwrite_fence":
                             max_fence_wait_ms = max(max_fence_wait_ms, float(record.get("wait_ms", 0)))
                         failed = any(
                             result != 0 if event in ("commit", "snapshot_remove") else result < 0 for result in results
                         )
-                except (AttributeError, TypeError, ValueError):
+                except (AttributeError, KeyError, TypeError, ValueError):
                     malformed += 1
                     continue
                 events[event, direction] += 1
@@ -69,7 +76,7 @@ def summarize(paths: list[Path]) -> list[str]:
         f"files={len(paths)} events={sum(events.values())} malformed={malformed} "
         f"transfer_failures={failure_count} error_lines={error_count}",
         f"retained_config={len(config)} retained_errors={len(errors)} retained_transfer_failures={len(failures)} "
-        f"max_overwrite_wait_ms={max_fence_wait_ms:.3f}",
+        f"max_overwrite_wait_ms={max_fence_wait_ms:.3f} max_bulk_h2d_ms={max_bulk_h2d_ms:.3f}",
         *(f"event={event} direction={direction} count={count}" for (event, direction), count in events.most_common(20)),
         *(
             f"direction={direction} requested_bytes={total} copied_bytes={copied_counts[direction]}"

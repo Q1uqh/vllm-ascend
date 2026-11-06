@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash Mooncake KV Offload 服务器测试说明
 
-在 eager 模式的 Model Runner V2 中，Mooncake 的预填充节点（P）可以让兼容的层轮流使用同一设备缓存槽位。解码节点（D）使用驻留缓存，从 P 的最终检查点恢复。继续处理下一分块时，P 从公共键恢复已写完的历史页，并从请求专属快照恢复仍在使用的 SWA 缓存和压缩器状态。
+在 eager 模式的 Model Runner V2 中，Mooncake 的预填充节点（P）可以让兼容的层轮流使用同一设备缓存槽位。解码节点（D）使用驻留缓存，在首轮 Decode forward 前按缓存组把公共页和最终快照从 Mooncake DRAM 批量搬到本地 HBM。继续处理下一分块时，P 从公共键恢复已写完的历史页，并从请求专属快照恢复仍在使用的 SWA 缓存和压缩器状态。
 
 ## 服务器配置
 
@@ -12,7 +12,7 @@ DP 模式下，公共历史按 P 副本隔离。D 按交接元数据中的 P 副
 
 vLLM 使用 `.github/vllm-main-verified.commit` 指定的提交。Mooncake 使用支持会话与范围传输 API 以及 `batch_remove` 的 DRAM 版本。记录实际使用的版本和每个 rank 的 KV 缓存预算。
 
-单独使用 `AscendStoreConnector`。P 端关闭推测解码，并设置 `--no-async-scheduling` 和 `--no-enable-prefix-caching`。关闭本地前缀缓存后，仍可查询 Mooncake 中的公共前缀。
+P 和 D 单独使用 `AscendStoreConnector`。P 逐层保存到 Mooncake，D 按请求做 H2D 恢复。首轮部署中两端均关闭推测解码，并设置 `--no-async-scheduling` 和 `--no-enable-prefix-caching`。关闭本地前缀缓存后，仍可查询 Mooncake 中的公共前缀。
 
 ### P 端配置
 
@@ -38,13 +38,55 @@ vLLM 使用 `.github/vllm-main-verified.commit` 指定的提交。Mooncake 使�
   "kv_role": "kv_consumer",
   "kv_connector_extra_config": {
     "backend": "mooncake",
-    "use_layerwise": true,
+    "use_layerwise": false,
     "layerwise_dsv4_handoff": true
   }
 }
 ```
 
-向 P 发送请求时设置 `max_tokens=1`。将 P 返回的 `kv_transfer_params`、原始提示词 token ID 序列以及 P 采样出的第一个 token 一并传给 D。D 从 P 实际完成预填充的位置开始解码，并在读完后按后端租约规则删除私有对象，完成交接确认。
+### 单机 8 卡启动
+
+保留现有服务器脚本的网卡、HCCL、CANN 和 Mooncake 环境变量。两端的 `MOONCAKE_CONFIG_PATH` 指向各自可用的配置，连接同一个 Mooncake master，配置 `enable_ssd_offload=false`。将上面两个 JSON 分别保存为 `kv-p.json` 和 `kv-d.json`。在两个终端加载同一套环境变量，再各自执行下面对应的命令。
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=1
+export PYTHONHASHSEED=0
+local_ip="141.61.133.129"
+model="/mnt/share/weight/DeepSeek-V4-Flash-0731"
+
+common=(
+  --host "$local_ip" --served-model-name dsv4
+  --data-parallel-size 4 --data-parallel-size-local 4
+  --tensor-parallel-size 1 --enable-expert-parallel
+  --enforce-eager --no-async-scheduling --no-enable-prefix-caching
+  --no-disable-hybrid-kv-cache-manager --trust-remote-code
+  --max-model-len 1048576 --block-size 32 --kv-cache-dtype fp8
+  --attention_config.indexer_kv_dtype fp8 --tokenizer-mode deepseek_v4
+  --additional-config '{"enable_cpu_binding":true,"kv_pool_range_debug":true}'
+)
+```
+
+P 端：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 vllm serve "$model" "${common[@]}" \
+  --port 8099 --max-num-batched-tokens 8192 --max-num-seqs 16 \
+  --gpu-memory-utilization 0.90 --kv-transfer-config "$(cat kv-p.json)" \
+  2>&1 | tee v4_flash_p.log
+```
+
+D 端：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 vllm serve "$model" "${common[@]}" \
+  --port 8066 --max-num-batched-tokens 1024 --max-num-seqs 56 \
+  --gpu-memory-utilization 0.95 --kv-transfer-config "$(cat kv-d.json)" \
+  2>&1 | tee v4_flash_d.log
+```
+
+从旧脚本切换时，用上述 JSON 替换两端整段 `--kv-transfer-config`，并去掉 `--speculative-config`、D 端 `FULL_DECODE_ONLY` 和 `enable_npugraph_ex`。首次连通测试可以直接使用下面的冒烟脚本。生产请求由实际运行的代理转发时，代理需要透传快照交接参数。
+
+向 P 发送请求时设置 `max_tokens=1` 和 `return_token_ids=true`。将 P 实际处理的提示词 token ID 序列与 P 采样出的第一个 token 拼接成数组，通过 `/v1/completions` 传给 D，同时透传 P 返回的 `kv_transfer_params`。D 从 P 实际完成预填充的位置开始解码，并在读完后按后端租约规则删除私有对象，完成交接确认。
 
 为活跃快照和历史数据预留足够的 Mooncake DRAM。GET 会话保护正在读取的对象，两次读取之间的数据保留依赖可用容量。必需对象在分块之间或交接前被驱逐时，传输会报错。如果交接在 D 确认前被放弃，未确认的快照仍可由 Mooncake 驱逐。
 
@@ -56,10 +98,12 @@ vLLM 使用 `.github/vllm-main-verified.commit` 指定的提交。Mooncake 使�
 
 ```bash
 python3 tests/e2e/cases/features/kv_pool/dsv4_mooncake_temporal_smoke.py \
-  --prefill http://prefill:8000 --decode http://decode:8000 \
-  --resident http://resident:8000 --model dsv4 \
+  --prefill http://141.61.133.129:8099 --decode http://141.61.133.129:8066 \
+  --model dsv4 \
   --prompt-tokens prompts.json --output-tokens 8 --repeat 2 | tee smoke.log
 ```
+
+需要对照输出时，加上 `--resident http://resident:8000`。首次先用一条短请求检查 P、D 交接，再增加跨 chunk 输入。
 
 ## 验收项目
 
@@ -72,9 +116,9 @@ python3 tests/e2e/cases/features/kv_pool/dsv4_mooncake_temporal_smoke.py \
 
 ## 提取回传日志
 
-诊断时，在 Ascend additional config 中开启 `kv_pool_range_debug`。汇总 P 端日志、D 端日志和冒烟测试报告。脚本保留近期错误和失败传输事件，合计输出不超过 300 行。
+诊断时，在 Ascend additional config 中开启 `kv_pool_range_debug`。检查 D 的 `handoff_bulk_h2d` 和后续 `handoff_read_complete`，前者记录批量恢复的组数、键数、字节数和耗时。汇总 P 端日志、D 端日志和冒烟测试报告。脚本保留近期错误和失败传输事件，合计输出不超过 300 行。
 
 ```bash
 python3 tests/e2e/cases/features/kv_pool/summarize_mooncake_range_logs.py \
-  prefill.log decode.log smoke.log > mooncake-range-summary.txt
+  v4_flash_p.log v4_flash_d.log smoke.log > mooncake-range-summary.txt
 ```

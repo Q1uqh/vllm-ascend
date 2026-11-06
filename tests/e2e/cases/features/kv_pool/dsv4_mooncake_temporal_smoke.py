@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-"""Compare DeepSeek V4 Flash temporal P/D generation to resident generation."""
+"""Check DeepSeek V4 Flash temporal P/D handoff and optionally compare resident generation."""
 
 import argparse
 import json
@@ -40,14 +40,14 @@ def complete(url, model, prompt, count, timeout, transfer=None):
     logprobs = choice["logprobs"]["token_logprobs"]
     if len(tokens) != count or len(logprobs) != count or not all(math.isfinite(value) for value in logprobs):
         raise ValueError("Unexpected output length or nonfinite sampled logprobs")
-    return tokens, result.get("kv_transfer_params"), elapsed
+    return tokens, result.get("kv_transfer_params"), elapsed, choice.get("prompt_token_ids")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prefill", required=True)
     parser.add_argument("--decode", required=True)
-    parser.add_argument("--resident", required=True)
+    parser.add_argument("--resident")
     parser.add_argument("--model", required=True)
     parser.add_argument("--prompt-tokens", required=True, type=Path, help="JSON array of token ID arrays")
     parser.add_argument("--output-tokens", type=int, default=8)
@@ -68,24 +68,31 @@ def main():
         parser.error("--prompt-tokens must contain nonempty arrays of nonnegative integer token IDs")
 
     for index, prompt in enumerate(prompts):
-        expected, _, _ = complete(args.resident, args.model, prompt, args.output_tokens, args.timeout)
+        expected = None
+        if args.resident:
+            expected, _, _, _ = complete(args.resident, args.model, prompt, args.output_tokens, args.timeout)
         for attempt in range(args.repeat):
-            first, transfer, prefill_s = complete(args.prefill, args.model, prompt, 1, args.timeout)
-            if not transfer or transfer[_HANDOFF]["end_token"] != len(prompt):
+            first, transfer, prefill_s, processed_prompt = complete(args.prefill, args.model, prompt, 1, args.timeout)
+            if (
+                not processed_prompt
+                or not transfer
+                or transfer.get(_HANDOFF, {}).get("end_token") != len(processed_prompt)
+            ):
                 raise RuntimeError(f"Prefill response has no matching snapshot for prompt {index}")
-            rest, _, decode_s = complete(
+            rest, _, decode_s, _ = complete(
                 args.decode,
                 args.model,
-                prompt + first,
+                processed_prompt + first,
                 args.output_tokens - 1,
                 args.timeout,
                 transfer=transfer,
             )
-            if first + rest != expected:
+            if expected is not None and first + rest != expected:
                 raise AssertionError(f"Resident/P-D token IDs differ for prompt {index}, attempt {attempt}")
             print(
-                f"DSV4_ACCEPT prompt={index} tokens={len(prompt)} attempt={attempt} "
-                f"prefill_s={prefill_s:.3f} decode_s={decode_s:.3f} result=pass",
+                f"DSV4_ACCEPT prompt={index} tokens={len(processed_prompt)} attempt={attempt} "
+                f"prefill_s={prefill_s:.3f} decode_s={decode_s:.3f} "
+                f"resident_compared={expected is not None} result=pass",
                 flush=True,
             )
 

@@ -803,6 +803,40 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                     private_pages=[len(pages) for pages in snapshot.private_pages],
                 )
 
+    def restore_dsv4_bulk(self, metadata: AscendConnectorMetadata) -> None:
+        """Restore D's resident cache before any attention layer runs."""
+        if not metadata.requests:
+            return
+        assert isinstance(self.kv_recv_thread, KVCacheStoreLayerRecvingThread)
+        begin = time.monotonic()
+        try:
+            self.prepare_layerwise_step(metadata)
+            self._check_hybrid_load_errors()
+            groups: dict[int, list[LayerTransferTask]] = {}
+            for layer_tasks in self.layer_load_tasks:
+                for task in layer_tasks:
+                    groups.setdefault(task.group_id, []).append(task)
+            key_count = copied_bytes = 0
+            for tasks in groups.values():
+                keys, size = self.kv_recv_thread.restore_bulk_group(tasks)
+                key_count += keys
+                copied_bytes += size
+            if groups:
+                emit_dsv4_transfer_event(
+                    "handoff_bulk_h2d",
+                    direction="h2d",
+                    groups=len(groups),
+                    key_count=key_count,
+                    copied_bytes=copied_bytes,
+                    elapsed_ms=round((time.monotonic() - begin) * 1000, 3),
+                )
+        except Exception:
+            self._layer_load_aborted.set()
+            logger.exception("DSV4 bulk H2D restore failed before forward")
+            raise
+        finally:
+            self._finish_current_layerwise_load_sessions()
+
     def _is_layerwise_save_leader(self) -> bool:
         """Exactly one rank per (pcp, dcp, head_or_tp) group saves/allocates.
 
