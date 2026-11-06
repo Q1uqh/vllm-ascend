@@ -1190,6 +1190,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         invalid_block_ids_lock: threading.Lock | None = None,
         load_abort_event: threading.Event | None = None,
         raise_on_transfer_failure: bool = True,
+        trace_slot_reuse: bool = False,
     ):
         super().__init__(
             m_store,
@@ -1212,6 +1213,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.external_slot_release_waiter = external_slot_release_waiter
         self.save_failure_checker = save_failure_checker
         self.raise_on_transfer_failure = raise_on_transfer_failure
+        self._traced_slot_edges: set[tuple[str, int, int]] | None = set() if trace_slot_reuse else None
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
         self._load_abort_event = load_abort_event or threading.Event()
@@ -1350,6 +1352,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self.set_finished_request(req_id)
             self._active_load_indices = None
 
+    def _trace_completed_slot_fence(self, path: str, predecessor: int, layer_id: int) -> None:
+        edges = self._traced_slot_edges
+        if edges is None:
+            return
+        edge = (path, predecessor, layer_id)
+        if edge not in edges:
+            edges.add(edge)
+            logger.info(
+                "DSV4_SLOT_REUSE path=%s predecessor=%d layer_id=%d",
+                path,
+                predecessor,
+                layer_id,
+            )
+
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
         try:
@@ -1368,6 +1384,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self.save_failure_checker()
                 self.sync_save_events[wait_for_save].synchronize()
                 self.layer_save_finished_events[wait_for_save].clear()
+                self._trace_completed_slot_fence("range", wait_for_save, layer_id)
                 emit_dsv4_transfer_event(
                     "overwrite_fence",
                     layer_id=layer_id,
@@ -1456,6 +1473,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.sync_save_events[wait_for_save].synchronize()
             logger.debug("Layer save event cleared: layer %d", wait_for_save)
             self.layer_save_finished_events[wait_for_save].clear()
+            self._trace_completed_slot_fence("gva", wait_for_save, layer_id)
 
         if self.load_disabled.is_set():
             if self.external_slot_release_waiter is not None:
