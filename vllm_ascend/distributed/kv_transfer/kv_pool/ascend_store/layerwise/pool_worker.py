@@ -22,7 +22,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
-from vllm_ascend.distributed.kv_transfer.kv_diagnostics import emit_kv_lifecycle
+from vllm_ascend.distributed.kv_transfer.kv_diagnostics import emit_kv_lifecycle, kv_trace_enabled, trace_requests
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
@@ -2229,7 +2229,44 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             num_local = self.num_layers
         self._wait_for_final_layer_save(num_local, self.kv_send_thread)
 
+    def _prepare_trace_contexts(self, requests):
+        self._trace_contexts = {}
+        if not kv_trace_enabled():
+            return
+        step = getattr(self, "_trace_step", 0) + 1
+        self._trace_step = step
+        groups = {
+            name: group for group, item in enumerate(self.kv_cache_config.kv_cache_groups) for name in item.layer_names
+        }
+        records = trace_requests(requests)
+        for layer in range(self.num_layers):
+            slots = []
+            for name, caches in self.kv_caches.items():
+                physical = self._extract_physical_layer_index(name)
+                if self._global_to_local_layer.get(physical, physical) != layer:
+                    continue
+                for view, cache in enumerate(self._as_cache_tuple(caches)):
+                    group = groups[name]
+                    slots.append(
+                        dict(
+                            component=name,
+                            view=view,
+                            group=group,
+                            address=cache.data_ptr(),
+                            slot=f"{group}:{cache.data_ptr()}",
+                            stride_bytes=cache.stride(0) * cache.element_size(),
+                            device=str(cache.device),
+                            dtype=str(cache.dtype),
+                        )
+                    )
+            self._trace_contexts[layer] = dict(step=step, requests=records, slots=slots)
+
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
+        try:
+            self._prepare_trace_contexts(requests)
+        except Exception as error:
+            self._trace_contexts = {}
+            emit_kv_lifecycle("trace_error", detail=str(error), phase="capture_store_context")
         self._masked_runs_cache.clear()
         # Keep this method safe for direct callers as well as metadata binding.
         # Worker threads may still own the lists from the preceding step.
@@ -2342,6 +2379,11 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             task.final_group_layer = True
         self._build_shared_save_data()
         self._build_shared_load_data()
+        for layer in range(num_layers):
+            if layer in getattr(self, "_trace_contexts", {}):
+                self._trace_contexts[layer]["has_load"] = bool(self.layer_load_tasks[layer])
+            for task in self.layer_save_tasks[layer] + self.layer_load_tasks[layer]:
+                task.trace_context = getattr(self, "_trace_contexts", {}).get(layer)
 
     def _submit_attention_save(self, layer_id: int) -> None:
         """Start current-layer put only once KV is ready at attention entry."""
@@ -2440,6 +2482,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
+                    trace_context=getattr(self, "_trace_contexts", {}).get(layer_id),
                 )
             )
             return True
@@ -2516,7 +2559,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             if getattr(self, "use_block_key_layerwise", False):
                 self._finish_current_layerwise_load_sessions()
             raise
-        emit_kv_lifecycle("compute_ready", layer_id=self.current_layer)
+        context = getattr(self, "_trace_contexts", {}).get(self.current_layer) or {}
+        if not should_wait:
+            emit_kv_lifecycle("overwrite_begin", layer_id=self.current_layer, predecessor=None, **context)
+        emit_kv_lifecycle("compute_ready", layer_id=self.current_layer, **context)
         # KVPP can observe completion after attention; reset at the next bind.
         if not self.use_kvpp:
             self.layer_load_finished_events[self.current_layer].clear()
@@ -2549,6 +2595,11 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         send_thread.raise_if_failed()
         if self.current_layer not in self._attention_saved_layers:
             self.sync_save_events[self.current_layer].record()
+            emit_kv_lifecycle(
+                "device_event_recorded",
+                layer_id=self.current_layer,
+                **(getattr(self, "_trace_contexts", {}).get(self.current_layer) or {}),
+            )
             if self.layer_save_tasks[self.current_layer]:
                 for task in self.layer_save_tasks[self.current_layer]:
                     for block_range in task.block_ranges:

@@ -55,7 +55,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.distributed.kv_transfer.kv_diagnostics import emit_kv_lifecycle
+from vllm_ascend.distributed.kv_transfer.kv_diagnostics import emit_kv_lifecycle, kv_trace_enabled, trace_requests
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
@@ -146,6 +146,7 @@ class SendTask:
     layer_idx: int = 0
     layer_name: str = ""
     layer_names: list[str] = field(default_factory=list)
+    trace_context: dict[str, Any] | None = None
     failed_requests: dict[str, ReqMeta] = field(default_factory=dict)
     # trans block info
     group_rearrange_block_ids: list[list[int]] | None = None
@@ -548,6 +549,32 @@ class KVCacheSendingLayerThread(threading.Thread):
                     layer_name,
                     self.layer_metadata[layer_name].tensor_group_idx[0],
                 )
+                if kv_trace_enabled():
+                    local = self.layer_metadata[layer_name]
+                    remote = req_meta.remote_layer_metadata[layer_name]
+                    group = local.tensor_group_idx[0]
+                    emit_kv_lifecycle(
+                        "pd_component_plan",
+                        layer_id=send_task.layer_idx,
+                        request=req_id,
+                        endpoint=req_meta.local_computed_tokens,
+                        component=layer_name,
+                        group=group,
+                        destination_session=session_id,
+                        source_bases=local.kv_caches_base_addr,
+                        destination_bases=remote.kv_caches_base_addr,
+                        source_strides=local.block_stride,
+                        destination_strides=remote.block_stride,
+                        source_blocks=len(req_meta.local_block_ids[group]),
+                        destination_blocks=len(req_meta.remote_block_ids[group]),
+                        ranges=len(src_list),
+                        bytes=sum(length_list),
+                        source_sample=src_list[:4],
+                        destination_sample=dst_list[:4],
+                        transport="TransferEngine.batch_transfer_sync_write",
+                        address_evidence="registered_cache_views",
+                        device_d2d="UNVERIFIED",
+                    )
                 session_meta[session_id].src.extend(src_list)
                 session_meta[session_id].dst.extend(dst_list)
                 session_meta[session_id].length.extend(length_list)
@@ -576,7 +603,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                 emit_kv_lifecycle(
                     "pd_write",
                     layer_id=send_task.layer_idx,
-                    requests=transfer_meta.req_ids,
+                    request_ids=transfer_meta.req_ids,
+                    trace_context=getattr(send_task, "trace_context", None),
+                    transport="TransferEngine.batch_transfer_sync_write",
+                    destination_session=session_id,
+                    device_d2d="UNVERIFIED",
+                    elapsed_ms=(time.perf_counter() - req_start_time) * 1000,
                     ranges=len(transfer_meta.src),
                     bytes=sum(transfer_meta.length),
                     source=transfer_meta.src[:4],
@@ -1372,7 +1404,11 @@ class MooncakeLayerwiseConnectorWorker:
         if layer_idx in self._pending_reuse_layers:
             return
         self._pending_reuse_layers.add(layer_idx)
-        emit_kv_lifecycle("pd_reader_start", layer_id=layer_idx, slots=self.layer_storage_slots[layer_idx])
+        emit_kv_lifecycle(
+            "pd_reader_start",
+            layer_id=layer_idx,
+            **getattr(self, "_pd_trace_contexts", {}).get(layer_idx, dict(slots=self.layer_storage_slots[layer_idx])),
+        )
         for slot_id in self.layer_storage_slots[layer_idx]:
             self._storage_send_errors.pop(slot_id, None)
             self.storage_send_done_events[slot_id].clear()
@@ -1381,7 +1417,10 @@ class MooncakeLayerwiseConnectorWorker:
         if layer_idx not in self._pending_reuse_layers:
             return
         self._pending_reuse_layers.remove(layer_idx)
-        emit_kv_lifecycle("pd_reader_done", layer_id=layer_idx, slots=self.layer_storage_slots[layer_idx], error=error)
+        context = getattr(self, "_pd_trace_contexts", {}).pop(
+            layer_idx, dict(slots=self.layer_storage_slots[layer_idx])
+        )
+        emit_kv_lifecycle("pd_reader_done", layer_id=layer_idx, error=error, **context)
         for slot_id in self.layer_storage_slots[layer_idx]:
             if error is not None:
                 self._storage_send_errors[slot_id] = error
@@ -1575,10 +1614,24 @@ class MooncakeLayerwiseConnectorWorker:
             self.total_layers = max(self.total_layers, max(self.index_to_name) + 1)
 
         self._init_layerwise_reuse_state()
+        self._pd_trace_devices = (
+            {
+                name: [str(view.device) for view in (caches if isinstance(caches, (tuple, list)) else [caches])]
+                for name, caches in kv_caches.items()
+            }
+            if kv_trace_enabled()
+            else {}
+        )
         for name, metadata in self.layer_metadata.items():
             emit_kv_lifecycle(
                 "pd_layout",
                 component=name,
+                te_host=self.side_channel_host,
+                te_rpc_port=self.te_rpc_port,
+                engine_id=self.engine_id,
+                role=self.vllm_config.kv_transfer_config.kv_role,
+                num_blocks=self.kv_cache_config.num_blocks,
+                devices=self._pd_trace_devices.get(name, []),
                 groups=metadata.tensor_group_idx,
                 address=metadata.kv_caches_base_addr,
                 stride=metadata.block_stride,
@@ -2131,6 +2184,26 @@ class MooncakeLayerwiseConnectorWorker:
                 len(req_meta.local_block_ids) > layer_group_idx and bool(req_meta.local_block_ids[layer_group_idx])
                 for req_meta in connector_metadata.requests.values()
             )
+            if kv_trace_enabled():
+                trace_slots = [
+                    dict(
+                        component=name,
+                        view=view,
+                        group=group,
+                        address=address,
+                        slot=f"{group}:{address}",
+                        device=self._pd_trace_devices[name][view],
+                    )
+                    for name in layer_names
+                    for view, (group, address) in enumerate(
+                        zip(self.layer_metadata[name].tensor_group_idx, self.layer_metadata[name].kv_caches_base_addr)
+                    )
+                ]
+                context = dict(requests=trace_requests(layer_send_task.send_request), slots=trace_slots)
+                layer_send_task.trace_context = context
+                if not hasattr(self, "_pd_trace_contexts"):
+                    self._pd_trace_contexts = {}
+                self._pd_trace_contexts[self.current_layer] = context
             if needs_reuse_gate:
                 # This must happen before AscendStore publishes StoreSaveDone.
                 # Otherwise its receiver may consume the previous set state

@@ -956,6 +956,8 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
 
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
         layer_id = transfer_tasks[0].layer_id
+        context = getattr(transfer_tasks[0], "trace_context", None) or {}
+        emit_kv_lifecycle("store_source_start", layer_id=layer_id, **context)
         try:
             for task in transfer_tasks:
                 shared = task.shared_block_data
@@ -975,6 +977,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                     self.dec_stored_request(req_id)
                     if self.try_finish_and_delete_stored_request(req_id):
                         self.set_finished_request(req_id)
+            emit_kv_lifecycle("store_source_done", layer_id=layer_id, **context)
         except Exception as exc:
             self._fatal_error = exc
             # All started objects belong to the failed forward step, including
@@ -1238,14 +1241,18 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
+        context = getattr(data, "trace_context", None) or {}
         try:
             wait_for_save = data.wait_for_save_layer
+            wait_started = time.monotonic_ns()
+            emit_kv_lifecycle("overwrite_wait_start", layer_id=layer_id, predecessor=wait_for_save, **context)
             if wait_for_save is not None:
                 if not self._wait_for_event(self.layer_save_finished_events[wait_for_save], self.save_failure_checker):
                     return
                 if self.save_failure_checker is not None:
                     self.save_failure_checker()
                 self.sync_save_events[wait_for_save].synchronize()
+                emit_kv_lifecycle("predecessor_device_done", layer_id=layer_id, predecessor=wait_for_save, **context)
                 self.layer_save_finished_events[wait_for_save].clear()
 
             if data.attention_start_gate is not None:
@@ -1253,7 +1260,14 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     return
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
-            emit_kv_lifecycle("reuse_ready", layer_id=layer_id, predecessor=wait_for_save)
+            emit_kv_lifecycle(
+                "reuse_ready",
+                layer_id=layer_id,
+                predecessor=wait_for_save,
+                wait_ns=time.monotonic_ns() - wait_started,
+                **context,
+            )
+            emit_kv_lifecycle("overwrite_begin", layer_id=layer_id, predecessor=wait_for_save, **context)
             for task in data.transfer_tasks:
                 shared = task.shared_block_data
                 if shared is None:
@@ -1264,8 +1278,20 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
                 req_meta.layer_id = layer_id
                 self._active_load_indices = self._group_load_indices.get(task.group_id)
+                emit_kv_lifecycle(
+                    "load_group_start",
+                    layer_id=layer_id,
+                    group=task.group_id,
+                    keys=len(req_meta.keys),
+                    bytes=sum(sum(x) for x in req_meta.all_sizes),
+                    **context,
+                )
                 self._handle_range_request(req_meta, shared)
+                emit_kv_lifecycle(
+                    "load_group_done", layer_id=layer_id, group=task.group_id, keys=len(req_meta.keys), **context
+                )
                 self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices
+            emit_kv_lifecycle("load_done", layer_id=layer_id, **context)
         except Exception as exc:
             self._fatal_error = exc
             if self._active_load_indices is not None:

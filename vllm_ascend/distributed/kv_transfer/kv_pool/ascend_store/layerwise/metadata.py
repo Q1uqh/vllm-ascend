@@ -170,6 +170,7 @@ class LayerTransferTask:
     use_key_major_ranges: bool = False
     # Group-local completion differs from the physical model layer boundary.
     final_group_layer: bool = False
+    trace_context: dict[str, Any] | None = None
 
 
 @dataclass
@@ -178,6 +179,7 @@ class LayerLoadTask:
     transfer_tasks: list[LayerTransferTask]
     layer_id: int
     attention_start_gate: AttentionComputeStartGate | None = None
+    trace_context: dict[str, Any] | None = None
 
 
 @dataclass(init=False)

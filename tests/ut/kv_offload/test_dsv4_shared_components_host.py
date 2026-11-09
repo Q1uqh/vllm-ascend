@@ -19,6 +19,7 @@ import math
 import re
 import sys
 import threading
+import time
 import types
 import unittest
 from collections import defaultdict
@@ -66,6 +67,8 @@ class Recurrent:
 
 def definitions(relative, namespace, names=None):
     namespace.setdefault("emit_kv_lifecycle", lambda *args, **kwargs: None)
+    namespace.setdefault("kv_trace_enabled", lambda: False)
+    namespace.setdefault("trace_requests", lambda requests: [])
     path = ROOT / relative
     tree = ast.parse(path.read_text())
     tree.body = [
@@ -368,7 +371,9 @@ class TestSchedulerContracts(unittest.TestCase):
 class TestOverwriteFence(unittest.TestCase):
     def test_range_load_waits_for_store_device_and_pd_even_without_get(self):
         ns = definitions(
-            STORE + "layerwise/kv_transfer.py", dict(KVTransferThread=object), {"KVCacheStoreLayerRecvingThread"}
+            STORE + "layerwise/kv_transfer.py",
+            dict(KVTransferThread=object, time=time),
+            {"KVCacheStoreLayerRecvingThread"},
         )
         copied = threading.Event()
         pd_finished = threading.Event()
