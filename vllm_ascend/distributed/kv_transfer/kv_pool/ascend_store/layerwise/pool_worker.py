@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend.distributed.kv_transfer.kv_diagnostics import emit_kv_lifecycle
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
@@ -627,6 +628,17 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self._register_dspark_prefix_cache(draft_caches)
         auxiliary_caches = draft_caches if getattr(self, "dspark_prefix_cache", None) is not None else None
         self._register_kv_caches(target_caches, auxiliary_caches, draft_names)
+        for name, caches in target_caches.items():
+            for component, cache in enumerate(self._as_cache_tuple(caches)):
+                emit_kv_lifecycle(
+                    "layout",
+                    component=name,
+                    view=component,
+                    address=cache.data_ptr(),
+                    shape=list(cache.shape),
+                    stride=list(cache.stride()),
+                    dtype=str(cache.dtype),
+                )
 
     def _register_dspark_prefix_cache(self, draft_caches: dict[str, torch.Tensor]) -> None:
         prefix_keys: DSparkPrefixKeys | None = getattr(self, "_dspark_prefix_keys", None)
@@ -2504,6 +2516,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             if getattr(self, "use_block_key_layerwise", False):
                 self._finish_current_layerwise_load_sessions()
             raise
+        emit_kv_lifecycle("compute_ready", layer_id=self.current_layer)
         # KVPP can observe completion after attention; reset at the next bind.
         if not self.use_kvpp:
             self.layer_load_finished_events[self.current_layer].clear()

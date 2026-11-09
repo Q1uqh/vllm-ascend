@@ -32,7 +32,17 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
     def _build_req_meta(self, request_tracker: RequestTracker, *args, **kwargs):
         if self.layerwise_offload and request_tracker.layerwise_request_id is None:
             request_tracker.layerwise_request_id = uuid4().hex
-        return super()._build_req_meta(request_tracker, *args, **kwargs)
+        result = super()._build_req_meta(request_tracker, *args, **kwargs)
+        if (
+            result is not None
+            and result.can_save
+            and self.layerwise_offload
+            and getattr(self.kv_cache_config, "layerwise_component_namespace", "")
+        ):
+            # Mutable window state has an exact snapshot even at a fully
+            # hashed chunk boundary. Other groups still load public full pages.
+            request_tracker.last_layerwise_snapshot_end_token = result.target_token_len
+        return result
 
     def __init__(
         self,

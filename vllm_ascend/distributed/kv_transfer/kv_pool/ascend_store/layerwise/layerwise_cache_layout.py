@@ -116,6 +116,9 @@ class LayerwiseCacheTopology:
     group_ids: tuple[tuple[str, int], ...]
     draft_layer_names: tuple[str, ...] = ()
     resident_layer_names: tuple[str, ...] = ()
+    # Complete component vectors share one temporal assignment and fence.
+    component_domains: tuple[tuple[int, ...], ...] = ()
+    shared_backing: bool = False
 
 
 @dataclass(frozen=True)
@@ -168,8 +171,9 @@ def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None
             role = connector_config.get("kv_role", getattr(kv_transfer_config, "kv_role", None))
             if role != "kv_producer":
                 raise ValueError("Mooncake shared KV buffers require kv_role=kv_producer")
-            if any(child is not connector_config for child in connector_configs):
-                raise ValueError("Mooncake shared KV buffers require a standalone Store connector")
+            siblings = [child for child in connector_configs if child is not connector_config]
+            if any(child.get("kv_connector") != "MooncakeLayerwiseConnector" for child in siblings):
+                raise ValueError("Mooncake shared KV buffers require a standalone Store connector or layerwise PD")
         elif backend_class.layerwise_data_plane != "gva":
             continue
         if extra_config.get("use_layerwise", False):
@@ -301,7 +305,7 @@ def build_layerwise_reuse_layout(
     for physical_layer, named_specs in named_specs_by_layer.items():
         if declared_main_names is not None:
             main_specs = [spec for spec in named_specs if spec.layer_name in declared_main_names]
-            if len(main_specs) != 1:
+            if len(main_specs) != 1 and not topology.component_domains:
                 raise NotImplementedError("Main-pack reuse requires exactly one reusable main cache per physical layer")
             main_spec = main_specs[0]
             layer_cache_specs[physical_layer] = LayerwiseLayerCacheSpecs(
@@ -330,7 +334,33 @@ def build_layerwise_reuse_layout(
             extra_main_specs=extra_specs,
         )
 
-    if topology is None:
+    if topology is not None and topology.component_domains:
+        domain_layers = [layer for domain in topology.component_domains for layer in domain]
+        if (
+            len(domain_layers) != len(set(domain_layers))
+            or set(domain_layers) != set(physical_layers)
+            or any(tuple(sorted(domain)) != domain for domain in topology.component_domains)
+        ):
+            raise ValueError("Component domains must cover every target layer")
+        buffer_slots = [(layer,) for layer in independent_layers]
+        prefetch_layer_map = {}
+        for domain in topology.component_domains:
+            members = [layer for layer in domain if layer not in independent_layer_set]
+            for index in range(min(base_layout.num_shared_buffers, len(members))):
+                slot = tuple(members[index :: base_layout.num_shared_buffers])
+                # Prove that every component has the same predecessor. A
+                # partial match would leave auxiliary writers unprotected.
+                reference = layer_cache_specs[slot[0]]
+                reference_specs = (reference.main, *reference.extra_main_specs)
+                groups = dict(topology.group_ids)
+                signature = [(groups[item.layer_name], item.spec) for item in reference_specs]
+                for layer in slot[1:]:
+                    item = layer_cache_specs[layer]
+                    if [(groups[x.layer_name], x.spec) for x in (item.main, *item.extra_main_specs)] != signature:
+                        raise ValueError("Component-domain owners must have identical group/spec vectors")
+                buffer_slots.append(slot)
+                prefetch_layer_map.update(zip(slot[1:], slot))
+    elif topology is None:
         signature_buckets: list[tuple[KVCacheSpec, list[int]]] = []
         for physical_layer in physical_layers:
             if physical_layer in independent_layer_set:
@@ -563,6 +593,63 @@ def apply_layerwise_kv_cache_plan(
         raise ValueError("Layerwise KV cache descriptors must cover every cache spec.")
 
     new_tensors: list[KVCacheTensor] = []
+    if topology is not None and topology.component_domains:
+        # Assign disjoint regions within each group; groups overlay the same
+        # backing because the scheduler gives them globally exclusive IDs.
+        group_ids = dict(topology.group_ids)
+        counts: dict[tuple[int, int], int] = {}
+        regions = []
+        for slot in reuse_layout.buffer_slots:
+            vectors = [
+                named_specs
+                for layer in slot
+                for named_specs in [
+                    (
+                        reuse_layout.layer_cache_specs[layer].main,
+                        *reuse_layout.layer_cache_specs[layer].extra_main_specs,
+                    )
+                ]
+            ]
+            for components in zip(*vectors):
+                name = components[0].layer_name
+                page = page_sizes_by_name[name]
+                key = (group_ids[name], page)
+                position = counts.get(key, 0)
+                counts[key] = position + 1
+                regions.append((tuple(x.layer_name for x in components), page, position))
+        for name in sorted(excluded_layer_names):
+            page = page_sizes_by_name[name]
+            key = (group_ids[name], page)
+            position = counts.get(key, 0)
+            counts[key] = position + 1
+            regions.append(((name,), page, position))
+        offsets = {}
+        size = 0
+        for page in sorted({page for _, page in counts}):
+            offsets[page] = size
+            size += page * kv_cache_config.num_blocks * max(n for (_, p), n in counts.items() if p == page)
+        for names, page, position in regions:
+            new_tensors.append(
+                KVCacheTensor(
+                    size=size,
+                    layers=list(names),
+                    offset=offsets[page] + position * page * kv_cache_config.num_blocks,
+                    layer_stride=0,
+                    block_stride=page,
+                )
+            )
+        kv_cache_config.kv_cache_tensors = new_tensors
+        kv_cache_config.layerwise_kv_cache_reuse = True
+        kv_cache_config.layerwise_kv_cache_scratch = True
+        kv_cache_config.kv_cache_shared_backing = True
+        logger.info(
+            "Layerwise component plan bytes=%d blocks=%d slots=%s predecessors=%s",
+            size,
+            kv_cache_config.num_blocks,
+            reuse_layout.buffer_slots,
+            reuse_layout.prefetch_layer_map,
+        )
+        return
     if topology is not None:
         ring_names = {
             reuse_layout.layer_cache_specs[layer].main.layer_name

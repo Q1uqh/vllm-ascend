@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import threading
 import time
 from collections import defaultdict
@@ -13,6 +12,7 @@ import torch
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.kv_transfer.kv_diagnostics import emit_kv_lifecycle
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import (
     Backend,
     require_aligned_batch_results,
@@ -65,7 +65,7 @@ def _emit_range_debug_event(
         if not get_ascend_config().kv_pool_range_debug:
             return
         payload = _build_range_debug_payload(direction, layer_id, sizes, object_offsets, results)
-        logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
+        emit_kv_lifecycle(**payload)
     except Exception:
         # Debug instrumentation must never affect the transfer path.
         pass
@@ -81,7 +81,7 @@ def _emit_commit_debug_event(layer_id: int, key_count: int, results: list[int]) 
             "key_count": int(key_count),
             "results": [int(result) for result in results],
         }
-        logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
+        emit_kv_lifecycle(**payload)
     except Exception:
         pass
 
@@ -1253,6 +1253,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     return
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
+            emit_kv_lifecycle("reuse_ready", layer_id=layer_id, predecessor=wait_for_save)
             for task in data.transfer_tasks:
                 shared = task.shared_block_data
                 if shared is None:

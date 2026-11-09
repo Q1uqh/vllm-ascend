@@ -4,10 +4,9 @@
 import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Self
 
 import torch
-from typing_extensions import Self
 from vllm.config import CacheConfig, VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
@@ -377,6 +376,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     compress_ratio: int = 1
     model_version: str | None = None
     indexes_kv_by_block_stride: bool = False
+    offload_mutable: bool = False
     bounded_replay: bool = False
 
     @property
@@ -404,6 +404,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
             "All attention layers in the same KV cache group must be AscendSlidingWindowMLASpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        mutable_set = {spec.offload_mutable for spec in specs}
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
@@ -417,7 +418,8 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         extra_retained_set = set(getattr(spec, "extra_retained_tokens", None) for spec in specs)
         bounded_replay_set = set(getattr(spec, "bounded_replay", None) for spec in specs)
         assert (
-            len(cache_dtype_str_set) == 1
+            len(mutable_set) == 1
+            and len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
@@ -442,6 +444,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
+            offload_mutable=mutable_set.pop(),
             model_version=model_version_set.pop(),
             **carried_kwargs,
         )

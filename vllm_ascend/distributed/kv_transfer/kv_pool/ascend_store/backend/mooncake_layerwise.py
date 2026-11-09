@@ -65,6 +65,20 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
     kvpp_namespace = (
         f"kvpp-tp{parallel.tensor_parallel_size}-pcp{parallel.prefill_context_parallel_size}" if kvpp_size > 1 else ""
     )
+    components = getattr(kv_cache_config, "layerwise_component_namespace", "")
+    if components:
+        model = vllm_config.model_config
+        identity = (
+            components,
+            model.compute_hash(),
+            getattr(model, "revision", None),
+            vllm_config.cache_config.cache_dtype,
+            parallel.tensor_parallel_size,
+            parallel.prefill_context_parallel_size,
+            parallel.decode_context_parallel_size,
+            kvpp_namespace,
+        )
+        return "mooncake_components_v1:" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     if parallel.pipeline_parallel_size == 1:
         # Owner-only objects have different sizes and layer offsets from the
         # ordinary replicated layout, even with the same model and TP size.

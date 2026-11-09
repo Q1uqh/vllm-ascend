@@ -12,6 +12,7 @@ from __future__ import annotations
 from copy import copy
 from typing import TYPE_CHECKING
 
+from vllm_ascend.distributed.kv_transfer.kv_diagnostics import emit_kv_lifecycle
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import require_aligned_batch_results
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import get_partial_block_index
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -29,6 +30,25 @@ def snapshot_key(worker: LayerwiseKVPoolWorker, request: ReqMeta, group: int, in
     if not incarnation:
         raise ValueError("Mooncake offload snapshots require a scheduler-assigned request incarnation")
     return worker._make_layerwise_full_key(group, f"offload_v1:{incarnation}:{endpoint}:{index}")
+
+
+def _group_specs(worker, group):
+    spec = worker.kv_cache_config.kv_cache_groups[group].kv_cache_spec
+    return tuple(spec.kv_cache_specs.values()) if hasattr(spec, "kv_cache_specs") else (spec,)
+
+
+def _active_start(worker, group, endpoint):
+    """Logical page containing the earliest token needed for continuation."""
+    specs = _group_specs(worker, group)
+    windows = [getattr(spec, "sliding_window", None) for spec in specs]
+    if not windows or any(window is None for window in windows):
+        return 0
+    retained = max(window + (getattr(spec, "extra_retained_tokens", 0) or 0) for spec, window in zip(specs, windows))
+    return max(0, endpoint - retained) // worker.grouped_block_size[group]
+
+
+def _mutable_group(worker, group):
+    return any(getattr(spec, "offload_mutable", False) for spec in _group_specs(worker, group))
 
 
 def _load_entries(worker, request, group, hashes, mask):
@@ -62,12 +82,17 @@ def _load_entries(worker, request, group, hashes, mask):
         return [(worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index])), index)]
     snapshot_start = worker._layerwise_load_snapshot_start(request, group, tokens)
     entries = []
-    for index in range(end):
+    mutable = _mutable_group(worker, group)
+    for index in range(_active_start(worker, group, tokens), end):
         if mask is not None and index < len(mask) and not mask[index]:
             continue
         if recurrent and ids[index] == 0:
             raise ValueError("Mooncake offload restore selected a null recurrent checkpoint")
-        if snapshot_start is not None and index >= snapshot_start:
+        if mutable and spec.layerwise_previous_step:
+            if spec.layerwise_snapshot_end_token != tokens:
+                raise ValueError("Mutable cache restore requires the exact previous endpoint")
+            key = snapshot_key(worker, request, group, index, tokens)
+        elif snapshot_start is not None and index >= snapshot_start:
             key = snapshot_key(worker, request, group, index, spec.layerwise_snapshot_end_token)
         elif index < min(tokens // size, len(hashes)):
             key = worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
@@ -97,7 +122,13 @@ def _save_entries(worker, request, view, group, hashes):
         ):
             partial = (request.target_token_len - 1) // size
     end = worker._layerwise_save_full_end(request, group, size, partial)
+    mutable = _mutable_group(worker, group)
     start = min(request.save_start_token // size, end)
+    if mutable:
+        start = min(_active_start(worker, group, request.target_token_len), end)
+    else:
+        start = max(start, min(_active_start(worker, group, request.target_token_len), end))
+    view.save_start_token = start * size
     view.save_key_block_offset = start
     view.save_block_keys = [None] * (end - start)
     view.partial_block_index = partial
@@ -113,7 +144,7 @@ def _save_entries(worker, request, view, group, hashes):
             continue
         key = (
             worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
-            if index < len(hashes)
+            if index < len(hashes) and not mutable
             else snapshot_key(worker, request, group, index, request.target_token_len)
         )
         entries.append((key, index - start))
@@ -183,6 +214,18 @@ def prepare_offload_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMe
             put_slots.extend(
                 (view, key, slot, sum(worker.group_block_len[group]))
                 for key, slot in _save_entries(worker, request, view, group, hashes)
+            )
+            emit_kv_lifecycle(
+                "snapshot_plan",
+                request=request.req_id,
+                incarnation=request.layerwise_request_id,
+                group=group,
+                restore_endpoint=cached,
+                endpoint=request.target_token_len,
+                load_pages=[index for _, index in entries],
+                save_start=view.save_key_block_offset,
+                save_pages=len(view.save_block_keys),
+                partial=view.partial_block_index,
             )
             groups[group].append(view)
     try:

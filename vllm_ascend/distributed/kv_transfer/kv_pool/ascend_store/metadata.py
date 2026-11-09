@@ -1270,3 +1270,16 @@ class AscendStoreKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
             else:
                 merged[event_id] = merged[event_id] + other.completed_events[event_id]
         return AscendStoreKVConnectorWorkerMetadata(merged)
+
+
+def get_live_grouped_block_ids(scheduler_output, req_id: str, *, required: bool = False) -> list[list[int]] | None:
+    """Read the scheduler's current table, including sliding-window holes."""
+    state = getattr(scheduler_output, "kv_connector_block_state", None)
+    if state is None:
+        if required:
+            raise RuntimeError("Shared component offload requires vLLM KVConnectorBlockState live block tables")
+        return None
+    blocks = state.get_block_ids(req_id)
+    if required and blocks is None:
+        raise RuntimeError(f"Missing live grouped block table for scheduled request {req_id}")
+    return [list(group) for group in blocks] if blocks is not None else None

@@ -545,6 +545,16 @@ class BaseKVPoolScheduler(ABC):
             raise ValueError(f"Request {req_id} is not in _unfinished_requests, but it is scheduled to be cached")
         if new_block_ids is not None:
             request_tracker.update(new_block_ids, request.num_computed_tokens)
+        if self.layerwise_offload:
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import get_live_grouped_block_ids
+
+            live = get_live_grouped_block_ids(
+                scheduler_output,
+                req_id,
+                required=getattr(self.kv_cache_config, "layerwise_requires_live_block_table", False),
+            )
+            if live is not None:
+                request_tracker.allocated_block_ids_by_group = live
         load_spec = self._running_load_spec(request_tracker, num_current_tokens)
         # save_decode_cache is intentionally narrower than
         # consumer_is_to_put: a consumer keeps skipping prefill writes and is
