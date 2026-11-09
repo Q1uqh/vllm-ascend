@@ -1,0 +1,6 @@
+# Replace the draft number and filename when opening the adaptation PR.
+pr: 0
+entries:
+  - category: feature
+    text: Added DeepSeek V4 Flash component-aware shared KV offload and final-chunk handoff through the existing Mooncake layerwise PD connector, with exact continuation snapshots and shared-source reader protection.
+    model: DeepSeek-V4-Flash
