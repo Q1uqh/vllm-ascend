@@ -565,10 +565,26 @@ class TestPD(unittest.TestCase):
             index_to_name={0: ["model.layers.0.self_attn.swa_cache"]},
             _cache_write_events=[None, None],
         )
-        cls.on_kv_cache_written(worker, "model.layers.0.self_attn")
-        self.assertIsNotNone(worker._cache_write_events[0])
+        for layer in (0, 1):
+            worker.current_layer = layer
+            worker.index_to_name[layer] = [f"model.layers.{layer}.self_attn.swa_cache"]
+            for hook in (f"model.layers.{layer}.self_attn", f"model.layers.{layer}.self_attn.attn"):
+                cls.on_kv_cache_written(worker, hook)
+                self.assertIsNotNone(worker._cache_write_events[layer])
+        worker.current_layer = 0
         with self.assertRaises(RuntimeError):
             cls.on_kv_cache_written(worker, "model.layers.1.self_attn")
+
+    def test_hook_owner_resolution_preserves_exact_main_and_rejects_other_layers(self):
+        resolve = self.ns["MooncakeLayerwiseConnectorWorker"]._resolve_layer_cache_owner
+        swa = "model.layers.0.self_attn.swa_cache"
+        self.assertEqual(resolve("model.layers.0.self_attn.attn", [swa], 0), swa)
+        main = "model.layers.2.self_attn.attn"
+        self.assertEqual(resolve(main, ["model.layers.2.self_attn.swa_cache", main], 2), main)
+        with self.assertRaises(RuntimeError):
+            resolve("model.layers.1.self_attn.attn", [swa], 0)
+        with self.assertRaises(RuntimeError):
+            resolve("model.layers.0.unrelated.attn", [swa], 0)
 
     def test_null_scheduler_blocks_remain_null_after_kernel_expansion(self):
         cls = self.ns["MooncakeLayerwiseConnectorWorker"]

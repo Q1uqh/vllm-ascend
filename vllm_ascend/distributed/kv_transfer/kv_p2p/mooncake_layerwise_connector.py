@@ -1952,17 +1952,31 @@ class MooncakeLayerwiseConnectorWorker:
                     )
                     send_task.group_seq_start_tensor[i] = torch.tensor([0], dtype=torch.int32, device=device)
 
+    @staticmethod
+    def _resolve_layer_cache_owner(layer_name: str, layer_names: list[str], layer_idx: int) -> str:
+        """Resolve a layer hook against this physical layer's registered caches."""
+        if layer_names:
+            if not layer_name:
+                return layer_names[0]
+            if layer_name in layer_names:
+                return layer_name
+            # DSV4 pure SWA layers emit an .attn hook but register only
+            # sibling cache components under the same attention module.
+            module_name = layer_name.removesuffix(".attn")
+            for name in layer_names:
+                if name.startswith(layer_name + ".") or name.startswith(module_name + "."):
+                    return name
+        raise RuntimeError(
+            f"Mooncake layer hook {layer_name!r} does not belong to physical layer {layer_idx}: {layer_names}"
+        )
+
     def on_kv_cache_written(self, layer_name: str) -> None:
         if self.current_layer >= self.total_layers:
             return
         layer_names = self.index_to_name[self.current_layer]
         if not layer_names:
             raise RuntimeError(f"Mooncake layerwise metadata is missing physical layer {self.current_layer}")
-        if layer_name and not any(name == layer_name or name.startswith(layer_name + ".") for name in layer_names):
-            raise RuntimeError(
-                f"Mooncake layer hook {layer_name!r} does not belong to physical layer {self.current_layer}: "
-                f"{layer_names}"
-            )
+        MooncakeLayerwiseConnectorWorker._resolve_layer_cache_owner(layer_name, layer_names, self.current_layer)
         cache_write_event = torch.npu.Event()
         cache_write_event.record()
         self._cache_write_events[self.current_layer] = cache_write_event
@@ -1986,16 +2000,9 @@ class MooncakeLayerwiseConnectorWorker:
             # Use the scatter-time event recorded by on_kv_cache_written.
             # The fallback preserves correctness for attention paths that do
             # not call the early hook, but gives up transfer/compute overlap.
-            if layer_name == "":
-                layer_name = layer_names[0]
-            elif layer_name not in layer_names:
-                # A pure SWA layer has a parent attention hook but no main
-                # '.attn' allocation. Resolve that hook to its registered owner.
-                if not any(name.startswith(layer_name + ".") for name in layer_names):
-                    raise RuntimeError(
-                        f"Mooncake layer hook {layer_name!r} does not belong to physical layer {self.current_layer}"
-                    )
-                layer_name = layer_names[0]
+            layer_name = MooncakeLayerwiseConnectorWorker._resolve_layer_cache_owner(
+                layer_name, layer_names, self.current_layer
+            )
             cache_write_event = self._cache_write_events[self.current_layer]
             self._cache_write_events[self.current_layer] = None
             component_groups = {self.layer_metadata[name].tensor_group_idx[0] for name in layer_names}
