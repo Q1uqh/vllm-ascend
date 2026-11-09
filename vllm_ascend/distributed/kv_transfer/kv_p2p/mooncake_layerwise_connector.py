@@ -990,10 +990,10 @@ class MooncakeLayerwiseConnectorScheduler:
 
         trimmed_block_ids: list[list[int]] = []
         for group_block_ids, block_size in zip(block_ids, self.block_size):
-            if prompt_len % block_size == 1:
-                trimmed_block_ids.append(list(group_block_ids[:-1]))
-            else:
-                trimmed_block_ids.append(list(group_block_ids))
+            # Async allocation may already cover only N-1 tokens. Keep all
+            # endpoint pages and remove only an actually allocated extra page.
+            endpoint_blocks = (prompt_len - 1 + block_size - 1) // block_size
+            trimmed_block_ids.append(list(group_block_ids[:endpoint_blocks]))
         return tuple(trimmed_block_ids)
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:

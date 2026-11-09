@@ -513,6 +513,44 @@ class TestPD(unittest.TestCase):
                 exec(code, {"self": instance, "vllm_config": types.SimpleNamespace(quant_config=quant)})
                 self.assertEqual((instance.enable_kv_quant, instance.enable_c8_quant), expected)
 
+    def test_endpoint_block_trimming_preserves_already_truncated_tables(self):
+        method = self.ns["MooncakeLayerwiseConnectorScheduler"]._trim_hybrid_remote_block_ids
+        worker = types.SimpleNamespace(need_truncate=True, block_size=[4096, 128])
+        already = ([1, 2], list(range(1, 65)))
+        self.assertEqual(method(worker, already, 8193), already)
+        extra = ([1, 2, 3], list(range(1, 66)))
+        self.assertEqual(method(worker, extra, 8193), already)
+        self.assertEqual(method(worker, already, 8192), already)
+
+    def test_transfer_mapping_skips_null_sources_and_reports_short_destinations(self):
+        ns = definitions(
+            "vllm_ascend/distributed/kv_transfer/utils/utils.py",
+            dict(logger=logging.getLogger("host")),
+            {"get_transfer_mappings"},
+        )
+        mapping = ns["get_transfer_mappings"]
+        req = types.SimpleNamespace(local_block_ids=[[0, 4]], remote_block_ids=[[9]], local_computed_tokens=8192)
+        arguments = (
+            [[[[0, 1]]]],
+            {0: {0: dict(host="d", port=31000, block_idx=0)}, 1: {0: dict(host="d", port=31000, block_idx=0)}},
+            {0: [0]},
+            {("d", 31000): 1},
+            req,
+            0,
+            types.SimpleNamespace(dcp_size=1),
+            "req",
+            0,
+            2,
+            0,
+            0,
+            0,
+        )
+        result = mapping(*arguments)
+        self.assertEqual(result[("d", 31000)]["local_block_ids"], [4])
+        req.remote_block_ids = [[]]
+        with self.assertRaisesRegex(ValueError, "destination.*group=0.*destination_blocks=0"):
+            mapping(*arguments)
+
     def test_single_token_needs_no_external_prefill(self):
         method = self.ns["MooncakeLayerwiseConnectorScheduler"]._hybrid_prefill_token_count
         worker = types.SimpleNamespace(need_truncate=True)

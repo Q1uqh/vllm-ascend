@@ -319,10 +319,26 @@ def get_transfer_mappings(
         if logic_block_idx < transed_idx or logic_block_idx >= to_trans_idx:
             continue
         for d_head_group_rank in pd_head_mapping[p_head_group_rank]:
+            if p_block_idx >= len(p_block_ids):
+                raise ValueError(
+                    f"Layerwise PD source block table too short: request={req_id} group={block_group_idx} "
+                    f"source_index={p_block_idx} source_blocks={len(p_block_ids)} "
+                    f"logical_end={to_trans_idx}"
+                )
             p_block_id = p_block_ids[p_block_idx]
+            if p_block_id == 0:
+                # Sliding-window holes have no live source to send.
+                continue
             remote_host = d_block_rank_mapping[logic_block_idx][d_head_group_rank]["host"]
             remote_port = d_block_rank_mapping[logic_block_idx][d_head_group_rank]["port"]
             d_block_idx = d_block_rank_mapping[logic_block_idx][d_head_group_rank]["block_idx"]
+            if d_block_idx >= len(d_block_ids):
+                raise ValueError(
+                    f"Layerwise PD destination block table too short: request={req_id} group={block_group_idx} "
+                    f"destination_index={d_block_idx} destination_blocks={len(d_block_ids)} "
+                    f"source_blocks={len(p_block_ids)} logical_end={to_trans_idx} "
+                    f"endpoint={req_meta.local_computed_tokens}"
+                )
             d_block_id = d_block_ids[d_block_idx]
             if (remote_host, remote_port) not in transfer_mappings:
                 transfer_mappings[(remote_host, remote_port)] = {
