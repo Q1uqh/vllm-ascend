@@ -69,6 +69,7 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
         super().__init__(vllm_config, use_layerwise, kv_cache_config)
         self.load_async = False
         self.dsv4_temporal = dsv4_temporal_config(vllm_config) is not None
+        self._dsv4_pd_d2d = extra_config.get("layerwise_dsv4_pd_transport") == "d2d"
         self._dsv4_snapshots: dict[str, DSV4Snapshot] = {}
         self._dsv4_incoming: dict[str, DSV4Snapshot] = {}
         self._dsv4_consumed: set[str] = set()
@@ -167,6 +168,10 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         params = getattr(request, "kv_transfer_params", None) or {}
+        if getattr(self, "_dsv4_pd_d2d", False) and not (
+            params.get("do_remote_decode") and params.get("remote_worker_addresses")
+        ):
+            raise ValueError("DSV4 D2D prefill requires a D-first layerwise proxy destination")
         payload = params.get(DSV4_HANDOFF_KEY)
         if payload is None or request.request_id in self._dsv4_consumed:
             if self.dsv4_temporal and request.max_tokens != 1:
@@ -205,6 +210,10 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
             raise RuntimeError(f"DSV4 snapshot is unavailable at endpoint {snapshot.end_token}")
 
     def request_finished_all_groups(self, request: Request, block_ids: tuple[list[int], ...]):
+        if getattr(self, "_dsv4_pd_d2d", False):
+            # Snapshots serve P's next chunk only. Push owns PD completion;
+            # release this request's private objects through the normal path.
+            return False, None
         if self.dsv4_temporal and request.status in (
             RequestStatus.FINISHED_STOPPED,
             RequestStatus.FINISHED_LENGTH_CAPPED,

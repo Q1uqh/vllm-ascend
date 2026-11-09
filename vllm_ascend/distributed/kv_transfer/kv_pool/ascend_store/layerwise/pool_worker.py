@@ -836,6 +836,7 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 emit_dsv4_transfer_event(
                     "snapshot_prepare",
                     enabled=self._dsv4_debug,
+                    request_id=request.req_id,
                     restore_generation=restore.generation if restore else None,
                     generation=snapshot.generation,
                     producer_replica=snapshot.producer_replica,
@@ -2549,6 +2550,12 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 self._finish_current_layerwise_load_sessions()
             raise
         # KVPP can observe completion after attention; reset at the next bind.
+        if getattr(self, "dsv4_temporal", False):
+            emit_dsv4_transfer_event(
+                "layer_entry_ready",
+                enabled=self._dsv4_debug,
+                layer_id=self.current_layer,
+            )
         if not self.use_kvpp:
             self.layer_load_finished_events[self.current_layer].clear()
         if (

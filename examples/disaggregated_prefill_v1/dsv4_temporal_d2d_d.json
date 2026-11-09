@@ -1,0 +1,8 @@
+{
+  "kv_connector": "MooncakePushConnector",
+  "kv_role": "kv_consumer",
+  "kv_port": 15579,
+  "kv_connector_extra_config": {
+    "dsv4_temporal_d2d": true
+  }
+}

@@ -45,8 +45,9 @@ def complete(url, model, prompt, count, timeout, transfer=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prefill", required=True)
-    parser.add_argument("--decode", required=True)
+    parser.add_argument("--proxy", help="D-first layerwise D2D proxy URL")
+    parser.add_argument("--prefill", help="Legacy snapshot P URL")
+    parser.add_argument("--decode", help="Legacy snapshot D URL")
     parser.add_argument("--resident")
     parser.add_argument("--model", required=True)
     parser.add_argument("--prompt-tokens", required=True, type=Path, help="JSON array of token ID arrays")
@@ -54,6 +55,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=900)
     args = parser.parse_args()
+    if not args.proxy and not (args.prefill and args.decode):
+        parser.error("provide --proxy for D2D, or both --prefill and --decode for legacy snapshot handoff")
     if args.output_tokens < 2 or args.repeat < 1:
         parser.error("--output-tokens must be at least 2 and --repeat must be positive")
     prompts = json.loads(args.prompt_tokens.read_text())
@@ -72,6 +75,17 @@ def main():
         if args.resident:
             expected, _, _, _ = complete(args.resident, args.model, prompt, args.output_tokens, args.timeout)
         for attempt in range(args.repeat):
+            if args.proxy:
+                actual, _, elapsed, _ = complete(args.proxy, args.model, prompt, args.output_tokens, args.timeout)
+                if expected is not None and actual != expected:
+                    raise AssertionError(f"Resident/D2D token IDs differ for prompt {index}, attempt {attempt}")
+                print(
+                    f"DSV4_ACCEPT prompt={index} tokens={len(prompt)} attempt={attempt} "
+                    f"transport=d2d elapsed_s={elapsed:.3f} "
+                    f"resident_compared={expected is not None} result=pass",
+                    flush=True,
+                )
+                continue
             first, transfer, prefill_s, processed_prompt = complete(args.prefill, args.model, prompt, 1, args.timeout)
             if (
                 not processed_prompt

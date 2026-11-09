@@ -11,9 +11,7 @@ from pathlib import Path
 
 _MARKER = "[KVPOOL_RANGE_DEBUG]"
 _ERROR = re.compile(r"\b(ERROR|CRITICAL|Traceback|failed|rejected|short transfer)\b", re.IGNORECASE)
-_CONFIG = re.compile(
-    r"layerwise config|layerwise group|DSV4 temporal|DSV4_ACCEPT|num_gpu_blocks|KV cache size", re.I
-)
+_CONFIG = re.compile(r"layerwise config|layerwise group|DSV4 temporal|DSV4_ACCEPT|num_gpu_blocks|KV cache size", re.I)
 _SLOT_TRACE = re.compile(r"DSV4_SLOT_TRACE .*expected_edges=(\d+)")
 _SLOT_EDGE = re.compile(r"DSV4_SLOT_REUSE path=(\w+) predecessor=(\d+) layer_id=(\d+)")
 _SLOT_PLAN = re.compile(r"DSV4 temporal slots .*predecessors=(\{[^}]*\})")
@@ -25,6 +23,14 @@ _EVIDENCE_EVENTS = {
     "handoff_bulk_h2d",
     "handoff_read_complete",
     "snapshot_cleanup",
+    "write_complete",
+    "receive_complete",
+    "slot_released",
+    "layer_save_complete",
+    "layer_restore_begin",
+    "layer_restore_complete",
+    "layer_entry_ready",
+    "overwrite_fence",
 }
 
 
@@ -43,12 +49,14 @@ def summarize(paths: list[Path]) -> list[str]:
     slot_edges: dict[str, set[tuple[int, int]]] = {}
     slot_paths: dict[str, set[str]] = {}
     malformed = 0
+    layouts: dict[tuple[str, int, int, tuple[int, ...]], set[str]] = {}
     error_count = 0
     failure_count = 0
     for path in paths:
         with path.open(errors="replace") as stream:
             for number, line in enumerate(stream, 1):
-                if _MARKER not in line:
+                d2d = "DSV4_D2D " in line
+                if _MARKER not in line and not d2d:
                     if "DSV4_SLOT_" in line and (worker := _WORKER.search(line)):
                         identity = f"{path.name} {worker[1]}"
                         if match := _SLOT_TRACE.search(line):
@@ -66,11 +74,19 @@ def summarize(paths: list[Path]) -> list[str]:
                     elif _CONFIG.search(line):
                         config.append(f"{path.name}:{number} {line.strip()[:600]}")
                     continue
-                payload = line.split(_MARKER, 1)[1].strip()
+                payload = line.split("DSV4_D2D " if d2d else _MARKER, 1)[1].strip()
                 try:
                     record, _ = json.JSONDecoder().raw_decode(payload)
                     event = str(record.get("event", "unknown"))
-                    direction = str(record.get("direction", "-"))
+                    if d2d and event == "layer_layout":
+                        identity = (
+                            str(path),
+                            int(record["pid"]),
+                            int(record["group"]),
+                            tuple(int(addr) for addr in record["base_addresses"]),
+                        )
+                        layouts.setdefault(identity, set()).add(str(record["layer"]))
+                    direction = "d2d" if d2d else str(record.get("direction", "-"))
                     results = record.get("results", [])
                     requested = record.get("requested_bytes", [])
                     if not isinstance(requested, list):
@@ -81,6 +97,10 @@ def summarize(paths: list[Path]) -> list[str]:
                         failed = len(results) != len(requested) or any(
                             result != expected for result, expected in zip(results, requested)
                         )
+                    elif d2d:
+                        requested_bytes = int(record.get("copied_bytes", 0))
+                        copied_counts[direction] += requested_bytes
+                        failed = event == "error" or record.get("failed", False)
                     elif event == "handoff_bulk_h2d":
                         copied = int(record["copied_bytes"])
                         requested_bytes = copied
@@ -116,9 +136,20 @@ def summarize(paths: list[Path]) -> list[str]:
             f"paths={','.join(sorted(slot_paths.get(worker, set())))} "
             f"edges={','.join(f'{prev}->{layer}' for prev, layer in sorted(edges))}"
         )
+    aliases = [
+        f"shared_addresses file={Path(path).name} pid={pid} group={group} addresses={addresses} "
+        f"layers={','.join(sorted(names))}"
+        for (path, pid, group, addresses), names in layouts.items()
+        if len(names) > 1
+    ]
+    # Preserve the original 300-line budget, including address evidence.
+    slot_summary = aliases[:8] + slot_summary[:10] if aliases else slot_summary
     return [
         f"files={len(paths)} events={sum(events.values())} malformed={malformed} "
-        f"transfer_failures={failure_count} error_lines={error_count}",
+        f"transfer_failures={failure_count} error_lines={error_count} "
+        f"d2d_write_events={events['write_complete', 'd2d']} "
+        f"d2d_receive_events={events['receive_complete', 'd2d']} "
+        f"legacy_h2d_handoffs={events['handoff_bulk_h2d', 'h2d']}",
         f"retained_config={len(config)} retained_errors={len(errors)} retained_transfer_failures={len(failures)} "
         f"max_overwrite_wait_ms={max_fence_wait_ms:.3f} max_bulk_h2d_ms={max_bulk_h2d_ms:.3f}",
         *(f"event={event} direction={direction} count={count}" for (event, direction), count in events.most_common(20)),

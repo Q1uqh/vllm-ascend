@@ -140,7 +140,9 @@ def dsv4_temporal_config(config: VllmConfig) -> dict | None:
     transfer = getattr(config, "kv_transfer_config", None)
     if transfer is None:
         return None
+    extra = transfer.kv_connector_extra_config
     if transfer.kv_connector in ("MultiConnector", "AscendMultiConnector"):
+        selected = []
         for child in transfer.kv_connector_extra_config.get("connectors", ()):
             if child.get("kv_connector") not in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
                 continue
@@ -148,10 +150,32 @@ def dsv4_temporal_config(config: VllmConfig) -> dict | None:
             if str(extra.get("backend", "mooncake")).lower() == "mooncake" and (
                 extra.get("layerwise_num_shared_buffers") is not None or extra.get("layerwise_dsv4_handoff")
             ):
-                raise ValueError("DSV4 temporal Mooncake requires a standalone AscendStoreConnector")
-    if transfer.kv_connector not in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
+                selected.append(child)
+        if not selected:
+            return None
+        children = transfer.kv_connector_extra_config["connectors"]
+        if (
+            len(selected) != 1
+            or len(children) != 2
+            or children[0].get("kv_connector") != "MooncakePushConnector"
+            or selected[0]["kv_connector_extra_config"].get("layerwise_dsv4_pd_transport") != "d2d"
+            or not any(
+                child.get("kv_connector") == "MooncakePushConnector"
+                and child.get("kv_role") == "kv_producer"
+                and child.get("kv_connector_extra_config", {}).get("dsv4_temporal_d2d") is True
+                for child in children
+            )
+        ):
+            raise ValueError("DSV4 temporal MultiConnector requires one store and one D2D MooncakePushConnector")
+        extra = selected[0]["kv_connector_extra_config"]
+        if selected[0].get("kv_role") != "kv_producer":
+            raise ValueError("DSV4 temporal store requires a kv_producer")
+    elif transfer.kv_connector not in ("AscendStoreConnector", "MooncakeConnectorStoreV1"):
         return None
-    extra = transfer.kv_connector_extra_config
+    if extra.get("layerwise_dsv4_pd_transport", "snapshot") not in ("snapshot", "d2d"):
+        raise ValueError("Unsupported DSV4 PD transport")
+    if extra.get("layerwise_dsv4_pd_transport") == "d2d" and extra.get("layerwise_dsv4_handoff"):
+        raise ValueError("DSV4 D2D cannot enable the bulk H2D handoff")
     if str(extra.get("backend", "mooncake")).lower() != "mooncake" or extra.get("layerwise_num_shared_buffers") is None:
         return None
     if not extra.get("use_layerwise"):
@@ -164,6 +188,15 @@ def dsv4_temporal_config(config: VllmConfig) -> dict | None:
     if config.scheduler_config.async_scheduling or config.cache_config.enable_prefix_caching:
         raise ValueError("DSV4 temporal producer requires synchronous scheduling and disabled local prefix caching")
     return extra
+
+
+def validate_dsv4_d2d_config(config: VllmConfig) -> None:
+    """Keep temporal D2D on the endpoint/topology validated by the store."""
+    _validate_dsv4_snapshot_topology(config)
+    if getattr(config, "speculative_config", None) is not None:
+        raise ValueError("DSV4 temporal D2D does not support speculative decoding")
+    if config.cache_config.enable_prefix_caching:
+        raise ValueError("DSV4 temporal D2D requires disabled local prefix caching on P and D")
 
 
 def build_dsv4_temporal_plan(config: VllmConfig, groups: list[KVCacheGroupSpec]) -> DSV4TuplePlan:

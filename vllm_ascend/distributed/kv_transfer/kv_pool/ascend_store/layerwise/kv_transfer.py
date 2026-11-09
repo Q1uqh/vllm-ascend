@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -91,7 +92,7 @@ def emit_dsv4_transfer_event(event: str, *, enabled: bool | None = None, **field
         if enabled is None:
             enabled = get_ascend_config().kv_pool_range_debug
         if enabled:
-            payload = {"event": event, **fields}
+            payload = {"event": event, "pid": os.getpid(), "monotonic_ns": time.monotonic_ns(), **fields}
             logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
     except Exception:
         pass
@@ -1043,6 +1044,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                     self.dec_stored_request(req_id)
                     if self.try_finish_and_delete_stored_request(req_id):
                         self.set_finished_request(req_id)
+            emit_dsv4_transfer_event("layer_save_complete", layer_id=layer_id)
         except Exception as exc:
             self._fatal_error = exc
             # All started objects belong to the failed forward step, including
@@ -1409,7 +1411,19 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
                 req_meta.layer_id = layer_id
                 self._active_load_indices = self._group_load_indices.get(task.group_id)
+                emit_dsv4_transfer_event(
+                    "layer_restore_begin",
+                    layer_id=layer_id,
+                    group=task.group_id,
+                    requests=req_meta.req_ids,
+                )
                 self._handle_range_request(req_meta, shared)
+                emit_dsv4_transfer_event(
+                    "layer_restore_complete",
+                    layer_id=layer_id,
+                    group=task.group_id,
+                    requests=req_meta.req_ids,
+                )
                 self._group_load_indices[task.group_id] = None if task.final_group_layer else self._active_load_indices
         except Exception as exc:
             self._fatal_error = exc

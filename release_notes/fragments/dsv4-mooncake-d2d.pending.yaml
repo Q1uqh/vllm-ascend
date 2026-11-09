@@ -1,0 +1,7 @@
+entries:
+  - category: feature
+    model: DeepSeek-V4-Flash
+    text: >-
+      Added D-first layerwise Mooncake Push D2D handoff for temporal KV offload.
+      Prefill workers complete each layer's device WRITE before reusing its
+      shared slot; decode workers receive directly into resident device caches.
