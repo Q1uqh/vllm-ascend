@@ -483,6 +483,36 @@ class TestPD(unittest.TestCase):
         self.assertEqual(final.local_computed_tokens, 8192)
         self.assertTrue(final.chunk_finish)
 
+    def test_optional_kv_quantization_flags_during_worker_initialization(self):
+        tree = ast.parse((ROOT / PD).read_text())
+        worker = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MooncakeLayerwiseConnectorWorker"
+        )
+        initializer = next(
+            node for node in worker.body if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        flags = {"enable_kv_quant", "enable_c8_quant"}
+        assignments = [
+            node
+            for node in initializer.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute) and target.attr in flags for target in node.targets)
+        ]
+        self.assertEqual(len(assignments), 2)
+        code = compile(ast.Module(body=assignments, type_ignores=[]), str(ROOT / PD), "exec")
+        for quant, expected in [
+            (None, (False, False)),
+            (types.SimpleNamespace(), (False, False)),
+            (types.SimpleNamespace(enable_fa_quant=True, enable_c8_quant=False), (True, False)),
+            (types.SimpleNamespace(enable_fa_quant=False, enable_c8_quant=True), (False, True)),
+        ]:
+            with self.subTest(quant=quant):
+                instance = types.SimpleNamespace()
+                exec(code, {"self": instance, "vllm_config": types.SimpleNamespace(quant_config=quant)})
+                self.assertEqual((instance.enable_kv_quant, instance.enable_c8_quant), expected)
+
     def test_single_token_needs_no_external_prefill(self):
         method = self.ns["MooncakeLayerwiseConnectorScheduler"]._hybrid_prefill_token_count
         worker = types.SimpleNamespace(need_truncate=True)
