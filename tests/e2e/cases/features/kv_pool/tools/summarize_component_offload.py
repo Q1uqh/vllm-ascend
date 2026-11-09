@@ -20,6 +20,10 @@ def summarize(paths):
     for path in paths:
         with Path(path).open(errors="replace") as stream:
             for number, line in enumerate(stream, 1):
+                if "[MOONCAKE_PUT_FAILURE]" in line:
+                    if len(errors) < 25:
+                        errors.append(f"ERROR {Path(path).name}:{number} {line.strip()}")
+                    continue
                 if MARKER not in line:
                     # A warning quoting the word 'error' is not a runtime failure.
                     if "WARNING" in line and len(warnings) < 8:

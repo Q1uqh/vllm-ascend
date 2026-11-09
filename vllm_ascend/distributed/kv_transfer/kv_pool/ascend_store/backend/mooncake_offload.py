@@ -9,8 +9,12 @@ read. There is no per-layer key or session preparation on the forward path.
 
 from __future__ import annotations
 
+import json
+from collections import Counter
 from copy import copy
 from typing import TYPE_CHECKING
+
+from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_diagnostics import emit_kv_lifecycle
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import require_aligned_batch_results
@@ -153,7 +157,62 @@ def _save_entries(worker, request, view, group, hashes):
     return entries
 
 
-def _open_puts(worker, slots):
+def _log_put_failure(worker, slots, groups, batch, codes, unreadable, started, phase, error):
+    """Bounded, failure-only evidence independent of kv_pool_range_debug."""
+    try:
+        result_type = type(codes).__name__
+        codes = codes if isinstance(codes, (list, tuple)) else []
+        group_ids = {id(view): group for group, views in (groups or {}).items() for view in views}
+        rejected = {key: code for key, code in zip(batch, codes) if code != 0}
+        samples = []
+        for key in list(rejected or dict.fromkeys(batch))[:8]:
+            owners = []
+            size = None
+            owner_count = 0
+            for view, candidate, slot, object_size in slots:
+                if candidate != key:
+                    continue
+                size = object_size
+                owner_count += 1
+                if len(owners) < 8:
+                    owners.append(
+                        dict(
+                            request=getattr(view, "req_id", None),
+                            incarnation=getattr(view, "layerwise_request_id", None),
+                            group=group_ids.get(id(view)),
+                            endpoint=getattr(view, "target_token_len", None),
+                            slot=slot,
+                        )
+                    )
+            samples.append(
+                dict(
+                    key=key,
+                    code=rejected.get(key),
+                    size=size,
+                    unreadable=None if unreadable is None else key in unreadable,
+                    owner_count=owner_count,
+                    owners=owners,
+                )
+            )
+        payload = dict(
+            phase=phase,
+            error=str(error)[:500],
+            result_type=result_type,
+            batch_keys=len(batch),
+            returned_results=len(codes),
+            rejected_keys=len(rejected),
+            code_counts=dict(Counter(str(code) for code in codes)),
+            unreadable_keys=None if unreadable is None else len(unreadable),
+            opened_to_revoke=len(started),
+            samples=samples,
+        )
+        logger.error("[MOONCAKE_PUT_FAILURE] %s", json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        # Preserve the original failure and its cleanup even if logging fails.
+        pass
+
+
+def _open_puts(worker, slots, groups=None):
     # One metadata RPC per batch across requests and groups, with each group's
     # own object size. Deduplication also prevents duplicate concurrent writers.
     sizes: dict[str, int] = {}
@@ -163,11 +222,14 @@ def _open_puts(worker, slots):
         sizes[key] = size
     missing = worker._filter_pool_existing_keys(list(sizes))
     started = set()
+    batch, codes, unreadable = [], [], None
+    phase = "batch_put_start"
     try:
         for batch in worker._layerwise_key_batches(missing):
-            codes = require_aligned_batch_results(
-                "batch_put_start", batch, worker.m_store.batch_put_start(batch, [sizes[key] for key in batch])
-            )
+            codes, unreadable = [], None
+            phase = "batch_put_start"
+            codes = worker.m_store.batch_put_start(batch, [sizes[key] for key in batch])
+            codes = require_aligned_batch_results("batch_put_start", batch, codes)
             opened = {key for key, code in zip(batch, codes, strict=True) if code == 0}
             started.update(opened)
             with worker._put_started_keys_lock:
@@ -175,9 +237,13 @@ def _open_puts(worker, slots):
             rejected = [key for key, code in zip(batch, codes, strict=True) if code != 0]
             # A competing writer may have committed since the existence probe.
             # An unfinished competing PUT is not a safe offload destination.
-            if rejected and worker._filter_pool_existing_keys(rejected):
-                raise RuntimeError("Mooncake offload could not open a required PUT session")
-    except Exception:
+            if rejected:
+                phase = "recheck_rejected"
+                unreadable = set(worker._filter_pool_existing_keys(rejected))
+                if unreadable:
+                    raise RuntimeError("Mooncake offload could not open a required PUT session")
+    except Exception as error:
+        _log_put_failure(worker, slots, groups, batch, codes, unreadable, started, phase, error)
         worker._queue_layerwise_revoke_keys(list(started))
         raise
     for view, key, slot, _ in slots:
@@ -231,7 +297,7 @@ def prepare_offload_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMe
     try:
         worker._open_layerwise_get_sessions(get_slots)
         worker._check_layerwise_transfer_errors()
-        _open_puts(worker, put_slots)
+        _open_puts(worker, put_slots, groups)
     except Exception:
         worker._layer_load_aborted.set()
         worker._finish_current_layerwise_load_sessions()
