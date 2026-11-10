@@ -168,8 +168,28 @@ def _open_puts(worker, slots):
             rejected = [key for key, code in zip(batch, codes, strict=True) if code != 0]
             # A competing writer may have committed since the existence probe.
             # An unfinished competing PUT is not a safe offload destination.
-            if rejected and worker._filter_pool_existing_keys(rejected):
-                raise RuntimeError("Mooncake offload could not open a required PUT session")
+            unresolved = worker._filter_pool_existing_keys(rejected) if rejected else []
+            if unresolved:
+                codes_by_key = dict(zip(batch, codes, strict=True))
+                owners = {}
+                for view, key, _, _ in slots:
+                    if key in codes_by_key and codes_by_key[key] != 0:
+                        owners.setdefault(key, view)
+                details = [
+                    dict(
+                        result=codes_by_key[key],
+                        bytes=sizes[key],
+                        private_snapshot="offload_v1:" in key,
+                        request=owners[key].req_id,
+                        endpoint=owners[key].target_token_len,
+                    )
+                    for key in unresolved[:8]
+                ]
+                offload_event("put_session_failed", failed_keys=len(unresolved), samples=details)
+                raise RuntimeError(
+                    f"Mooncake offload could not open a required PUT session: "
+                    f"failed_keys={len(unresolved)} samples={details}"
+                )
     except Exception:
         worker._queue_layerwise_revoke_keys(list(started))
         raise
