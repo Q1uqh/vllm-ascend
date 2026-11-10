@@ -118,16 +118,27 @@ def _save_entries(worker, request, view, group, hashes):
     if end > len(ids) or (partial is not None and partial >= len(ids)):
         raise ValueError("Mooncake offload save exceeds the allocated block table")
     mask = request.store_masks[group] if request.store_masks is not None else None
+    # RequestTracker describes the private suffix in transfer-LCM units.
+    # A finer group can have hashed complete pages inside that suffix. Saving
+    # those under public keys makes the next step's private-key GET miss.
+    snapshot_start = None
+    if not recurrent:
+        transfer_size = getattr(worker, "cache_transfer_granularity", size)
+        full_transfer_blocks = request.target_token_len // transfer_size
+        hashed_transfer_blocks = len(hashes) * size // transfer_size
+        if request.target_token_len % transfer_size or full_transfer_blocks > hashed_transfer_blocks:
+            snapshot_start = min(full_transfer_blocks, hashed_transfer_blocks) * transfer_size // size
     entries = []
     for index in range(start, end):
         if ids[index] == 0:
             continue
         if mask is not None and index < len(mask) and not mask[index]:
             continue
+        use_private_snapshot = snapshot_start is not None and index >= snapshot_start
         key = (
-            worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
-            if index < len(hashes)
-            else snapshot_key(worker, request, group, index, request.target_token_len)
+            snapshot_key(worker, request, group, index, request.target_token_len)
+            if use_private_snapshot or index >= len(hashes)
+            else worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
         )
         entries.append((key, index - start))
     if partial is not None and ids[partial] != 0:
