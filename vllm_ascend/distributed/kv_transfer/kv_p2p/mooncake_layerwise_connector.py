@@ -1968,17 +1968,32 @@ class MooncakeLayerwiseConnectorWorker:
                     )
                     send_task.group_seq_start_tensor[i] = torch.tensor([0], dtype=torch.int32, device=device)
 
+    def _resolve_layer_hook(self, layer_name: str, layer_names: list[str]) -> str:
+        if not layer_name or layer_name in layer_names:
+            return layer_name or layer_names[0]
+        # Pure SWA layers still call the model's attention hook, although
+        # only their SWA cache is registered. Resolve that exact alias only;
+        # never accept another layer or an arbitrary unregistered component.
+        if (
+            self.is_dsv4
+            and self.current_layer in (0, 1)
+            and layer_name.endswith(".self_attn.attn")
+            and extract_layer_index(layer_name) == self.current_layer
+            and layer_names == [layer_name.removesuffix(".attn") + ".swa_cache"]
+        ):
+            return layer_names[0]
+        raise RuntimeError(
+            f"Mooncake layer hook {layer_name!r} does not belong to physical layer {self.current_layer}: "
+            f"{layer_names}"
+        )
+
     def on_kv_cache_written(self, layer_name: str) -> None:
         if self.current_layer >= self.total_layers:
             return
         layer_names = self.index_to_name[self.current_layer]
         if not layer_names:
             raise RuntimeError(f"Mooncake layerwise metadata is missing physical layer {self.current_layer}")
-        if layer_name and layer_name not in layer_names:
-            raise RuntimeError(
-                f"Mooncake layer hook {layer_name!r} does not belong to physical layer {self.current_layer}: "
-                f"{layer_names}"
-            )
+        self._resolve_layer_hook(layer_name, layer_names)
         cache_write_event = torch.npu.Event()
         cache_write_event.record()
         self._cache_write_events[self.current_layer] = cache_write_event
@@ -2002,13 +2017,7 @@ class MooncakeLayerwiseConnectorWorker:
             # Use the scatter-time event recorded by on_kv_cache_written.
             # The fallback preserves correctness for attention paths that do
             # not call the early hook, but gives up transfer/compute overlap.
-            if layer_name == "":
-                layer_name = layer_names[0]
-            elif layer_name not in layer_names:
-                raise RuntimeError(
-                    f"Mooncake layer hook {layer_name!r} does not belong to physical layer {self.current_layer}: "
-                    f"{layer_names}"
-                )
+            layer_name = self._resolve_layer_hook(layer_name, layer_names)
             cache_write_event = None if self.is_dsv4 else self._cache_write_events[self.current_layer]
             self._cache_write_events[self.current_layer] = None
             if cache_write_event is None:
