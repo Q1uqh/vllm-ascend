@@ -354,14 +354,21 @@ class KVCacheSendingLayerThread(threading.Thread):
         if self.is_dsv4:
             if not req_meta.chunk_finish:
                 raise RuntimeError("DSV4 component transfer requires a final endpoint")
-            return component_transfer_ranges(
-                local_layer_metadata,
-                remote_layer_metadata,
-                local_block_ids,
-                remote_block_ids,
-                spec,
-                req_meta.local_computed_tokens,
-            )
+            try:
+                return component_transfer_ranges(
+                    local_layer_metadata,
+                    remote_layer_metadata,
+                    local_block_ids,
+                    remote_block_ids,
+                    spec,
+                    req_meta.local_computed_tokens,
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"DSV4 handoff component={layer_name} group={layer_group_idx} "
+                    f"endpoint={req_meta.local_computed_tokens} page_span={spec.block_size} "
+                    f"local_pages={len(local_block_ids)} remote_pages={len(remote_block_ids)}: {error}"
+                ) from error
 
         if isinstance(layer_kv_cache_spec, MambaSpec):
             # only support one block transfer for mamba
@@ -991,6 +998,15 @@ class MooncakeLayerwiseConnectorScheduler:
     def _trim_hybrid_remote_block_ids(self, block_ids: tuple[list[int], ...], prompt_len: int) -> tuple[list[int], ...]:
         if not self.need_truncate or prompt_len <= 1:
             return block_ids
+
+        if self.is_dsv4:
+            # Allocation may already cover only the external N-1 tokens.
+            # Removing a final page based on N alone can drop a required page.
+            endpoint = prompt_len - 1
+            return tuple(
+                list(ids[: (endpoint + size - 1) // size])
+                for ids, size in zip(block_ids, self.block_size, strict=True)
+            )
 
         trimmed_block_ids: list[list[int]] = []
         for group_block_ids, block_size in zip(block_ids, self.block_size):
