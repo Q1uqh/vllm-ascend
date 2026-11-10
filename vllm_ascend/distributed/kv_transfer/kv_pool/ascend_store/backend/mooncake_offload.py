@@ -19,6 +19,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     block_hash_to_str,
     get_block_hashes,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.offload_diagnostics import offload_event
 
 if TYPE_CHECKING:
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_worker import LayerwiseKVPoolWorker
@@ -36,6 +37,12 @@ def _load_entries(worker, request, group, hashes, mask):
     if spec is None or not spec.can_load:
         return []
     recurrent = worker.group_uses_align_state[group]
+    if (
+        spec.layerwise_previous_step
+        and getattr(getattr(worker, "kv_cache_config", None), "dsv4_shared_cache_names", None) is not None
+        and not worker._group_reuses_buffer(group)
+    ):
+        return []
     if spec.layerwise_previous_step and recurrent and not worker._group_reuses_buffer(group):
         return []
     tokens = spec.kvpool_cached_tokens
@@ -67,6 +74,10 @@ def _load_entries(worker, request, group, hashes, mask):
             continue
         if recurrent and ids[index] == 0:
             raise ValueError("Mooncake offload restore selected a null recurrent checkpoint")
+        if ids[index] == 0:
+            if worker._group_reuses_buffer(group) or (mask is not None and index < len(mask) and mask[index]):
+                raise ValueError("Mooncake offload restore selected a required null block")
+            continue
         if snapshot_start is not None and index >= snapshot_start:
             key = snapshot_key(worker, request, group, index, spec.layerwise_snapshot_end_token)
         elif index < min(tokens // size, len(hashes)):
@@ -109,6 +120,8 @@ def _save_entries(worker, request, view, group, hashes):
     mask = request.store_masks[group] if request.store_masks is not None else None
     entries = []
     for index in range(start, end):
+        if ids[index] == 0:
+            continue
         if mask is not None and index < len(mask) and not mask[index]:
             continue
         key = (
@@ -117,7 +130,7 @@ def _save_entries(worker, request, view, group, hashes):
             else snapshot_key(worker, request, group, index, request.target_token_len)
         )
         entries.append((key, index - start))
-    if partial is not None:
+    if partial is not None and ids[partial] != 0:
         entries.append((snapshot_key(worker, request, group, partial, request.target_token_len), None))
     return entries
 
@@ -176,6 +189,19 @@ def prepare_offload_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMe
             view.load_key_block_offset = 0
             hashes = get_block_hashes(request.block_hashes, worker.grouped_block_size[group], worker.hash_block_size)
             entries = _load_entries(worker, request, group, hashes, masks[group] if masks is not None else None)
+            offload_event(
+                "restore",
+                request=request.req_id,
+                incarnation=request.layerwise_request_id,
+                group=group,
+                endpoint=cached,
+                target=request.target_token_len,
+                source="previous_step"
+                if request.load_spec and request.load_spec.layerwise_previous_step
+                else "external",
+                keys=len(entries),
+                shared=worker._group_reuses_buffer(group),
+            )
             view.load_block_keys = [None] * (max((index for _, index in entries), default=-1) + 1)
             for key, index in entries:
                 view.load_block_keys[index] = key

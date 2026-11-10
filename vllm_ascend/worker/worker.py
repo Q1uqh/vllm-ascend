@@ -1264,6 +1264,8 @@ class NPUWorker(WorkerBase):
         # Consume that same layout rather than applying a logical multiplier.
         plan = get_physical_kv_cache_config_from_specs(config, kv_cache_spec) if config is not None else None
         if plan is not None:
+            if getattr(plan, "dsv4_shared_cache_names", None) is not None and not self.use_v2_model_runner:
+                raise ValueError("DSV4 Mooncake temporal offload requires Model Runner V2")
             layout = getattr(plan, "layerwise_reuse_layout", None)
             assignments = len(layout.buffer_slots) if layout is not None and layout.has_layer_reuse else num_layers
             return num_layers, assignments, 1.0
