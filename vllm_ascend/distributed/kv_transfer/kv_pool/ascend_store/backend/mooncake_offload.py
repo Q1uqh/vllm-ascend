@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_worker import LayerwiseKVPoolWorker
 
 
+_OBJECT_ALREADY_EXISTS = -705
+
+
 def snapshot_key(worker: LayerwiseKVPoolWorker, request: ReqMeta, group: int, index: int, endpoint: int) -> str:
     incarnation = request.layerwise_request_id
     if not incarnation:
@@ -66,7 +69,11 @@ def _load_entries(worker, request, group, hashes, mask):
             # final, unaligned prompt chunk. It cannot be floored to an older
             # hash boundary or rolled back from a later speculative state.
             raise ValueError("Mooncake recurrent restore requires its exact saved snapshot endpoint")
-        return [(worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index])), index)]
+        key = worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
+        key = getattr(worker, "_offload_private_aliases", {}).get(
+            (request.req_id, request.layerwise_request_id, key), key
+        )
+        return [(key, index)]
     snapshot_start = worker._layerwise_load_snapshot_start(request, group, tokens)
     entries = []
     for index in range(end):
@@ -85,6 +92,10 @@ def _load_entries(worker, request, group, hashes, mask):
         else:
             # Never invent a snapshot endpoint for an external prefix hit.
             raise ValueError("Mooncake offload restore has no exact snapshot identity")
+        if spec.layerwise_previous_step:
+            key = getattr(worker, "_offload_private_aliases", {}).get(
+                (request.req_id, request.layerwise_request_id, key), key
+            )
         entries.append((key, index))
     return entries
 
@@ -156,6 +167,8 @@ def _open_puts(worker, slots):
         sizes[key] = size
     missing = worker._filter_pool_existing_keys(list(sizes))
     started = set()
+    fallback_slots = []
+    aliases = {}
     try:
         for batch in worker._layerwise_key_batches(missing):
             codes = require_aligned_batch_results(
@@ -169,27 +182,48 @@ def _open_puts(worker, slots):
             # A competing writer may have committed since the existence probe.
             # An unfinished competing PUT is not a safe offload destination.
             unresolved = worker._filter_pool_existing_keys(rejected) if rejected else []
-            if unresolved:
-                codes_by_key = dict(zip(batch, codes, strict=True))
-                owners = {}
-                for view, key, _, _ in slots:
-                    if key in codes_by_key and codes_by_key[key] != 0:
-                        owners.setdefault(key, view)
+            codes_by_key = dict(zip(batch, codes, strict=True))
+            conflicts = {
+                key for key in unresolved
+                if codes_by_key[key] == _OBJECT_ALREADY_EXISTS and "offload_v1:" not in key
+            }
+            fatal = [key for key in unresolved if key not in conflicts]
+            if fatal:
                 details = [
-                    dict(
-                        result=codes_by_key[key],
-                        bytes=sizes[key],
-                        private_snapshot="offload_v1:" in key,
-                        request=owners[key].req_id,
-                        endpoint=owners[key].target_token_len,
-                    )
-                    for key in unresolved[:8]
+                    dict(result=codes_by_key[key], bytes=sizes[key], private_snapshot="offload_v1:" in key)
+                    for key in fatal[:8]
                 ]
-                offload_event("put_session_failed", failed_keys=len(unresolved), samples=details)
+                offload_event("put_session_failed", failed_keys=len(fatal), samples=details)
                 raise RuntimeError(
                     f"Mooncake offload could not open a required PUT session: "
-                    f"failed_keys={len(unresolved)} samples={details}"
+                    f"failed_keys={len(fatal)} samples={details}"
                 )
+            # Do not overwrite a competing writer or wait for a peer that
+            # may need this rank's EP collectives to finish its own PUT.
+            for view, key, slot, size in slots:
+                if key not in conflicts:
+                    continue
+                incarnation = view.layerwise_request_id
+                if not incarnation:
+                    raise ValueError("Offload PUT conflict requires a request incarnation")
+                private_key = f"{key}@offload_v1:fallback:{incarnation}"
+                fallback_slots.append((view, private_key, slot, size))
+                aliases[(view.req_id, incarnation, key)] = private_key
+        if fallback_slots:
+            with worker._put_started_keys_lock:
+                before_fallback = worker._put_started_keys.copy()
+            try:
+                _open_puts(worker, fallback_slots)
+            finally:
+                with worker._put_started_keys_lock:
+                    started.update(worker._put_started_keys - before_fallback)
+            if not hasattr(worker, "_offload_private_aliases"):
+                worker._offload_private_aliases = {}
+            worker._offload_private_aliases.update(aliases)
+            offload_event(
+                "put_collision_fallback", keys=len(set(aliases.values())),
+                requests=len({view.req_id for view, _, _, _ in fallback_slots}),
+            )
     except Exception:
         worker._queue_layerwise_revoke_keys(list(started))
         raise
