@@ -168,8 +168,13 @@ def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None
             role = connector_config.get("kv_role", getattr(kv_transfer_config, "kv_role", None))
             if role != "kv_producer":
                 raise ValueError("Mooncake shared KV buffers require kv_role=kv_producer")
-            if any(child is not connector_config for child in connector_configs):
-                raise ValueError("Mooncake shared KV buffers require a standalone Store connector")
+            siblings = [child for child in connector_configs if child is not connector_config]
+            if siblings and (
+                len(siblings) != 1
+                or siblings[0].get("kv_connector") != "MooncakeLayerwiseConnector"
+                or not (siblings[0].get("kv_connector_extra_config") or {}).get("dsv4_final_handoff", False)
+            ):
+                raise ValueError("Mooncake shared KV buffers require Store alone or one MooncakeLayerwiseConnector")
         elif backend_class.layerwise_data_plane != "gva":
             continue
         if extra_config.get("use_layerwise", False):

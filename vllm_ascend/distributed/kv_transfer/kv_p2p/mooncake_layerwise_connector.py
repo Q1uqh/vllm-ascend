@@ -55,7 +55,9 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv4_layerwise import component_transfer_ranges
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.offload_diagnostics import offload_event
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     PD_QOS_DEFAULT,
@@ -73,6 +75,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     validate_register_region_count,
 )
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_rank
+from vllm_ascend.models.deepseek_v4.cache_config import component_layout_identity, is_deepseek_v4_cache
 from vllm_ascend.utils import (
     get_kv_cache_tensor_layers,
     npu_stream_switch,
@@ -98,11 +101,13 @@ class LayerMetadata:
     kv_caches_base_addr: list[int]
     block_len: list[int]
     block_size_scale: list[int]
+    block_stride: list[int] = field(default_factory=list)
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     te_rpc_port: int
     layer_metadata: dict[str, LayerMetadata]
+    dsv4_identity: str = ""
 
 
 @dataclass
@@ -240,6 +245,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.engine = engine
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        self.is_dsv4 = is_deepseek_v4_cache(kv_cache_config.kv_cache_groups)
         self.kv_cache_specs = kv_cache_specs
         self.attn_resharding_group_idx = attn_resharding_group_idx
         self.mamba_cache_mode = self.vllm_config.cache_config.mamba_cache_mode
@@ -292,6 +298,8 @@ class KVCacheSendingLayerThread(threading.Thread):
             error = str(e)
             self.failed_reqs.update(send_task.send_request)
         finally:
+            if self.is_dsv4 and send_task.failed_requests and error is None:
+                error = "DSV4 handoff peer metadata lookup failed"
             if error is not None:
                 logger.error(
                     "Failed to transfer KV cache. layer_idx=%s, error=%s. Check transfer engine and memory state.",
@@ -339,6 +347,21 @@ class KVCacheSendingLayerThread(threading.Thread):
         remote_layer_metadata = req_meta.remote_layer_metadata[layer_name]
         local_layer_metadata = self.layer_metadata[layer_name]
         local_block_ids = req_meta.local_block_ids[layer_group_idx]
+
+        spec = layer_kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = spec.kv_cache_specs[layer_name]
+        if self.is_dsv4:
+            if not req_meta.chunk_finish:
+                raise RuntimeError("DSV4 component transfer requires a final endpoint")
+            return component_transfer_ranges(
+                local_layer_metadata,
+                remote_layer_metadata,
+                local_block_ids,
+                remote_block_ids,
+                spec,
+                req_meta.local_computed_tokens,
+            )
 
         if isinstance(layer_kv_cache_spec, MambaSpec):
             # only support one block transfer for mamba
@@ -518,7 +541,6 @@ class KVCacheSendingLayerThread(threading.Thread):
         # Merge transmission tasks of the same session
         session_meta: dict[str, TransferMeta] = {}
         layer_names = send_task.layer_names or [send_task.layer_name]
-        layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
         for req_id, req_meta in send_task.send_request.items():
             session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
             if session_id not in session_meta:
@@ -530,7 +552,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                     req_id,
                     req_meta,
                     layer_name,
-                    layer_group_idx,
+                    self.layer_metadata[layer_name].tensor_group_idx[0],
                 )
                 session_meta[session_id].src.extend(src_list)
                 session_meta[session_id].dst.extend(dst_list)
@@ -574,6 +596,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_id,
                         req_transfer_elapsed,
                     )
+        offload_event(
+            "p2p_send",
+            layer=send_task.layer_idx,
+            requests=list(send_task.send_request),
+            bytes=sum(sum(meta.length) for meta in session_meta.values()),
+            failed=bool(transfer_errors),
+        )
         return "; ".join(transfer_errors) if transfer_errors else None
 
 
@@ -635,6 +664,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 self.task_tracker[req_id] = set()
             self.task_tracker.pop(req_id, None)
             self.failed_requests.add(req_id)
+            offload_event("p2p_receive", request=req_id, failed=True)
 
     def update_done_task(self, req_id, trans_count, side_channel_path):
         """
@@ -649,6 +679,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
             if len(self.task_tracker[req_id]) == trans_count:
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
+                offload_event("p2p_receive", request=req_id, failed=False)
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -860,8 +891,9 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.save_kv_layer(layer_name, kv_layer, attn_metadata, self._connector_metadata)
 
     def wait_for_save(self):
-        """MooncakeLayerwiseConnector does not save explicitly."""
-        pass
+        assert self.connector_worker is not None
+        if self.connector_worker.is_dsv4 and self._is_kv_producer:
+            self.connector_worker.drain_dsv4_handoff()
 
 
 class MooncakeLayerwiseConnectorScheduler:
@@ -893,7 +925,8 @@ class MooncakeLayerwiseConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int], list[list[int]]]] = {}
         self._reqs_need_send_layerwise: dict[str, SendReqInfo] = {}
-        self.need_truncate = self._has_attn_mamba_hybrid_cache(kv_cache_config)
+        self.is_dsv4 = is_deepseek_v4_cache(kv_cache_config.kv_cache_groups)
+        self.need_truncate = self.is_dsv4 or self._has_attn_mamba_hybrid_cache(kv_cache_config)
         self.executor = ThreadPoolExecutor(32)
         tls_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("tls_config", {})
         ssl_keyfile = tls_config.get("ssl_keyfile")
@@ -991,6 +1024,10 @@ class MooncakeLayerwiseConnectorScheduler:
         )
 
         if params is not None and params.get("do_remote_prefill"):
+            if self.is_dsv4 and len(request.prompt_token_ids) <= 1:
+                # No prefix remains when D keeps its final prompt token.
+                params["do_remote_prefill"] = False
+                return 0, False
             # Remote prefill: get all prompt blocks from remote.
             assert num_computed_tokens % min(self.block_size) == 0
             count = max(self._hybrid_prefill_token_count(len(request.prompt_token_ids)) - num_computed_tokens, 0)
@@ -1158,7 +1195,16 @@ class MooncakeLayerwiseConnectorScheduler:
                     # whether chunk finish
                     chunk_finish = send_req_info.local_computed_tokens >= len(send_req_info.request.all_token_ids)
 
-                    add_transfer_task(req_id, send_req_info, chunk_finish=chunk_finish)
+                    if self.is_dsv4:
+                        state = getattr(scheduler_output, "kv_connector_block_state", None)
+                        live = state.get_block_ids(req_id) if state is not None else None
+                        if live is None:
+                            raise RuntimeError("DSV4 P2P requires current grouped block tables")
+                        send_req_info.local_block_ids = [list(group) for group in live]
+                    # Scratch history is restored only at layer entry. Send its
+                    # complete history in the final chunk, never intermediate chunks.
+                    if not self.is_dsv4 or chunk_finish:
+                        add_transfer_task(req_id, send_req_info, chunk_finish=chunk_finish)
                     if chunk_finish:
                         self._reqs_need_send_layerwise.pop(req_id)
         return meta
@@ -1214,6 +1260,25 @@ class MooncakeLayerwiseConnectorWorker:
         # Metadata.
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        self.is_dsv4 = is_deepseek_v4_cache(kv_cache_config.kv_cache_groups)
+        dsv4_handoff = vllm_config.kv_transfer_config.get_from_extra_config("dsv4_final_handoff", False)
+        if dsv4_handoff and not self.is_dsv4:
+            raise ValueError("dsv4_final_handoff requires a DSV4 cache layout")
+        if self.is_dsv4 and not dsv4_handoff:
+            raise ValueError("DSV4 P2P requires dsv4_final_handoff=true on both peers")
+        if self.is_dsv4:
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.prefill_context_parallel_size,
+                parallel.decode_context_parallel_size,
+            ) != (1, 1, 1, 1):
+                raise ValueError("DSV4 layerwise P2P requires TP=PP=PCP=DCP=1")
+            if vllm_config.speculative_config is not None or not vllm_config.model_config.enforce_eager:
+                raise ValueError("DSV4 layerwise P2P requires eager and no speculative decoding")
+            if vllm_config.scheduler_config.async_scheduling:
+                raise ValueError("DSV4 layerwise P2P requires synchronous scheduling")
         self.num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
         self.kv_cache_specs: list[KVCacheSpec] = [spec.kv_cache_spec for spec in self.kv_cache_config.kv_cache_groups]
         self.local_engine_id: str = " "
@@ -1273,6 +1338,8 @@ class MooncakeLayerwiseConnectorWorker:
         )
         self.pd_head_ratio = get_ascend_config().pd_head_ratio
         self.num_head_replica = get_ascend_config().num_head_replica
+        if self.is_dsv4 and (self.pd_head_ratio != 1 or self.enable_kv_quant or self.enable_c8_quant):
+            raise ValueError("DSV4 handoff uses native cache bytes without P/D KV resharding or requantization")
         self.resharding_stream = None
         if self.pd_head_ratio > 1 or self.enable_kv_quant or self.enable_c8_quant:
             self.resharding_stream = torch.npu.Stream()
@@ -1297,6 +1364,28 @@ class MooncakeLayerwiseConnectorWorker:
         self.virtual_request: set[str] = set()
         self._invalid_block_ids: set[int] = set()
         self._recving_metadata: dict[str, ReqMeta] = {}
+
+    def drain_dsv4_handoff(self) -> None:
+        # Do not let the scheduler recycle request blocks while a final-layer
+        # D2D transfer still reads resident auxiliary state or scratch history.
+        for layer in self.layer_storage_slots:
+            self.wait_for_layer_reuse(layer)
+        if self.kv_send_layer_thread is not None and self.kv_send_layer_thread.failed_reqs:
+            raise RuntimeError("DSV4 final handoff failed before step completion")
+        offload_event("p2p_drain", pending=len(self._pending_reuse_layers))
+
+    def _dsv4_wire_identity(self) -> str:
+        if not self.is_dsv4:
+            return ""
+        return hashlib.sha256(
+            repr(
+                (
+                    component_layout_identity(self.kv_cache_config.kv_cache_groups),
+                    self.vllm_config.model_config.compute_hash(),
+                    self.vllm_config.cache_config.cache_dtype,
+                )
+            ).encode()
+        ).hexdigest()
 
     def _init_layerwise_reuse_state(self) -> None:
         slot_by_addr: dict[int, int] = {}
@@ -1330,6 +1419,9 @@ class MooncakeLayerwiseConnectorWorker:
         if layer_idx not in self._pending_reuse_layers:
             return
         self._pending_reuse_layers.remove(layer_idx)
+        offload_event(
+            "p2p_source_done", layer=layer_idx, slots=self.layer_storage_slots[layer_idx], failed=error is not None
+        )
         for slot_id in self.layer_storage_slots[layer_idx]:
             if error is not None:
                 self._storage_send_errors[slot_id] = error
@@ -1343,6 +1435,7 @@ class MooncakeLayerwiseConnectorWorker:
             raise RuntimeError(f"Mooncake layerwise reuse mapping is missing layer {layer_idx}")
         for slot_id in self.layer_storage_slots[layer_idx]:
             event = self.storage_send_done_events[slot_id]
+            offload_event("p2p_slot_wait", layer=layer_idx, slot=slot_id, blocked=not event.is_set())
             while not event.wait(timeout=LAYERWISE_REUSE_WAIT_LOG_INTERVAL_SECONDS):
                 if not send_thread.is_alive():
                     raise RuntimeError("Mooncake send thread stopped while waiting for layerwise buffer reuse")
@@ -1350,6 +1443,7 @@ class MooncakeLayerwiseConnectorWorker:
             error = self._storage_send_errors.get(slot_id)
             if error is not None:
                 raise RuntimeError(f"Mooncake failed to transfer physical KV slot {slot_id}: {error}")
+            offload_event("p2p_slot_release", layer=layer_idx, slot=slot_id)
 
     def create_kv_buffer(self, first_kv_cache_tuple):
         alignment = 2 * 1024 * 1024
@@ -1469,6 +1563,7 @@ class MooncakeLayerwiseConnectorWorker:
                 single_layer_meta.tensor_group_idx.append(layer_kv_group_id)
                 single_layer_meta.kv_caches_base_addr.append(single_kv_cache.data_ptr())
                 single_layer_meta.block_len.append(single_kv_cache.element_size() * math.prod(block_shape))
+                single_layer_meta.block_stride.append(single_kv_cache.stride(0) * single_kv_cache.element_size())
                 single_layer_meta.block_size_scale.append(block_size_scale)
                 self.kernel_block_size_scale[layer2group_ids[layer_name]] = block_size_scale
                 if single_kv_cache.data_ptr() not in ptrs and not self.use_attn_mamba_hybrid:
@@ -1515,9 +1610,9 @@ class MooncakeLayerwiseConnectorWorker:
         for layer_names in self.index_to_name.values():
             layer_names.sort(key=lambda name: "indexer" in name.lower())
             primary_group_idx = self.layer_metadata[layer_names[0]].tensor_group_idx[0]
-            assert all(self.layer_metadata[name].tensor_group_idx[0] == primary_group_idx for name in layer_names), (
-                f"Mooncake layerwise merged components must share one KV cache group. layer_names={layer_names}"
-            )
+            assert self.is_dsv4 or all(
+                self.layer_metadata[name].tensor_group_idx[0] == primary_group_idx for name in layer_names
+            ), f"Mooncake layerwise merged components must share one KV cache group. layer_names={layer_names}"
         if mtp_layer_name != "":
             self.index_to_name[max(self.index_to_name.keys()) + 1].append(mtp_layer_name)
         if self.index_to_name:
@@ -1529,6 +1624,7 @@ class MooncakeLayerwiseConnectorWorker:
         metadata = MooncakeAgentMetadata(
             te_rpc_port=self.te_rpc_port,
             layer_metadata=self.layer_metadata,
+            dsv4_identity=self._dsv4_wire_identity(),
         )
         if self.vllm_config.kv_transfer_config.is_kv_producer:
             ready_event = threading.Event()
@@ -1796,6 +1892,16 @@ class MooncakeLayerwiseConnectorWorker:
             update_metadata = {}
             for req_idx, (req_id, req_meta) in enumerate(metadata.requests.items()):
                 transfer_mappings: dict[tuple[str, int], dict[str, Any]] = {}
+                if self.is_dsv4:
+                    if not req_meta.chunk_finish:
+                        raise RuntimeError("DSV4 handoff must run only in the final chunk")
+                    if (req_meta.remote_tp_size, req_meta.remote_pcp_size, req_meta.remote_dcp_size) != (1, 1, 1):
+                        raise ValueError("DSV4 handoff requires matching TP1/PCP1/DCP1 peers")
+                    if req_meta.remote_block_size != self.block_size:
+                        raise ValueError("DSV4 handoff group page spans differ between peers")
+                    req_meta.trans_count = [1] * self.num_kv_cache_groups
+                    update_metadata[req_id] = req_meta
+                    continue
                 self._align_remote_block_ids(req_meta)
                 for i, kv_cache_spec in enumerate(self.kv_cache_specs):
                     if isinstance(kv_cache_spec, MambaSpec):
@@ -1907,7 +2013,7 @@ class MooncakeLayerwiseConnectorWorker:
                     f"Mooncake layer hook {layer_name!r} does not belong to physical layer {self.current_layer}: "
                     f"{layer_names}"
                 )
-            cache_write_event = self._cache_write_events[self.current_layer]
+            cache_write_event = None if self.is_dsv4 else self._cache_write_events[self.current_layer]
             self._cache_write_events[self.current_layer] = None
             if cache_write_event is None:
                 cache_write_event = torch.npu.Event()
@@ -2087,6 +2193,8 @@ class MooncakeLayerwiseConnectorWorker:
                 ensure_zmq_send(sock, encoded_data, path)
                 metadata_bytes = ensure_zmq_recv(sock, self.remote_poller, path)
                 agent_meta: MooncakeAgentMetadata = self.decoder.decode(metadata_bytes)
+                if self.is_dsv4 and agent_meta.dsv4_identity != self._dsv4_wire_identity():
+                    raise ValueError("DSV4 P/D model, component or cache-format identity differs")
             except Exception as e:
                 logger.error(
                     "Query to port and kv base addr for request fail. req_id=%s, source=%s:%s, error=%s. ",

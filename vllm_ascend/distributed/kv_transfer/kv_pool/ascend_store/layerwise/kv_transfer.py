@@ -1361,6 +1361,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         attention_start_gate = data.attention_start_gate
 
         if wait_for_save is not None:
+            offload_event(
+                "slot_wait",
+                layer=layer_id,
+                predecessor=wait_for_save,
+                blocked=not self.layer_save_finished_events[wait_for_save].is_set(),
+            )
             if not self._wait_for_event(self.layer_save_finished_events[wait_for_save], self.save_failure_checker):
                 return False
             if self.save_failure_checker is not None:
@@ -1369,6 +1375,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             # Their CPU save-finished signal only means the event was recorded;
             # wait for the NPU work before reusing the local HBM buffer.
             self.sync_save_events[wait_for_save].synchronize()
+            offload_event("slot_release", layer=layer_id, predecessor=wait_for_save)
             logger.debug("Layer save event cleared: layer %d", wait_for_save)
             self.layer_save_finished_events[wait_for_save].clear()
 

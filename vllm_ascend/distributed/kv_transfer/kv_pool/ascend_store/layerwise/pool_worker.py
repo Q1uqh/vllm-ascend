@@ -739,6 +739,17 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self._save_disabled.clear()
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.load_disabled.clear()
+        offload_event(
+            "step_begin",
+            requests=[
+                {
+                    "request": req.req_id,
+                    "endpoint": req.target_token_len,
+                    "restore_endpoint": req.load_spec.kvpool_cached_tokens if req.load_spec else 0,
+                }
+                for req in metadata.requests
+            ],
+        )
         self.process_layer_data(metadata.requests)
 
     def _is_layerwise_save_leader(self) -> bool:

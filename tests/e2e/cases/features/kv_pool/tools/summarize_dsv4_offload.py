@@ -44,7 +44,11 @@ def summarize(paths):
                 process = (str(path), event.get("pid"))
                 counts[kind] += 1
                 layer = event.get("layer")
-                if kind == "config":
+                if kind == "step_begin":
+                    for table in (sources, waiting, released):
+                        for key in [key for key in table if key[0] == process]:
+                            del table[key]
+                elif kind == "config":
                     configs[process] = event
                 elif kind == "component":
                     layouts[process][(event["component"], event["segment"])] = event
@@ -79,6 +83,12 @@ def summarize(paths):
                 elif kind == "range":
                     ranges[event["direction"] + "_bytes"] += sum(event["requested_bytes"])
                     ranges[event["direction"] + "_failed"] += sum(code < 0 for code in event["results"])
+                elif kind == "p2p_receive":
+                    evidence["p2p_receive_failed"] += bool(event["failed"])
+                    evidence["p2p_receive_complete"] += not event["failed"]
+                elif kind == "p2p_send":
+                    ranges["p2p_bytes"] += event["bytes"]
+                    ranges["p2p_failed"] += bool(event["failed"])
                 elif kind == "commit":
                     evidence["commit_failed"] += sum(code != 0 for code in event["results"])
     output = ["DSV4 offload acceptance evidence (PASS / FAIL / INSUFFICIENT)"]
@@ -92,6 +102,9 @@ def summarize(paths):
     incomplete_layouts = 0
     for process, config in configs.items():
         entries = layouts[process]
+        # Ordinary consumer allocations are outside the shared-ring probe.
+        if not entries and not config["predecessors"] and config.get("buffers") is None:
+            continue
         seen = defaultdict(list)
         for entry in entries.values():
             seen[entry["address"]].append(entry)
@@ -149,6 +162,7 @@ def summarize(paths):
         or evidence["bad_fences"]
         or evidence["bad_compute_gates"]
         or evidence["failed_loads"]
+        or evidence["p2p_receive_failed"]
         or evidence["commit_failed"]
         or evidence["budget_mismatch"]
         or any(ranges[key] for key in ranges if key.endswith("_failed"))

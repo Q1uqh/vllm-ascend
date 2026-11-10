@@ -534,3 +534,229 @@ def test_summary_preserves_failures_and_never_reports_empty_run_as_pass(tmp_path
     assert result[-1] == "RESULT FAIL"
     log.write_text("")
     assert "INSUFFICIENT" in module.summarize([log])[-1]
+
+
+@pytest.mark.parametrize("window", [None, 4])
+def test_d2d_component_copy_uses_each_peer_stride_and_live_window(ns, window):
+    definitions("vllm_ascend/distributed/kv_transfer/kv_p2p/dsv4_layerwise.py", ns)
+    # Same payload with distinct P scratch and D overlay page strides.
+    source = ctypes.create_string_buffer(128)
+    target = ctypes.create_string_buffer(b"x" * 256, 256)
+    for index in range(128):
+        source[index] = bytes([index])
+    local = NS(block_len=[8], block_stride=[8], kv_caches_base_addr=[ctypes.addressof(source)])
+    remote = NS(block_len=[8], block_stride=[16], kv_caches_base_addr=[ctypes.addressof(target)])
+    spec = NS(block_size=4, sliding_window=window)
+    src, dst, sizes = ns["component_transfer_ranges"](local, remote, [1, 2, 3], [4, 5, 6], spec, 9)
+    expected_pages = [1, 2] if window else [0, 1, 2]
+    assert len(src) == len(expected_pages)
+    for a, b, size in zip(src, dst, sizes, strict=True):
+        ctypes.memmove(b, a, size)
+    for page in expected_pages:
+        assert target.raw[(4 + page) * 16 : (4 + page) * 16 + 8] == source.raw[(1 + page) * 8 : (1 + page) * 8 + 8]
+        assert target.raw[(4 + page) * 16 + 8 : (5 + page) * 16] == b"x" * 8
+    with pytest.raises(ValueError, match="null block"):
+        ns["component_transfer_ranges"](local, remote, [1, 2, 0], [4, 5, 6], spec, 9)
+    with pytest.raises(ValueError, match="payload differs"):
+        ns["component_transfer_ranges"](
+            local, NS(**{**remote.__dict__, "block_len": [7]}), [1, 2, 3], [4, 5, 6], spec, 9
+        )
+
+
+def test_d2d_final_chunk_only_and_current_tables(ns):
+    path = "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py"
+    captured = []
+    ns["MooncakeLayerwiseConnectorMetadata"] = lambda: NS(add_new_req=lambda **kw: captured.append(kw))
+    ns["round_down"] = lambda x, size: x // size * size
+    ns["logging"] = NS(DEBUG=10)
+    cls = isolated_method(path, "MooncakeLayerwiseConnectorScheduler", "build_connector_meta", ns)
+    scheduler = cls()
+    scheduler.is_dsv4 = True
+    scheduler.vllm_config = NS(kv_transfer_config=NS(is_kv_consumer=False))
+    scheduler.block_size = [4]
+    req = NS(all_token_ids=list(range(9)), kv_transfer_params={"remote_cached_tokens": 0})
+    info = NS(request=req, local_computed_tokens=0, local_block_ids=[[8]])
+    info.update_transferred_tokens = lambda x: setattr(info, "transferred", x)
+    info.update_computed_tokens = lambda x: setattr(info, "local_computed_tokens", x)
+    info.unpack = lambda: (info.local_block_ids, info.transferred, info.local_computed_tokens, req)
+    scheduler._reqs_need_send_layerwise = {"r": info}
+    live = [[0, 11, 12]]
+    output = NS(
+        scheduled_cached_reqs=NS(req_ids=["r"], new_block_ids=[None], num_computed_tokens=[0]),
+        scheduled_new_reqs=[],
+        scheduled_spec_decode_tokens={},
+        num_scheduled_tokens={"r": 4},
+        kv_connector_block_state=NS(get_block_ids=lambda _: live),
+    )
+    scheduler.build_connector_meta(output)
+    assert not captured
+    output.scheduled_cached_reqs.num_computed_tokens = [4]
+    output.num_scheduled_tokens = {"r": 5}
+    scheduler.build_connector_meta(output)
+    assert len(captured) == 1 and captured[0]["chunk_finish"]
+    assert captured[0]["local_block_ids"] == live
+    live[0][1] = 99
+    assert captured[0]["local_block_ids"][0][1] == 11
+    assert not scheduler._reqs_need_send_layerwise
+
+
+def test_shared_store_accepts_only_explicit_dsv4_p2p_sibling(ns):
+    ns["get_backend_class"] = lambda _: NS(layerwise_data_plane="block_key")
+    definitions(STORE + "layerwise/layerwise_cache_layout.py", ns, {"get_layerwise_reuse_config"})
+    store = dict(
+        kv_connector="AscendStoreConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config=dict(backend="mooncake", use_layerwise=True, layerwise_num_shared_buffers=2),
+    )
+    peer = dict(kv_connector="MooncakeLayerwiseConnector", kv_connector_extra_config={"dsv4_final_handoff": True})
+    config = NS(
+        kv_connector="MultiConnector", kv_role="kv_producer", kv_connector_extra_config={"connectors": [store, peer]}
+    )
+    assert ns["get_layerwise_reuse_config"](config) is store["kv_connector_extra_config"]
+    peer["kv_connector_extra_config"] = {}
+    with pytest.raises(ValueError):
+        ns["get_layerwise_reuse_config"](config)
+
+
+def test_d2d_sender_selects_each_components_group(ns):
+    path = "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py"
+    ns["TransferMeta"] = lambda **kw: NS(**kw)
+    ns["offload_event"] = MagicMock()
+    ns["time"] = NS(perf_counter=lambda: 0)
+    cls = isolated_method(path, "KVCacheSendingLayerThread", "_transfer_kv_cache", ns)
+    sender = cls()
+    sender.pd_head_ratio = 1
+    sender.enable_kv_quant = sender.enable_c8_quant = False
+    sender.layer_metadata = {
+        "main": NS(tensor_group_idx=[0]),
+        "swa": NS(tensor_group_idx=[2]),
+        "state": NS(tensor_group_idx=[4]),
+    }
+    groups_seen = []
+
+    def ranges(task, req_id, req, name, group):
+        groups_seen.append(group)
+        return [100 + group], [200 + group], [8]
+
+    sender.get_transfer_meta = ranges
+    sender.engine = NS(batch_transfer_sync_write=MagicMock(return_value=0))
+    sender.failed_reqs = set()
+    task = NS(
+        k_cache=None,
+        v_cache=None,
+        k_quant_cache=None,
+        layer_idx=3,
+        wait_event=MagicMock(),
+        layer_name="main",
+        layer_names=["main", "swa", "state"],
+        send_request={"r": NS(remote_host="D", remote_te_rpc_port=123)},
+    )
+    assert sender._transfer_kv_cache(task) is None
+    assert groups_seen == [0, 2, 4]
+    sender.engine.batch_transfer_sync_write.assert_called_once_with("D:123", [100, 102, 104], [200, 202, 204], [8] * 3)
+
+
+def test_cold_slot_wait_has_evidence_without_get(ns):
+    import threading
+
+    ns["offload_event"] = MagicMock()
+    cls = isolated_method(STORE + "layerwise/kv_transfer.py", "KVCacheStoreLayerRecvingThread", "_copy_gva_layers", ns)
+    receiver = cls()
+    receiver.layer_save_finished_events = [threading.Event()]
+    receiver.layer_save_finished_events[0].set()
+    receiver.layer_load_finished_events = [threading.Event(), threading.Event()]
+    receiver.sync_save_events = [MagicMock()]
+    receiver.save_failure_checker = MagicMock()
+    receiver._wait_for_event = lambda event, *args: event.wait(timeout=1)
+    receiver.load_disabled = threading.Event()
+    receiver.external_slot_release_waiter = MagicMock()
+    task = NS(wait_for_save_layer=0, transfer_tasks=[], layer_id=1, attention_start_gate=None)
+    assert receiver._copy_gva_layers(task)
+    assert [call.args[0] for call in ns["offload_event"].call_args_list] == ["slot_wait", "slot_release"]
+    receiver.external_slot_release_waiter.assert_called_once_with(1)
+
+
+@pytest.mark.parametrize("failure", [None, "D2D failed"])
+def test_p2p_shared_slot_blocks_until_device_copy_and_propagates_failure(ns, failure):
+    import threading
+
+    path = "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py"
+    names = ["_mark_layer_reuse_pending", "_complete_layer_reuse", "wait_for_layer_reuse"]
+    methods = {
+        name: getattr(isolated_method(path, "MooncakeLayerwiseConnectorWorker", name, ns), name) for name in names
+    }
+    worker = type("Worker", (), methods)()
+    worker.layer_storage_slots = {2: (0,), 6: (0,)}
+    worker.storage_send_done_events = [threading.Event()]
+    worker.storage_send_done_events[0].set()
+    worker._pending_reuse_layers = set()
+    worker._storage_send_errors = {}
+    worker.kv_send_layer_thread = NS(is_alive=lambda: True)
+    ns["LAYERWISE_REUSE_WAIT_LOG_INTERVAL_SECONDS"] = 0.1
+    entered = threading.Event()
+    events = []
+
+    def record(event, **fields):
+        events.append(event)
+        if event == "p2p_slot_wait":
+            entered.set()
+
+    ns["offload_event"] = record
+    worker._mark_layer_reuse_pending(2)
+    outcomes = []
+
+    def wait():
+        try:
+            worker.wait_for_layer_reuse(6)
+            outcomes.append("released")
+        except RuntimeError:
+            outcomes.append("failed")
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    try:
+        assert entered.wait(timeout=1)
+        assert not outcomes
+        worker._complete_layer_reuse(2, failure)
+        thread.join(timeout=1)
+        assert outcomes == ["failed" if failure else "released"]
+        if not failure:
+            assert events.index("p2p_source_done") < events.index("p2p_slot_release")
+    finally:
+        worker.storage_send_done_events[0].set()
+        thread.join(timeout=1)
+
+
+def test_p2p_wire_preserves_page_strides_and_identity(ns, monkeypatch):
+    import sys
+    from types import ModuleType
+
+    import msgspec
+
+    module = ModuleType("dsv4_wire_test")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    ns["__name__"] = module.__name__
+    ns["msgspec"] = msgspec
+    path = "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py"
+    definitions(path, ns, {"LayerMetadata", "MooncakeAgentMetadata"})
+    module.__dict__.update(ns)
+    layer = ns["LayerMetadata"]([2], [1024], [64], [1], [320])
+    wire = ns["MooncakeAgentMetadata"](1234, {"swa": layer}, "identity")
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(wire), type=ns["MooncakeAgentMetadata"])
+    assert decoded.layer_metadata["swa"].block_stride == [320]
+    assert decoded.dsv4_identity == "identity"
+
+
+def test_dsv4_reserves_final_token_and_skips_empty_remote_prefix(ns):
+    path = "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_layerwise_connector.py"
+    cls = isolated_method(path, "MooncakeLayerwiseConnectorScheduler", "get_num_new_matched_tokens", ns)
+    scheduler = cls()
+    scheduler.is_dsv4 = True
+    scheduler.block_size = [2, 128]
+    scheduler._hybrid_prefill_token_count = lambda count: count - 1 if count > 1 else count
+    req = NS(prompt_token_ids=[1], kv_transfer_params={"do_remote_prefill": True})
+    assert scheduler.get_num_new_matched_tokens(req, 0) == (0, False)
+    assert not req.kv_transfer_params["do_remote_prefill"]
+    req.prompt_token_ids = [1] * 4097
+    req.kv_transfer_params["do_remote_prefill"] = True
+    assert scheduler.get_num_new_matched_tokens(req, 0) == (4096, True)

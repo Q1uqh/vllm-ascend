@@ -1,0 +1,9 @@
+{
+  "kv_connector": "MooncakeLayerwiseConnector",
+  "kv_role": "kv_consumer",
+  "kv_port": 14600,
+  "kv_load_failure_policy": "fail",
+  "kv_connector_extra_config": {
+    "dsv4_final_handoff": true
+  }
+}
