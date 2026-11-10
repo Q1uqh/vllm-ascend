@@ -760,3 +760,46 @@ def test_dsv4_reserves_final_token_and_skips_empty_remote_prefix(ns):
     req.prompt_token_ids = [1] * 4097
     req.kv_transfer_params["do_remote_prefill"] = True
     assert scheduler.get_num_new_matched_tokens(req, 0) == (4096, True)
+
+
+@pytest.mark.parametrize("endpoint", [4095, 4096, 4097, 8193, 122798])
+@pytest.mark.parametrize("size", [128, 4096])
+@pytest.mark.parametrize("hash_lag", [0, 2])
+def test_transfer_suffix_snapshots_match_next_step_keys(ns, endpoint, size, hash_lag):
+    total = (endpoint + size - 1) // size
+    hashes = [str(i).encode() for i in range(max(0, endpoint // size - hash_lag))]
+    transfer = 4096
+    cutoff = min(endpoint // transfer, len(hashes) * size // transfer) * transfer // size
+    needs_snapshot = bool(endpoint % transfer or endpoint // transfer > len(hashes) * size // transfer)
+    worker = NS(
+        grouped_block_size=[size], group_uses_align_state=[False],
+        cache_transfer_granularity=transfer, use_eagle=False,
+        kv_cache_config=NS(dsv4_shared_cache_names=("main",)),
+        _group_reuses_buffer=lambda group: True,
+        _is_layerwise_save_owner=lambda group: True,
+        _make_layerwise_full_key=lambda group, key: key,
+    )
+    worker._layerwise_save_full_end = lambda req, group, span, partial: (
+        min(req.target_token_len // span, partial)
+        if partial is not None else req.target_token_len // span
+    )
+    worker._layerwise_load_snapshot_start = lambda req, group, tokens: cutoff if needs_snapshot else None
+    request = NS(
+        target_token_len=endpoint, save_start_token=0, can_save=True,
+        block_ids_by_group=[list(range(1, total + 1))], store_masks=None,
+        layerwise_request_id="incarnation",
+        load_spec=NS(
+            can_load=True, layerwise_previous_step=True, kvpool_cached_tokens=endpoint,
+            kvpool_store_skip_tokens=None, layerwise_snapshot_end_token=endpoint,
+        ),
+    )
+    saved = ns["_save_entries"](worker, request, NS(), 0, hashes)
+    saved_keys = {key for key, _ in saved}
+    # Hashes arriving on the next scheduler step must not change which
+    # namespace the preceding save used.
+    for restore_hashes in (hashes, hashes + [b"new"] * 8):
+        loaded = ns["_load_entries"](worker, request, 0, restore_hashes, None)
+        assert {key for key, _ in loaded} <= saved_keys
+    if endpoint == 122798 and size == 128 and not hash_lag:
+        assert sum("offload_v1:" in key and slot is not None for key, slot in saved) == 31
+        assert sum("offload_v1:" in key for key, _ in saved) == 32
