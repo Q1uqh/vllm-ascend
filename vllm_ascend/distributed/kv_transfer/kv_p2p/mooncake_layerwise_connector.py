@@ -1330,12 +1330,8 @@ class MooncakeLayerwiseConnectorWorker:
         self.sparse_sfa_c8_layers: set[str] = set()
         self.attn_resharding_group_idx = set[int]()
 
-        self.enable_kv_quant = (
-            vllm_config.quant_config.enable_fa_quant if vllm_config.quant_config is not None else False
-        )
-        self.enable_c8_quant = (
-            vllm_config.quant_config.enable_c8_quant if vllm_config.quant_config is not None else False
-        )
+        self.enable_kv_quant = getattr(vllm_config.quant_config, "enable_fa_quant", False)
+        self.enable_c8_quant = getattr(vllm_config.quant_config, "enable_c8_quant", False)
         self.pd_head_ratio = get_ascend_config().pd_head_ratio
         self.num_head_replica = get_ascend_config().num_head_replica
         if self.is_dsv4 and (self.pd_head_ratio != 1 or self.enable_kv_quant or self.enable_c8_quant):
