@@ -81,8 +81,6 @@ def build_deepseek_v4_reuse_config(config, groups, num_blocks):
     ):
         raise ValueError("DSV4 Mooncake temporal offload requires PP=PCP=DCP=1")
     validate_dsv4_transfer_speculation(config)
-    if getattr(config.scheduler_config, "async_scheduling", False):
-        raise ValueError("DSV4 Mooncake temporal offload requires synchronous scheduling")
     if not config.model_config.enforce_eager:
         raise ValueError("DSV4 Mooncake temporal offload requires enforce_eager")
     base = config.model_config.get_num_layers(parallel)

@@ -1301,8 +1301,6 @@ class MooncakeLayerwiseConnectorWorker:
             validate_dsv4_transfer_speculation(vllm_config)
             if not vllm_config.model_config.enforce_eager:
                 raise ValueError("DSV4 layerwise P2P requires eager")
-            if vllm_config.scheduler_config.async_scheduling:
-                raise ValueError("DSV4 layerwise P2P requires synchronous scheduling")
         self.num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
         self.kv_cache_specs: list[KVCacheSpec] = [spec.kv_cache_spec for spec in self.kv_cache_config.kv_cache_groups]
         self.local_engine_id: str = " "
