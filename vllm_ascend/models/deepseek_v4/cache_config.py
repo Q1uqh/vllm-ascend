@@ -58,8 +58,8 @@ def component_layout_identity(groups) -> str:
 
 def validate_dsv4_transfer_speculation(config) -> None:
     speculative = getattr(config, "speculative_config", None)
-    if speculative is not None and speculative.method != "mtp":
-        raise ValueError("DSV4 Mooncake transfer supports native MTP speculation only")
+    if speculative is not None and speculative.method not in ("mtp", "dspark"):
+        raise ValueError("DSV4 Mooncake transfer supports native MTP and DSpark speculation")
 
 
 def build_deepseek_v4_reuse_config(config, groups, num_blocks):

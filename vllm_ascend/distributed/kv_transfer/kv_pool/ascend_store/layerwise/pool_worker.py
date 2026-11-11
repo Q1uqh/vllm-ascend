@@ -2634,7 +2634,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             speculative = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
             draft_rewrites = (
                 getattr(self.kv_cache_config, "dsv4_component_identity", None) is not None
-                and getattr(speculative, "method", None) == "mtp"
+                and getattr(speculative, "method", None) in ("mtp", "dspark")
             )
             if _LW_DEFER_LAST_SAVE and not draft_rewrites and not (
                 self._recurrent_layers & (self.prefetch_layer_map.keys() | set(self.prefetch_layer_map.values()))

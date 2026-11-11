@@ -915,7 +915,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
                 and metadata.requests
                 and worker.current_layer < worker.total_layers
             ):
-                raise RuntimeError("DSV4 MTP handoff did not write every registered KV layer")
+                raise RuntimeError("DSV4 speculative handoff did not write every registered KV layer")
 
 
 class MooncakeLayerwiseConnectorScheduler:
