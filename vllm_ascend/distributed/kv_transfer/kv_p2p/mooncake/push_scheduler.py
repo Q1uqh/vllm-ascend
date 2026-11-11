@@ -25,6 +25,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import MooncakeMetaserverClient
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.offload_diagnostics import offload_event
 from vllm_ascend.models.deepseek_v4.cache_config import component_layout_identity, is_deepseek_v4_cache
 
 if TYPE_CHECKING:
@@ -110,6 +111,13 @@ class MooncakePushConnectorScheduler(MooncakeBaseConnectorScheduler):
                     request,
                     tuple(list(group) for group in blocks.get_block_ids()),
                     num_external_tokens,
+                )
+            if self._is_dsv4:
+                offload_event(
+                    "push_prefix",
+                    request=request.request_id,
+                    local_tokens=params["num_computed_tokens"],
+                    external_tokens=num_external_tokens,
                 )
             params["do_remote_prefill"] = False
             # The proxy matches external IDs; workers retain the full D ID.

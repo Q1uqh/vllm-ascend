@@ -83,6 +83,10 @@ def summarize(paths):
                 elif kind == "range":
                     ranges[event["direction"] + "_bytes"] += sum(event["requested_bytes"])
                     ranges[event["direction"] + "_failed"] += sum(code < 0 for code in event["results"])
+                elif kind == "push_prefix":
+                    evidence["d_local_prefix_requests"] += event["local_tokens"] > 0
+                    evidence["d_local_prefix_tokens"] += event["local_tokens"]
+                    evidence["d_push_prefix_tokens"] += event["external_tokens"]
                 elif kind == "p2p_receive":
                     evidence["p2p_receive_failed"] += bool(event["failed"])
                     evidence["p2p_receive_complete"] += not event["failed"]
