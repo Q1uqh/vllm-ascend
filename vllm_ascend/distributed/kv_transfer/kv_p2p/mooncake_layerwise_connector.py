@@ -1274,9 +1274,6 @@ class MooncakeLayerwiseConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.is_dsv4 = is_deepseek_v4_cache(kv_cache_config.kv_cache_groups)
-        dsv4_handoff = vllm_config.kv_transfer_config.get_from_extra_config("dsv4_final_handoff", False)
-        if dsv4_handoff and not self.is_dsv4:
-            raise ValueError("dsv4_final_handoff requires a DSV4 cache layout")
         if self.is_dsv4:
             parallel = vllm_config.parallel_config
             if (

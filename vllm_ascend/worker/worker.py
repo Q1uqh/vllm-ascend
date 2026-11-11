@@ -1291,8 +1291,18 @@ class NPUWorker(WorkerBase):
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
-        extra_config = get_layerwise_reuse_config(self.vllm_config.kv_transfer_config)
+        transfer_config = self.vllm_config.kv_transfer_config
+        extra_config = get_layerwise_reuse_config(transfer_config)
         if extra_config is not None:
+            if (
+                transfer_config.kv_connector == "MultiConnector"
+                and str(extra_config.get("backend", "mooncake")).lower() == "mooncake"
+                and len(transfer_config.kv_connector_extra_config["connectors"]) > 1
+            ):
+                from vllm_ascend.models.deepseek_v4.cache_config import is_deepseek_v4_cache
+
+                if not is_deepseek_v4_cache(kv_cache_spec):
+                    raise ValueError("Mooncake shared KV buffers with layerwise P2P require a DSV4 cache layout")
             speculator = getattr(self.model_runner, "speculator", None)
             speculative = self.vllm_config.speculative_config
             draft_names = (

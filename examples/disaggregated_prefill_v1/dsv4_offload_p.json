@@ -7,10 +7,7 @@
       {
         "kv_connector": "MooncakeLayerwiseConnector",
         "kv_role": "kv_producer",
-        "kv_port": 14500,
-        "kv_connector_extra_config": {
-          "dsv4_final_handoff": true
-        }
+        "kv_port": 14500
       },
       {
         "kv_connector": "AscendStoreConnector",

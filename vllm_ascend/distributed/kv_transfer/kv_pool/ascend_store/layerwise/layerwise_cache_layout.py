@@ -172,12 +172,9 @@ def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None
             if siblings and (
                 len(siblings) != 1
                 or siblings[0].get("kv_connector") != "MooncakeLayerwiseConnector"
-                or not (siblings[0].get("kv_connector_extra_config") or {}).get("dsv4_final_handoff", False)
+                or siblings[0].get("kv_role", getattr(kv_transfer_config, "kv_role", None)) != "kv_producer"
             ):
-                raise ValueError(
-                    "Mooncake shared KV buffers require standalone Store or one "
-                    "MooncakeLayerwiseConnector sibling with dsv4_final_handoff=true"
-                )
+                raise ValueError("Mooncake shared KV buffers require Store alone or one layerwise P2P producer")
         elif backend_class.layerwise_data_plane != "gva":
             continue
         if extra_config.get("use_layerwise", False):
