@@ -75,7 +75,12 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     validate_register_region_count,
 )
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_rank
-from vllm_ascend.models.deepseek_v4.cache_config import component_layout_identity, is_deepseek_v4_cache
+from vllm_ascend.models.deepseek_v4.cache_config import (
+    component_layout_identity,
+    get_physical_layer_index,
+    is_deepseek_v4_cache,
+    validate_dsv4_transfer_speculation,
+)
 from vllm_ascend.utils import (
     get_kv_cache_tensor_layers,
     npu_stream_switch,
@@ -902,6 +907,16 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker.is_dsv4 and self._is_kv_producer:
             self.connector_worker.drain_dsv4_handoff()
 
+            metadata = self._connector_metadata
+            worker = self.connector_worker
+            if (
+                worker.vllm_config.speculative_config is not None
+                and isinstance(metadata, MooncakeLayerwiseConnectorMetadata)
+                and metadata.requests
+                and worker.current_layer < worker.total_layers
+            ):
+                raise RuntimeError("DSV4 MTP handoff did not write every registered KV layer")
+
 
 class MooncakeLayerwiseConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -1283,8 +1298,9 @@ class MooncakeLayerwiseConnectorWorker:
                 parallel.decode_context_parallel_size,
             ) != (1, 1, 1, 1):
                 raise ValueError("DSV4 layerwise P2P requires TP=PP=PCP=DCP=1")
-            if vllm_config.speculative_config is not None or not vllm_config.model_config.enforce_eager:
-                raise ValueError("DSV4 layerwise P2P requires eager and no speculative decoding")
+            validate_dsv4_transfer_speculation(vllm_config)
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError("DSV4 layerwise P2P requires eager")
             if vllm_config.scheduler_config.async_scheduling:
                 raise ValueError("DSV4 layerwise P2P requires synchronous scheduling")
         self.num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -1606,6 +1622,10 @@ class MooncakeLayerwiseConnectorWorker:
         num_attn_module = 2 if model_type in ("longcat_flash", "longcat_flash_ngram") else 1
         mtp_layer_name = ""
         for layer_name in kv_caches:
+            if self.is_dsv4:
+                layer_idx = get_physical_layer_index(layer_name, self.total_layers)
+                self.index_to_name[layer_idx].append(layer_name)
+                continue
             if "mtp" in layer_name:
                 mtp_layer_name = layer_name
                 continue
@@ -1982,9 +2002,7 @@ class MooncakeLayerwiseConnectorWorker:
         # never accept another layer or an arbitrary unregistered component.
         if (
             self.is_dsv4
-            and self.current_layer in (0, 1)
             and layer_name.endswith(".self_attn.attn")
-            and extract_layer_index(layer_name) == self.current_layer
             and layer_names == [layer_name.removesuffix(".attn") + ".swa_cache"]
         ):
             return layer_names[0]
@@ -2160,6 +2178,9 @@ class MooncakeLayerwiseConnectorWorker:
                 if needs_reuse_gate:
                     self._complete_layer_reuse(self.current_layer, str(error))
                 raise
+            if needs_reuse_gate and self.is_dsv4 and "mtp" in layer_name.split("."):
+                # Later proposals can update the same draft page in this step.
+                self.wait_for_layer_reuse(self.current_layer)
             self.current_layer += 1
 
     # NOTE: Due to the FIA operator constraints, the expected kv cache is ND format, NZ shape,

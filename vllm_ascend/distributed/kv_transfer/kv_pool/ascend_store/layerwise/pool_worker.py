@@ -2631,7 +2631,12 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         if self.current_layer == num_local - 1:
             # Recurrent state may be cleared or copied before the next load
             # hook. Finish reading shared state before returning from forward.
-            if _LW_DEFER_LAST_SAVE and not (
+            speculative = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
+            draft_rewrites = (
+                getattr(self.kv_cache_config, "dsv4_component_identity", None) is not None
+                and getattr(speculative, "method", None) == "mtp"
+            )
+            if _LW_DEFER_LAST_SAVE and not draft_rewrites and not (
                 self._recurrent_layers & (self.prefetch_layer_map.keys() | set(self.prefetch_layer_map.values()))
             ):
                 # PERF-TUNE(2): move the last layer's save drain off the forward

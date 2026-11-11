@@ -56,6 +56,12 @@ def component_layout_identity(groups) -> str:
     return hashlib.sha256(json.dumps(components, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def validate_dsv4_transfer_speculation(config) -> None:
+    speculative = getattr(config, "speculative_config", None)
+    if speculative is not None and speculative.method != "mtp":
+        raise ValueError("DSV4 Mooncake transfer supports native MTP speculation only")
+
+
 def build_deepseek_v4_reuse_config(config, groups, num_blocks):
     """Separate resident allocations from the two compressed-history rings.
 
@@ -74,8 +80,7 @@ def build_deepseek_v4_reuse_config(config, groups, num_blocks):
         for field in ("pipeline_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size")
     ):
         raise ValueError("DSV4 Mooncake temporal offload requires PP=PCP=DCP=1")
-    if getattr(config, "speculative_config", None) is not None:
-        raise ValueError("DSV4 Mooncake temporal offload requires speculative decoding disabled")
+    validate_dsv4_transfer_speculation(config)
     if getattr(config.scheduler_config, "async_scheduling", False):
         raise ValueError("DSV4 Mooncake temporal offload requires synchronous scheduling")
     if not config.model_config.enforce_eager:
@@ -86,13 +91,17 @@ def build_deepseek_v4_reuse_config(config, groups, num_blocks):
     per_layer = defaultdict(list)
     for name, spec in specs.items():
         per_layer[get_physical_layer_index(name, base)].append(NamedKVCacheSpec(name, spec))
-    if sorted(per_layer) != list(range(base)):
+    if not set(range(base)).issubset(per_layer):
         raise ValueError("DSV4 component plan must cover every target layer")
     layer_specs = {}
     resident_layers = set(options.independent_layers)
     buckets = []
     resident_names = []
     for layer, components in sorted(per_layer.items()):
+        if layer >= base:
+            # Draft KV remains resident, including across prefill chunks.
+            resident_names.extend(item.layer_name for item in components)
+            continue
         mains = [item for item in components if is_shared_compressor_cache(item.layer_name)]
         if len(mains) > 1:
             raise ValueError("DSV4 layer has multiple compressor histories")
