@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Final-endpoint DSV4 component copies between different physical layouts."""
+"""Chunk-wise DSV4 component copies between different physical layouts."""
 
 
-def component_transfer_ranges(local, remote, local_ids, remote_ids, spec, endpoint):
+def component_transfer_ranges(
+    local, remote, local_ids, remote_ids, spec, endpoint, *, transferred_tokens=0, chunk_finish=True
+):
     """Copy live pages only, using each peer's stride and each segment's payload.
 
     Block zero is the allocator's null block. Never read it or write it. A
@@ -10,9 +12,16 @@ def component_transfer_ranges(local, remote, local_ids, remote_ids, spec, endpoi
     Both the compressed-history and state groups express spans in raw tokens.
     """
     size = spec.block_size
-    end = (endpoint + size - 1) // size
     window = getattr(spec, "sliding_window", None)
-    start = max(0, (endpoint - window + 1) // size) if window else 0
+    # The receiver reserves the final sliding window. Earlier windows can
+    # contain null destination blocks and mutable state that D cannot use.
+    if window and not chunk_finish:
+        return [], [], []
+    if window:
+        start = max(0, (endpoint - window + 1) // size)
+    else:
+        start = transferred_tokens // size
+    end = (endpoint + size - 1) // size if chunk_finish else endpoint // size
     if endpoint <= 0 or end > len(local_ids) or end > len(remote_ids):
         raise ValueError("DSV4 handoff endpoint exceeds allocated component tables")
     if not local.block_stride or not remote.block_stride:

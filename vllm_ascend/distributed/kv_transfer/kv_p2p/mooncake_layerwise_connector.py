@@ -352,8 +352,6 @@ class KVCacheSendingLayerThread(threading.Thread):
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[layer_name]
         if self.is_dsv4:
-            if not req_meta.chunk_finish:
-                raise RuntimeError("DSV4 component transfer requires a final endpoint")
             try:
                 return component_transfer_ranges(
                     local_layer_metadata,
@@ -362,6 +360,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                     remote_block_ids,
                     spec,
                     req_meta.local_computed_tokens,
+                    transferred_tokens=max(req_meta.local_transed_tokens, req_meta.remote_cache_tokens or 0),
+                    chunk_finish=req_meta.chunk_finish,
                 )
             except ValueError as error:
                 raise ValueError(
@@ -1217,10 +1217,7 @@ class MooncakeLayerwiseConnectorScheduler:
                         if live is None:
                             raise RuntimeError("DSV4 P2P requires current grouped block tables")
                         send_req_info.local_block_ids = [list(group) for group in live]
-                    # Scratch history is restored only at layer entry. Send its
-                    # complete history in the final chunk, never intermediate chunks.
-                    if not self.is_dsv4 or chunk_finish:
-                        add_transfer_task(req_id, send_req_info, chunk_finish=chunk_finish)
+                    add_transfer_task(req_id, send_req_info, chunk_finish=chunk_finish)
                     if chunk_finish:
                         self._reqs_need_send_layerwise.pop(req_id)
         return meta
@@ -1280,8 +1277,6 @@ class MooncakeLayerwiseConnectorWorker:
         dsv4_handoff = vllm_config.kv_transfer_config.get_from_extra_config("dsv4_final_handoff", False)
         if dsv4_handoff and not self.is_dsv4:
             raise ValueError("dsv4_final_handoff requires a DSV4 cache layout")
-        if self.is_dsv4 and not dsv4_handoff:
-            raise ValueError("DSV4 P2P requires dsv4_final_handoff=true on both peers")
         if self.is_dsv4:
             parallel = vllm_config.parallel_config
             if (
@@ -1905,8 +1900,6 @@ class MooncakeLayerwiseConnectorWorker:
             for req_idx, (req_id, req_meta) in enumerate(metadata.requests.items()):
                 transfer_mappings: dict[tuple[str, int], dict[str, Any]] = {}
                 if self.is_dsv4:
-                    if not req_meta.chunk_finish:
-                        raise RuntimeError("DSV4 handoff must run only in the final chunk")
                     if (req_meta.remote_tp_size, req_meta.remote_pcp_size, req_meta.remote_dcp_size) != (1, 1, 1):
                         raise ValueError("DSV4 handoff requires matching TP1/PCP1/DCP1 peers")
                     if req_meta.remote_block_size != self.block_size:
