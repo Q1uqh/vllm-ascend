@@ -739,17 +739,18 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self._save_disabled.clear()
         if self.kv_recv_thread is not None:
             self.kv_recv_thread.load_disabled.clear()
-        offload_event(
-            "step_begin",
-            requests=[
-                {
-                    "request": req.req_id,
-                    "endpoint": req.target_token_len,
-                    "restore_endpoint": req.load_spec.kvpool_cached_tokens if req.load_spec else 0,
-                }
-                for req in metadata.requests
-            ],
-        )
+        if metadata.requests:
+            offload_event(
+                "step_begin",
+                requests=[
+                    {
+                        "request": req.req_id,
+                        "endpoint": req.target_token_len,
+                        "restore_endpoint": req.load_spec.kvpool_cached_tokens if req.load_spec else 0,
+                    }
+                    for req in metadata.requests
+                ],
+            )
         self.process_layer_data(metadata.requests)
 
     def _is_layerwise_save_leader(self) -> bool:
@@ -980,7 +981,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         if aliases:
             for identity in [identity for identity in aliases if identity[0] in req_ids]:
                 del aliases[identity]
-        offload_event("terminal_cleanup", requests=sorted(req_ids))
+        if req_ids:
+            offload_event("terminal_cleanup", requests=sorted(req_ids))
 
     def _release_failed_layerwise_get_attempts(self, request_ids_by_key: dict[str, set[str]]) -> None:
         with self._load_session_lock:

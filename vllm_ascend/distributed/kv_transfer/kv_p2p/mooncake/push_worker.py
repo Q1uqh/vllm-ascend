@@ -413,6 +413,8 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
             reply = msgspec.msgpack.decode(ensure_zmq_recv(sock, path))
             if reply != {"kind": "done_ack", "request_id": params["request_id"]}:
                 raise ValueError("Invalid DONE ACK")
+            if self._is_dsv4:
+                offload_event("push_done_ack", request=params["request_id"], failed=bool(error))
             return True
         except Exception:
             # D may have died. Its receive timeout handles a missing DONE.
@@ -667,7 +669,13 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 session = f"{worker.local_ip}:{worker.te_rpc_port}"
                 ret = self.engine.batch_transfer_sync_write(session, src_list, dst_list, length_list)
                 if self._is_dsv4:
-                    offload_event("p2p_send", layer=batch.layer_name, bytes=sum(length_list), failed=ret < 0)
+                    offload_event(
+                        "p2p_send",
+                        requests=[req.request_id for req in batch.requests],
+                        layer=batch.layer_name,
+                        bytes=sum(length_list),
+                        failed=ret < 0,
+                    )
                 if ret < 0:
                     return f"Mooncake WRITE failed: session={session}, ret={ret}"
         except Exception as exc:
@@ -810,6 +818,8 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                     for layer in destination.required_layers
                 )
                 if state.error or complete:
+                    if self._is_dsv4:
+                        offload_event("push_done_queued", request=request_id, rank=rank, error=state.error)
                     assert self._sender_executor is not None
                     destination.completion = self._sender_executor.submit(
                         self._send_done_after_transfers, destination.transfer_params, state.error, transfers

@@ -104,6 +104,9 @@ class MooncakePushConnectorScheduler(MooncakeBaseConnectorScheduler):
                 return
             if params["remote_num_external_tokens"] == 0:
                 return
+            if self._is_dsv4:
+                offload_event("push_p_alloc", request=request.request_id, remote=params.get("remote_request_id"),
+                              prompt_tokens=request.num_prompt_tokens)
             self._reqs_need_send_layerwise[request.request_id] = (
                 request,
                 tuple(list(group) for group in blocks.get_block_ids()),
@@ -152,6 +155,9 @@ class MooncakePushConnectorScheduler(MooncakeBaseConnectorScheduler):
             if self._dsv4_identity is not None:
                 message["dsv4_identity"] = self._dsv4_identity
             assert self.metaserver_client is not None
+            if self._is_dsv4:
+                offload_event("push_callback_submit", request=request.request_id, external_id=external_request_id,
+                              prompt_tokens=request.num_prompt_tokens, url=params.get("metaserver"))
             self.metaserver_client.submit(request.request_id, params.get("metaserver"), message)
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> MooncakeConnectorMetadata:
@@ -189,6 +195,12 @@ class MooncakePushConnectorScheduler(MooncakeBaseConnectorScheduler):
                     if live_blocks is None:
                         raise RuntimeError("DSV4 Push requires current grouped block tables")
                     block_ids = tuple(list(group) for group in live_blocks)
+                    end_token = local_num_computed_tokens + num_scheduled_tokens
+                    offload_event(
+                        "push_p_chunk", request=req_id, start=local_num_computed_tokens,
+                        end=min(end_token, request.num_prompt_tokens),
+                        final=end_token >= request.num_prompt_tokens,
+                    )
                 meta.add_new_push_send_req(
                     request_id=req_id,
                     # Match D's transfer table: the final Mamba block must be
