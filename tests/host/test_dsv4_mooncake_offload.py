@@ -534,11 +534,13 @@ def test_summary_preserves_failures_and_never_reports_empty_run_as_pass(tmp_path
     assert "INSUFFICIENT" in module.summarize([log])[-1]
 
 
-def test_dsv4_push_final_chunk_uses_live_component_groups(ns):
+@pytest.mark.parametrize("cacheable", [True, False])
+def test_dsv4_push_final_chunk_uses_live_component_groups(ns, cacheable):
     path = "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/push_worker.py"
     ns.update(
         MambaSpec=type("MambaSpec", (), {}),
         is_circular_kv_cache_spec=lambda _: False,
+        is_prefix_cacheable=lambda _: cacheable,
         LayerTransferRequest=lambda *args: args,
     )
     worker = isolated_method(path, "MooncakePushConnectorWorker", "_build_layer_transfer_request", ns)()
@@ -550,7 +552,7 @@ def test_dsv4_push_final_chunk_uses_live_component_groups(ns):
     peer = NS(layer_names=["component"], group_indices=[0], block_size_scales=[[1]], layer_block_sizes=[4])
     destination = NS(
         transfer_params=dict(
-            num_computed_tokens=0, num_external_tokens=11, consumer_rank=(0, 0, 0), block_ids=((0, 7, 8),)
+            num_computed_tokens=8, num_external_tokens=3, consumer_rank=(0, 0, 0), block_ids=((0, 7, 8),)
         ),
         sent_tokens={},
         metadata_future=NS(result=lambda: NS(metadata_by_pp_rank=[peer])),
@@ -562,7 +564,8 @@ def test_dsv4_push_final_chunk_uses_live_component_groups(ns):
     assert worker._build_layer_transfer_request("r", state, destination, "component") is None
     state.available_layers["component"] = 11, "event"
     transfer, event = worker._build_layer_transfer_request("r", state, destination, "component")
-    assert transfer == ("r", (3, 4), (7, 8), 3, 11)
+    expected = ("r", (4,), (8,), 8, 11) if cacheable else ("r", (3, 4), (7, 8), 3, 11)
+    assert transfer == expected
     assert event == "event"
 
 
