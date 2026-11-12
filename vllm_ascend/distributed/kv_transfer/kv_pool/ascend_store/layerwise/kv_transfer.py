@@ -925,7 +925,9 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
         active_indices = [index for index, key in enumerate(req_meta.keys) if key in self._active_put_keys]
         active_keys = [req_meta.keys[index] for index in active_indices]
         if active_keys:
+            ready_start = time.perf_counter_ns()
             self.sync_save_events[layer_id].synchronize()
+            copy_start = time.perf_counter_ns()
             active_buffers = [req_meta.all_buffers[index] for index in active_indices]
             active_sizes = [req_meta.all_sizes[index] for index in active_indices]
             active_offsets = [req_meta.all_offsets[index] for index in active_indices]
@@ -945,6 +947,13 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
                         self.m_store.batch_copy_put(keys, buffers, sizes, offsets),
                     )
                 )
+            offload_event(
+                "range_save_time",
+                layer=layer_id,
+                keys=len(active_keys),
+                source_wait_ns=copy_start - ready_start,
+                copy_ns=time.perf_counter_ns() - copy_start,
+            )
             _emit_range_debug_event("save", layer_id, active_sizes, active_offsets, results)
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:

@@ -2569,10 +2569,16 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 bool(self.layer_load_tasks[self.current_layer]) or self.current_layer in self.prefetch_layer_map
             )
             if should_wait:
+                wait_start = time.perf_counter_ns()
                 while not self.layer_load_finished_events[self.current_layer].wait(timeout=10):
                     self.kv_recv_thread.raise_if_failed()
                     logger.info("Layerwise %d load not done, keep waiting", self.current_layer)
                 self.kv_recv_thread.raise_if_failed()
+                offload_event(
+                    "layer_load_wait_time",
+                    layer=self.current_layer,
+                    wait_ns=time.perf_counter_ns() - wait_start,
+                )
             elif self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(self.current_layer)
             if getattr(self, "layerwise_offload", False) or getattr(self, "block_key_hybrid", False):
@@ -2661,7 +2667,14 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 # thread's tail latency into the inter-step scheduling gap.
                 self._pending_last_save_drain = True
             else:
+                drain_start = time.perf_counter_ns()
                 self._wait_for_final_layer_save(num_local, send_thread)
+                if self._current_layerwise_request_ids:
+                    offload_event(
+                        "save_drain_time",
+                        requests=sorted(self._current_layerwise_request_ids),
+                        wait_ns=time.perf_counter_ns() - drain_start,
+                    )
         self.current_layer += 1
 
     def _wait_for_final_layer_save(self, num_local: int, send_thread: KVTransferThread) -> None:

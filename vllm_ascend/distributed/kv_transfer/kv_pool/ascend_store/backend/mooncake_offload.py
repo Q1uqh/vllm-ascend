@@ -9,6 +9,7 @@ read. There is no per-layer key or session preparation on the forward path.
 
 from __future__ import annotations
 
+import time
 from copy import copy
 from typing import TYPE_CHECKING
 
@@ -40,13 +41,14 @@ def _load_entries(worker, request, group, hashes, mask):
     if spec is None or not spec.can_load:
         return []
     recurrent = worker.group_uses_align_state[group]
+    shared = worker._group_reuses_buffer(group)
     if (
         spec.layerwise_previous_step
         and getattr(getattr(worker, "kv_cache_config", None), "dsv4_shared_cache_names", None) is not None
-        and not worker._group_reuses_buffer(group)
+        and not shared
     ):
         return []
-    if spec.layerwise_previous_step and recurrent and not worker._group_reuses_buffer(group):
+    if spec.layerwise_previous_step and recurrent and not shared:
         return []
     tokens = spec.kvpool_cached_tokens
     if not worker.use_eagle and spec.kvpool_store_skip_tokens is not None:
@@ -82,7 +84,7 @@ def _load_entries(worker, request, group, hashes, mask):
         if recurrent and ids[index] == 0:
             raise ValueError("Mooncake offload restore selected a null recurrent checkpoint")
         if ids[index] == 0:
-            if worker._group_reuses_buffer(group) or (mask is not None and index < len(mask) and mask[index]):
+            if shared or (mask is not None and index < len(mask) and mask[index]):
                 raise ValueError("Mooncake offload restore selected a required null block")
             continue
         if snapshot_start is not None and index >= snapshot_start:
@@ -243,9 +245,11 @@ def prepare_offload_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMe
     groups: dict[int, list[ReqMeta]] = {group: [] for group in worker.cacheable_group_ids}
     get_slots = []
     put_slots: list[tuple[ReqMeta, str, int | None, int]] = []
+    prepare_start = time.perf_counter_ns()
     for request in requests:
-        cached = request.load_spec.kvpool_cached_tokens if request.load_spec is not None else 0
-        masks = worker._compute_reachable_load_masks(request, cached)
+        spec = request.load_spec
+        cached = spec.kvpool_cached_tokens if spec is not None and spec.can_load else 0
+        masks = worker._compute_reachable_load_masks(request, cached) if cached > 0 else None
         for group in worker.cacheable_group_ids:
             view = copy(request)
             view.load_block_keys = []
@@ -276,6 +280,7 @@ def prepare_offload_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMe
                 for key, slot in _save_entries(worker, request, view, group, hashes)
             )
             groups[group].append(view)
+    entries_done = time.perf_counter_ns()
     try:
         worker._open_layerwise_get_sessions(get_slots)
         worker._check_layerwise_transfer_errors()
@@ -284,4 +289,13 @@ def prepare_offload_sessions(worker: LayerwiseKVPoolWorker, requests: list[ReqMe
         worker._layer_load_aborted.set()
         worker._finish_current_layerwise_load_sessions()
         raise
+    if requests:
+        offload_event(
+            "session_prepare_time",
+            requests=sorted(worker._current_layerwise_request_ids),
+            get_keys=len(get_slots),
+            put_keys=len(put_slots),
+            build_ns=entries_done - prepare_start,
+            open_ns=time.perf_counter_ns() - entries_done,
+        )
     return groups
