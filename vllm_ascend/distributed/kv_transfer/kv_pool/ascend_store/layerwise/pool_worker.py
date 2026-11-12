@@ -2507,6 +2507,16 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             return True
 
         window_end = min(self.current_layer + self.num_prefetch_layers, self.num_layers - 1)
+        # DSpark writes draft context directly between Store load/save hooks.
+        # Those writes do not open the attention gate used by prefetch tasks.
+        speculative = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
+        if (
+            getattr(getattr(self, "kv_cache_config", None), "dsv4_component_identity", None) is not None
+            and getattr(speculative, "method", None) == "dspark"
+        ):
+            first_draft = self._global_to_local_layer.get(self.hf_config.num_hidden_layers)
+            if first_draft is not None:
+                window_end = min(window_end, max(self.current_layer, first_draft - 1))
         while self.next_layer_to_submit <= window_end:
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
