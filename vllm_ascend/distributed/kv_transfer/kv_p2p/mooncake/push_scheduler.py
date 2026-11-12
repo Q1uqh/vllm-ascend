@@ -26,7 +26,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import MooncakeMetaserverClient
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.offload_diagnostics import offload_event
-from vllm_ascend.models.deepseek_v4.cache_config import component_layout_identity, is_deepseek_v4_cache
+from vllm_ascend.models.deepseek_v4.cache_config import is_deepseek_v4_cache
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -58,11 +58,16 @@ class MooncakePushConnectorScheduler(MooncakeBaseConnectorScheduler):
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig") -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        self._is_dsv4 = is_deepseek_v4_cache(kv_cache_config.kv_cache_groups)
+        # Scheduler projection keeps only one spec per group. Use the identity
+        # captured from all components before that projection.
+        component_identity = getattr(kv_cache_config, "dsv4_component_identity", None)
+        self._is_dsv4 = component_identity is not None or is_deepseek_v4_cache(kv_cache_config.kv_cache_groups)
+        if self._is_dsv4 and component_identity is None:
+            raise ValueError("DSV4 Push requires a component identity from the physical cache config")
         self.need_truncate |= self._is_dsv4
         self._dsv4_identity = (
             (
-                component_layout_identity(kv_cache_config.kv_cache_groups),
+                component_identity,
                 vllm_config.model_config.compute_hash(),
                 vllm_config.cache_config.cache_dtype,
             )
