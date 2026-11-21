@@ -81,6 +81,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     is_kv_save_role,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import BaseKVPoolWorker
+from vllm_ascend.models.deepseek_v4.cache_transfer import transfer_cache_views
 
 # PERF-TUNE switch: defer the last layer's save drain out of the forward
 # critical path; the drain runs at the start of the next step's start_load_kv.
@@ -461,6 +462,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     layer_byte_offset=layer_byte_offset,
                 )
             )
+        shared_entries = getattr(self, "dsv4_group_shared_entries", {})
+        for group_id, builder in enumerate(builders):
+            builder.shared_cache_entries = shared_entries.get(group_id)
         return builders
 
     def configure_dspark_prefix_cache(self, keys: DSparkPrefixKeys) -> None:
@@ -634,6 +638,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self._transfer_threads_started = True
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        if getattr(self.kv_cache_config, "dsv4_component_identity", None) is not None:
+            kv_caches = transfer_cache_views(kv_caches)
         if self.use_recoverssm:
             kv_caches = self._recoverssm_store_caches(kv_caches)
         draft_names = set(getattr(self, "_dspark_draft_layer_names", ()))
@@ -801,6 +807,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
 
     def _group_reuses_buffer(self, group_id: int) -> bool:
         """Include both writers of each shared slot, including its first owner."""
+        names = getattr(self.kv_cache_config, "dsv4_shared_cache_names", None)
+        if names is not None:
+            return bool(set(names) & set(self.kv_cache_config.kv_cache_groups[group_id].layer_names))
         return any(
             candidate_group == group_id
             for layer in set(self.prefetch_layer_map)
@@ -974,6 +983,14 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
     def _release_layerwise_requests_terminal(self, req_ids: set[str]) -> None:
         with self._load_session_lock:
             self._end_layerwise_load_keys(self._layerwise_session_tracker.release_terminal(req_ids))
+        aliases = getattr(self, "_offload_private_aliases", None)
+        if aliases:
+            for identity in [identity for identity in aliases if identity[0] in req_ids]:
+                del aliases[identity]
+        for name in ("_offload_active_pages", "_offload_pending_pages"):
+            checkpoints = getattr(self, name, {})
+            for identity in [identity for identity in checkpoints if identity[0] in req_ids]:
+                del checkpoints[identity]
 
     def _release_failed_layerwise_get_attempts(self, request_ids_by_key: dict[str, set[str]]) -> None:
         with self._load_session_lock:
@@ -1182,52 +1199,63 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         for request in requests:
             if request.can_save is None or not request.can_save:
                 continue
-            save_start_block = request.save_start_token // block_size
-            group_block_hashes = get_block_hashes(
-                request.block_hashes,
-                block_size,
-                self.hash_block_size,
-            )
-            partial_block_index = get_partial_block_index(
-                request.target_token_len,
-                block_size,
-                len(group_block_hashes),
-                self.layerwise_offload,
-            )
-            save_end_block = self._layerwise_save_full_end(request, group_id, block_size, partial_block_index)
-            # External hits already have full keys. A previous-step hit may
-            # instead use snapshots, which still need promotion to full keys.
-            if (
-                request.load_spec is not None
-                and request.load_spec.can_load
-                and not request.load_spec.layerwise_previous_step
-            ):
-                pool_hit_tokens = (
-                    request.load_spec.kvpool_store_skip_tokens
-                    if request.load_spec.kvpool_store_skip_tokens is not None
-                    else request.load_spec.kvpool_cached_tokens
+            if self.use_block_key_layerwise and self.layerwise_offload:
+                # The prepared keys include request-private pages excluded by
+                # the public prefix mask. Only opened PUT sessions have keys
+                # here, and the batch builder skips empty slots.
+                start = request.save_key_block_offset
+                end = start + len(request.save_block_keys)
+                block_runs = [(start, end)] if any(request.save_block_keys) else []
+                partial_block_index = (
+                    request.partial_block_index if request.save_last_block_key is not None else None
                 )
-                hit_full_blocks = pool_hit_tokens // block_size
-                save_start_block = max(save_start_block, hit_full_blocks)
-            if partial_block_index is None:
-                partial_block_index = request.partial_block_index
-            num_allocated_blocks = (
-                len(request.block_ids_by_group_np[group_id])
-                if request.block_ids_by_group_np is not None and group_id < len(request.block_ids_by_group_np)
-                else len(request.block_ids_by_group[group_id])
-            )
-            save_end_block = min(save_end_block, num_allocated_blocks)
-            save_start_block = min(save_start_block, save_end_block)
-            if partial_block_index is not None and partial_block_index >= num_allocated_blocks:
-                partial_block_index = None
-            group_store_mask = (
-                request.store_masks[group_id]
-                if request.store_masks is not None and group_id < len(request.store_masks)
-                else None
-            )
-            block_runs = self._masked_block_runs_cached(
-                "save", request, group_id, save_start_block, save_end_block, group_store_mask
-            )
+            else:
+                save_start_block = request.save_start_token // block_size
+                group_block_hashes = get_block_hashes(
+                    request.block_hashes,
+                    block_size,
+                    self.hash_block_size,
+                )
+                partial_block_index = get_partial_block_index(
+                    request.target_token_len,
+                    block_size,
+                    len(group_block_hashes),
+                    self.layerwise_offload,
+                )
+                save_end_block = self._layerwise_save_full_end(request, group_id, block_size, partial_block_index)
+                # External hits already have full keys. A previous-step hit may
+                # instead use snapshots, which still need promotion to full keys.
+                if (
+                    request.load_spec is not None
+                    and request.load_spec.can_load
+                    and not request.load_spec.layerwise_previous_step
+                ):
+                    pool_hit_tokens = (
+                        request.load_spec.kvpool_store_skip_tokens
+                        if request.load_spec.kvpool_store_skip_tokens is not None
+                        else request.load_spec.kvpool_cached_tokens
+                    )
+                    hit_full_blocks = pool_hit_tokens // block_size
+                    save_start_block = max(save_start_block, hit_full_blocks)
+                if partial_block_index is None:
+                    partial_block_index = request.partial_block_index
+                num_allocated_blocks = (
+                    len(request.block_ids_by_group_np[group_id])
+                    if request.block_ids_by_group_np is not None and group_id < len(request.block_ids_by_group_np)
+                    else len(request.block_ids_by_group[group_id])
+                )
+                save_end_block = min(save_end_block, num_allocated_blocks)
+                save_start_block = min(save_start_block, save_end_block)
+                if partial_block_index is not None and partial_block_index >= num_allocated_blocks:
+                    partial_block_index = None
+                group_store_mask = (
+                    request.store_masks[group_id]
+                    if request.store_masks is not None and group_id < len(request.store_masks)
+                    else None
+                )
+                block_runs = self._masked_block_runs_cached(
+                    "save", request, group_id, save_start_block, save_end_block, group_store_mask
+                )
             if not block_runs and partial_block_index is None:
                 continue
             for run_idx, (run_start_block, run_end_block) in enumerate(block_runs):
@@ -2461,6 +2489,16 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             return True
 
         window_end = min(self.current_layer + self.num_prefetch_layers, self.num_layers - 1)
+        # DSpark writes draft context directly between Store load/save hooks.
+        # Those writes do not open the attention gate used by prefetch tasks.
+        speculative = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
+        if (
+            getattr(getattr(self, "kv_cache_config", None), "dsv4_component_identity", None) is not None
+            and getattr(speculative, "method", None) == "dspark"
+        ):
+            first_draft = self._global_to_local_layer.get(self.hf_config.num_hidden_layers)
+            if first_draft is not None:
+                window_end = min(window_end, max(self.current_layer, first_draft - 1))
         while self.next_layer_to_submit <= window_end:
             layer_id = self.next_layer_to_submit
             self.next_layer_to_submit += 1
@@ -2577,7 +2615,16 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         if self.current_layer == num_local - 1:
             # Recurrent state may be cleared or copied before the next load
             # hook. Finish reading shared state before returning from forward.
-            if _LW_DEFER_LAST_SAVE and not (
+            config = getattr(self, "vllm_config", None)
+            speculative = getattr(config, "speculative_config", None)
+            scheduler = getattr(config, "scheduler_config", None)
+            # An async step can already be queued, and speculative proposals
+            # may rewrite draft pages within the current step.
+            drain_dsv4_now = getattr(self.kv_cache_config, "dsv4_component_identity", None) is not None and (
+                getattr(scheduler, "async_scheduling", False)
+                or getattr(speculative, "method", None) in ("mtp", "dspark")
+            )
+            if _LW_DEFER_LAST_SAVE and not drain_dsv4_now and not (
                 self._recurrent_layers
                 & (
                     self.prefetch_layer_map.keys()
@@ -2626,6 +2673,12 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 while not save_finished_events[layer_id].wait(timeout=10):
                     send_thread.raise_if_failed()
             send_thread.raise_if_failed()
+        pending = getattr(self, "_offload_pending_pages", None)
+        if pending:
+            if not hasattr(self, "_offload_active_pages"):
+                self._offload_active_pages = {}
+            self._offload_active_pages.update(pending)
+            pending.clear()
         reuse_source_layers = {source for value in self.prefetch_layer_map.values() for source in reuse_sources(value)}
         for layer_id in range(num_local):
             if layer_id in reuse_source_layers:

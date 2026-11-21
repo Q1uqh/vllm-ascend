@@ -1217,6 +1217,29 @@ def _allocate_kv_cache(
             for name in get_kv_cache_tensor_layers(allocation):
                 kv_cache_raw_tensors[name] = backing
         return kv_cache_raw_tensors
+    if getattr(kv_cache_config, "dsv4_shared_cache_names", None) is not None:
+        # DSV4's model-owned plan separates resident regions from scratch.
+        # Keep this before the ordinary shared-tuple allocation below.
+        covered: set[str] = set()
+        for descriptor in kv_cache_config.kv_cache_tensors:
+            names = get_kv_cache_tensor_layers(descriptor)
+            if (
+                not names
+                or descriptor.offset
+                or descriptor.layer_stride
+                or descriptor.size != kv_cache_config.num_blocks * descriptor.block_stride
+                or any(layer_kv_cache_spec[name].page_size_bytes != descriptor.block_stride for name in names)
+                or covered.intersection(names)
+            ):
+                raise ValueError("Invalid DSV4 component slot geometry")
+            covered.update(names)
+        if covered != set(layer_kv_cache_spec):
+            raise ValueError("DSV4 component slots must cover every cache exactly once")
+        for descriptor in kv_cache_config.kv_cache_tensors:
+            backing = _allocate_int8_cache_tensor(descriptor.size, alignment, device)
+            for name in get_kv_cache_tensor_layers(descriptor):
+                kv_cache_raw_tensors[name] = backing
+        return kv_cache_raw_tensors
     uses_padded_page_layout = requires_padded_page_layout(layer_kv_cache_spec.values())
     has_shared_slot_descriptors = any(descriptor.layer_stride == 0 for descriptor in kv_cache_config.kv_cache_tensors)
     # GLM-Next emits one descriptor for each physical cache slot. Layers
