@@ -45,6 +45,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwis
     get_physical_layer_index,
     reuse_sources,
 )
+from vllm_ascend.models.deepseek_v4.cache_config import is_deepseek_v4_cache, validate_dsv4_transfer_speculation
+from vllm_ascend.models.deepseek_v4.cache_transfer import transfer_cache_views
 
 # Rank tuples are (PP, PCP, TP), matching scheduler handshake keys.
 WorkerRank = tuple[int, int, int]
@@ -209,6 +211,19 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
         if vllm_config.parallel_config.decode_context_parallel_size != 1:
             raise ValueError("Mooncake Push worker currently requires DCP=1")
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._is_dsv4 = is_deepseek_v4_cache(getattr(kv_cache_config, "kv_cache_groups", ()))
+        self._preserve_component_pages = self._is_dsv4
+        if self._is_dsv4:
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.prefill_context_parallel_size,
+            ) != (1, 1, 1):
+                raise ValueError("DSV4 Mooncake Push requires TP=PP=PCP=1")
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError("DSV4 Mooncake Push requires eager execution")
+            validate_dsv4_transfer_speculation(vllm_config)
         self._stop_event = threading.Event()
         self._result_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._reqs_recv_state: dict[str, _ReceiveState] = {}
@@ -239,6 +254,8 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
         self._zmq_context: Context | None = None
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor | list[torch.Tensor]"]) -> None:
+        if self._preserve_component_pages:
+            kv_caches = transfer_cache_views(kv_caches)
         super().register_kv_caches(kv_caches)
         if self.kv_transfer_config.is_kv_producer:
             # KVPP is outside the Push support plan.
@@ -258,11 +275,16 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
             self._layer_names_by_index: dict[tuple[str, int], list[str]] = {}
             for name, layer_index in self._layer_index_by_name.items():
                 self._layer_names_by_index.setdefault(layer_index, []).append(name)
-            if self._slot_predecessors:
+            if self._slot_predecessors or self._is_dsv4:
                 base_layers = self.vllm_config.model_config.get_num_layers(self.vllm_config.parallel_config)
                 self._slot_index_by_name = {
                     name: get_physical_layer_index(name, base_layers) for name in self._layer_indices
                 }
+            if self._is_dsv4:
+                for name in self._layer_indices:
+                    if name.endswith(".self_attn.swa_cache"):
+                        hook = name.removesuffix(".swa_cache") + ".attn"
+                        self._layer_index_by_name.setdefault(hook, self._layer_index_by_name[name])
             # Layer numbers do not establish execution order across models.
             # Multiple namespaces finalize at wait_for_save after draft execution.
             namespaces = {namespace for namespace, _ in self._layer_names_by_index}
@@ -472,7 +494,11 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 local_rank // ratio == remote_rank if local_size >= remote_size else remote_rank // ratio == local_rank
             )
             return (0, 0, 1) if matched else None
-        whole = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or is_circular_kv_cache_spec(spec)
+        whole = (
+            self._is_dsv4
+            or isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+            or is_circular_kv_cache_spec(spec)
+        )
         if whole:
             # Replicated pages: exactly one P worker writes each D replica.
             owner = (rank[2] * remote.pcp_size + rank[1]) % (self.tp_size * self.pcp_size)
@@ -555,7 +581,8 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 return None
             if final_only:
                 # Window tables retain logical positions, including null slots.
-                start = max(start, end - getattr(spec, "num_retained_tokens", spec.sliding_window - 1) - 1)
+                window_start = max(0, end - getattr(spec, "num_retained_tokens", spec.sliding_window - 1) - 1)
+                start = max(start, window_start)
             first, last = start // block_size, (end + block_size - 1) // block_size
             local_ids, remote_ids = [], []
             for index in range(first, last):
@@ -604,7 +631,11 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 partition = self._get_transfer_partition(batch.layer_name, remote, batch.remote_rank)
                 assert partition is not None
                 local_offset, remote_offset, heads = partition
-                whole = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or is_circular_kv_cache_spec(spec)
+                whole = (
+                    self._is_dsv4
+                    or isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+                    or is_circular_kv_cache_spec(spec)
+                )
                 local = self.transfer_metadata
                 for cache_index, (local_addr, remote_addr) in enumerate(
                     zip(local.kv_caches_base_addr[local_index], worker.kv_caches_base_addr[remote_index], strict=True)
@@ -616,6 +647,10 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                         remote_len //= pp.block_shapes[remote_index][cache_index][0]
                     if local_len != remote_len:
                         raise ValueError("P/D cache slice lengths differ")
+                    if self._is_dsv4 and local_len > min(
+                        local.block_strides[local_index][cache_index], pp.block_strides[remote_index][cache_index]
+                    ):
+                        raise ValueError("DSV4 Push payload exceeds physical page stride")
                     for req in batch.requests:
                         for local_block, remote_block in zip(req.local_block_ids, req.remote_block_ids, strict=True):
                             src_list.append(

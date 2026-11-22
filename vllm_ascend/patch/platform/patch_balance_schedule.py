@@ -63,6 +63,7 @@ import torch
 import torch.distributed as dist
 import vllm.v1.core.sched.scheduler as _sched_mod
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
+from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -78,6 +79,9 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.ascend_config import init_ascend_config
+
+
+logger = init_logger(__name__)
 
 
 def _balance_scheduling_enabled(vllm_config) -> bool:
