@@ -46,6 +46,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_trans
     _circular_shift,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
+    get_layerwise_reuse_layout,
     get_physical_layer_index,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -614,6 +615,9 @@ class BaseKVPoolWorker(ABC):
         group_block_lens: list[int] = []
         group_block_strides: list[int] = []
         group_cache_entry_segments: list[tuple[int, int]] = []
+        shared_entries: list[bool] = []
+        layout = get_layerwise_reuse_layout(self.kv_cache_config)
+        shared_names = layout.reused_cache_names if layout is not None else None
         layer_names_by_physical: dict[int, list[str]] = {}
         for layer_name in layer_names:
             phys = self._extract_physical_layer_index(layer_name)
@@ -637,6 +641,7 @@ class BaseKVPoolWorker(ABC):
                 )
                 for segments in cache_segments:
                     for segment_index, (base_addr, block_len, block_stride) in enumerate(segments):
+                        shared_entries.append(shared_names is None or layer_name in shared_names)
                         group_cache_entry_segments.append((segment_index, len(segments)))
                         group_addrs.append(base_addr)
                         group_block_lens.append(block_len)
@@ -650,6 +655,10 @@ class BaseKVPoolWorker(ABC):
                         len(combined),
                     )
             layer_cache_entry_offsets.append(len(group_addrs))
+        if shared_names is not None:
+            if not hasattr(self, "group_shared_cache_entries"):
+                self.group_shared_cache_entries = {}
+            self.group_shared_cache_entries[group_id] = shared_entries
         self.group_kv_caches_base_addr[group_id] = group_addrs
         self.group_block_len[group_id] = group_block_lens
         self.group_block_stride[group_id] = group_block_strides

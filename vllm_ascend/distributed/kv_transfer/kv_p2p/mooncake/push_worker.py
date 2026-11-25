@@ -44,6 +44,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     get_layerwise_reuse_layout,
 )
+from vllm_ascend.models.deepseek_v4.cache_config import is_deepseek_v4_cache, validate_dsv4_transfer_speculation
 
 # Rank tuples are (PP, PCP, TP), matching scheduler handshake keys.
 WorkerRank = tuple[int, int, int]
@@ -204,6 +205,18 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
 
     def __init__(self, vllm_config, engine_id, kv_cache_config) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._is_dsv4 = is_deepseek_v4_cache(getattr(kv_cache_config, "kv_cache_groups", ()))
+        if self._is_dsv4:
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.prefill_context_parallel_size,
+            ) != (1, 1, 1):
+                raise ValueError("DSV4 Mooncake Push requires TP=PP=PCP=1")
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError("DSV4 Mooncake Push requires eager execution")
+            validate_dsv4_transfer_speculation(vllm_config)
         self._stop_event = threading.Event()
         self._result_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._reqs_recv_state: dict[str, _ReceiveState] = {}
@@ -277,6 +290,10 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
             cache_names = getattr(layer, "kv_transfer_cache_names", None)
             if cache_names is not None:
                 self._layer_index_by_name[alias] = self._layer_index_by_name[cache_names[0]]
+            elif alias not in self._layer_index_by_name:
+                owner = getattr(layer, "layerwise_push_cache_name", None)
+                if owner in self._layer_index_by_name:
+                    self._layer_index_by_name[alias] = self._layer_index_by_name[owner]
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         if self.kv_transfer_config.is_kv_producer:
@@ -486,7 +503,10 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 local_rank // ratio == remote_rank if local_size >= remote_size else remote_rank // ratio == local_rank
             )
             return (0, 0, 1) if matched else None
-        whole = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or is_circular_kv_cache_spec(spec)
+        whole = (
+            isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+            or is_circular_kv_cache_spec(spec)
+        )
         if whole:
             # Registration exposes each KVPP target layer only on its persistent owner.
             # That owner supplies the full page to every destination holding the layer.
@@ -594,7 +614,8 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 return None
             if final_only:
                 # Window tables retain logical positions, including null slots.
-                start = max(start, end - getattr(spec, "num_retained_tokens", spec.sliding_window - 1) - 1)
+                window_start = max(0, end - getattr(spec, "num_retained_tokens", spec.sliding_window - 1) - 1)
+                start = max(start, window_start)
             first, last = start // block_size, (end + block_size - 1) // block_size
             local_ids, remote_ids = [], []
             for index in range(first, last):
@@ -662,7 +683,10 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 partition = self._get_transfer_partition(batch.layer_name, remote, batch.remote_rank)
                 assert partition is not None
                 local_offset, remote_offset, heads = partition
-                whole = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or is_circular_kv_cache_spec(spec)
+                whole = (
+                    isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+                    or is_circular_kv_cache_spec(spec)
+                )
                 local = self.transfer_metadata
                 for cache_index, (local_addr, remote_addr) in enumerate(
                     zip(local.kv_caches_base_addr[local_index], worker.kv_caches_base_addr[remote_index], strict=True)
@@ -674,6 +698,12 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                         remote_len //= pp.block_shapes[remote_index][cache_index][0]
                     if local_len != remote_len:
                         raise ValueError("P/D cache slice lengths differ")
+                    local_stride = local.block_strides[local_index][cache_index]
+                    remote_stride = pp.block_strides[remote_index][cache_index]
+                    if (local_offset + heads) * local_len > local_stride or (
+                        remote_offset + heads
+                    ) * remote_len > remote_stride:
+                        raise ValueError("Push payload exceeds physical page stride")
                     for req in batch.requests:
                         for local_block, remote_block in zip(req.local_block_ids, req.remote_block_ids, strict=True):
                             src_list.append(

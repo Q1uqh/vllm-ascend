@@ -675,6 +675,8 @@ class DeepseekV4Attention(nn.Module):
             # prefix=f'{prefix}.attn',
             prefix=f"{prefix}",
         )
+        if self.compress_ratio <= 1:
+            self.dsa_attn.dsa_attn.layerwise_push_cache_name = swa_cache_layer.prefix
 
     def forward(
         self,

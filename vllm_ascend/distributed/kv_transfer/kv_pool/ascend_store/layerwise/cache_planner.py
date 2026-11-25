@@ -26,7 +26,10 @@ from .layerwise_cache_layout import (
 )
 
 SPEC_REUSE_RULES = MappingProxyType(
-    {"glm5_next_text": "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES"}
+    {
+        "glm5_next_text": "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES",
+        "deepseek_v4": "vllm_ascend.models.deepseek_v4.cache_reuse.DEEPSEEK_V4_SPEC_REUSE_RULES",
+    }
 )
 
 
@@ -330,4 +333,17 @@ def plan_layerwise_cache_reuse(
         getattr(spec, "store_on_host", False) for spec in planner.spec_by_entry.values()
     ):
         raise ValueError("Layerwise offload requires device-resident cache tensors.")
+    if _is_mooncake(extra_config):
+        windows = {}
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            if layout.reused_cache_names.isdisjoint(group.layer_names):
+                continue
+            spec = planner.spec_by_entry[group.layer_names[0]]
+            window = getattr(spec, "sliding_window", None)
+            if window is not None:
+                windows[group_id] = window + (getattr(spec, "extra_retained_tokens", 0) or 0)
+        kv_cache_config.block_key_prefill_windows = windows
+        kv_cache_config.block_key_continuation_windows = (
+            windows if vllm_config.speculative_config is None else {}
+        )
     return layout
