@@ -633,6 +633,7 @@ def test_layerwise_prefill_keeps_checkpoint_for_partial_tail(ns, offload, target
         _get_last_chunk_tokens_num=lambda tokens: len(tokens) // 128 * 128,
         cache_transfer_granularity=128,
         _discard_partial_chunks=True,
+        enable_partial_hash_hits=False,
         original_block_size=128,
         kv_cache_group_families=(),
         hash_block_size=128,
@@ -727,7 +728,7 @@ def test_actual_receive_handler_waits_for_source_before_overwrite(ns, save_faile
     receiver.group_builders = [NS(build_addrs=lambda *args: meta)]
     receiver._handle_range_request = lambda *args: events.append("actual_write")
     task = NS(shared_block_data=shared, group_id=0, layer_idx_in_group=0, final_group_layer=True)
-    data = NS(layer_id=1, wait_for_save_layers=(0,), attention_start_gate=None, transfer_tasks=[task])
+    data = NS(layer_id=1, wait_for_save_layers=(0,), load_gate=None, compute_boundary=None, transfer_tasks=[task])
     failures = []
 
     def run():
@@ -838,7 +839,7 @@ def test_cold_slot_wait_has_evidence_without_get(ns):
     receiver._wait_for_event = lambda event, *args: event.wait(timeout=1)
     receiver.load_disabled = threading.Event()
     receiver.external_slot_release_waiter = MagicMock()
-    task = NS(wait_for_save_layers=(0,), transfer_tasks=[], layer_id=1, attention_start_gate=None)
+    task = NS(wait_for_save_layers=(0,), transfer_tasks=[], layer_id=1, load_gate=None, compute_boundary=None)
     assert receiver._copy_gva_layers(task)
     receiver.sync_save_events[0].synchronize.assert_called_once_with()
     assert [call.args for call in receiver.external_slot_release_waiter.call_args_list] == [(0,), (1,)]

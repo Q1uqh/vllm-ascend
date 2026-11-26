@@ -968,7 +968,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             active_indices = [
                 index
                 for index in range(len(req_meta.keys))
-                 if index in self._active_load_indices and req_meta.all_sizes[index]
+                if index in self._active_load_indices and req_meta.all_sizes[index]
             ]
             active_keys = [req_meta.keys[index] for index in active_indices]
             active_buffers = [req_meta.all_buffers[index] for index in active_indices]
