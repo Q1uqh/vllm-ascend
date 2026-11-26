@@ -36,7 +36,7 @@ def test_conflict_protocol(production, scenario):
     calls = []
     def put(keys, sizes):
         calls.append(keys)
-        if scenario == 'success' or (scenario == 'public_conflict' and len(calls) == 2):
+        if scenario == 'success':
             return [0] * len(keys)
         return [-1 if scenario == 'capacity' else -705] * len(keys)
     def missing(keys):
@@ -47,49 +47,39 @@ def test_conflict_protocol(production, scenario):
     key = 'offload_v1:private' if scenario == 'private_conflict' else 'public'
     request = NS(req_id='r', layerwise_request_id='inc', target_token_len=128,
                  save_block_keys=[None], save_last_block_key=None)
-    if scenario in ('private_conflict', 'capacity'):
+    if scenario == 'capacity':
         with pytest.raises(RuntimeError):
-            production['_open_puts'](worker, [(request, key, 0, 128)], {"r": "inc"})
+            production['_open_puts'](worker, [(request, key, 0, 128)])
         assert len(calls) == 1
         return
-    if scenario == 'public_conflict':
-        other = NS(req_id='other', save_block_keys=[None])
-        fallbacks = production['_open_puts'](worker, [(request, key, 0, 128), (other, key, 0, 128)], {"r": "inc", "other": "other"})
-        assert calls == [['public'], ['public@offload_v1:fallback:inc', 'public@offload_v1:fallback:other']]
-        assert fallbacks == [(request, 0, calls[1][0]), (other, 0, calls[1][1])]
-        assert request.save_block_keys == [calls[1][0]]
-        assert other.save_block_keys == [calls[1][1]]
-        return
     duplicate = NS(save_block_keys=[None])
-    production['_open_puts'](worker, [(request, key, 0, 128), (duplicate, key, 0, 128)], {"r": "inc"})
+    production['_open_puts'](worker, [(request, key, 0, 128), (duplicate, key, 0, 128)])
     assert duplicate.save_block_keys == [None]
     assert len(calls) == 1
-    if scenario == 'committed':
-        assert request.save_block_keys == [None]
-    else:
-        assert request.save_block_keys == ['public']
+    assert request.save_block_keys == (['public'] if scenario == 'success' else [None])
+    worker._queue_layerwise_revoke_keys.assert_not_called()
 
 
 def test_put_rejection_revokes_only_owned_sessions(production):
     calls = []
     def put(keys, sizes):
         calls.append(keys)
-        return [0, -705] if len(calls) == 1 else [-705]
+        return [0, -705, -1]
     worker = NS(_filter_pool_existing_keys=lambda keys: list(keys),
                 _layerwise_key_batches=lambda keys: [keys], m_store=NS(batch_put_start=put),
                 _put_started_keys=set(), _put_started_keys_lock=threading.Lock(),
                 _queue_layerwise_revoke_keys=Mock())
     request = NS(req_id='r', layerwise_request_id='inc', target_token_len=128,
-                 save_block_keys=[None, None])
+                 save_block_keys=[None, None, None])
     with pytest.raises(RuntimeError):
-        production['_open_puts'](worker, [(request, 'owned', 0, 128), (request, 'competing', 1, 128)], {"r": "inc"})
-    assert calls == [['owned', 'competing'], ['competing@offload_v1:fallback:inc']]
+        production['_open_puts'](worker, [(request, 'owned', 0, 128), (request, 'competing', 1, 128), (request, 'failed', 2, 128)])
+    assert calls == [['owned', 'competing', 'failed']]
     revoked = {key for call in worker._queue_layerwise_revoke_keys.call_args_list for key in call.args[0]}
     assert revoked == {'owned'}
 
 
 @pytest.mark.parametrize("window", [False, True])
-def test_continuation_uses_conflict_fallback(production, window):
+def test_continuation_keeps_public_key_after_conflict(production, window):
     windows = {0: 128} if window else {}
     worker = NS(
         _layer_load_aborted=threading.Event(),
@@ -102,7 +92,7 @@ def test_continuation_uses_conflict_fallback(production, window):
         _check_hybrid_load_errors=Mock(),
         _filter_pool_existing_keys=list,
         _layerwise_key_batches=lambda keys: [keys] if keys else [],
-        m_store=NS(batch_put_start=Mock(side_effect=[[-705], [0]])),
+        m_store=NS(batch_put_start=Mock(return_value=[-705])),
         _put_started_keys=set(),
         _put_started_keys_lock=threading.Lock(),
         _queue_layerwise_revoke_keys=Mock(),
@@ -120,15 +110,15 @@ def test_continuation_uses_conflict_fallback(production, window):
         block_hashes=[b"a"], block_ids_by_group=[[1]], store_masks=None,
     )
     groups = production["prepare_offload_sessions"](worker, [request], "batch")
-    private_key = "61@offload_v1:fallback:batch:0"
-    assert groups[0][0].save_block_keys == [private_key]
-    assert worker._block_key_snapshots == {"r": {0: {0: production["BlockKeySnapshot"](private_key, 128)}}}
+    worker.m_store.batch_put_start.assert_called_once_with(["61"], [128])
+    assert groups[0][0].save_block_keys == []
+    assert worker._block_key_snapshots == {"r": {0: {}}}
     if window:
-        assert worker._offload_pending_pages == {("r", 0): (128, {0: private_key})}
+        assert worker._offload_pending_pages == {("r", 0): (128, {0: "61"})}
         worker._offload_active_pages = worker._offload_pending_pages
 
     request.target_token_len = 256
     request.load_spec = NS(can_load=True, layerwise_previous_step=True, kvpool_cached_tokens=128)
-    assert production["_load_entries"](worker, request, 0, [b"a"], None) == [(private_key, 0)]
+    assert production["_load_entries"](worker, request, 0, [b"a"], None) == [("61", 0)]
     request.load_spec.layerwise_previous_step = False
     assert production["_load_entries"](worker, request, 0, [b"a"], None) == [("61", 0)]

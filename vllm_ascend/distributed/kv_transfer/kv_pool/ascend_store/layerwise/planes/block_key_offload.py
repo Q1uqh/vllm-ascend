@@ -175,8 +175,7 @@ def _save_entries(worker, request, view, group, hashes, snapshots, snapshot_scop
     return entries if worker._is_layerwise_save_owner(group) else []
 
 
-def _open_missing(worker, target_sizes, started, *, allow_fallback):
-    conflicts = set()
+def _open_missing(worker, target_sizes, started):
     missing = worker._filter_pool_existing_keys(list(target_sizes))
     for batch in worker._layerwise_key_batches(missing):
         codes = require_aligned_batch_results(
@@ -186,15 +185,14 @@ def _open_missing(worker, target_sizes, started, *, allow_fallback):
         started.update(opened)
         with worker._put_started_keys_lock:
             worker._put_started_keys.update(opened)
-        rejected = {key: code for key, code in zip(batch, codes, strict=True) if code != 0}
-        for key in worker._filter_pool_existing_keys(list(rejected)):
-            if not allow_fallback or rejected[key] != _OBJECT_ALREADY_EXISTS or "offload_v1:" in key:
-                raise RuntimeError("Mooncake offload could not open a required PUT session")
-            conflicts.add(key)
-    return conflicts
+        rejected = [
+            key for key, code in zip(batch, codes, strict=True) if code not in (0, _OBJECT_ALREADY_EXISTS)
+        ]
+        if rejected and worker._filter_pool_existing_keys(rejected):
+            raise RuntimeError("Mooncake offload could not open a required PUT session")
 
 
-def _open_puts(worker, slots, snapshot_scopes):
+def _open_puts(worker, slots):
     # One metadata RPC per batch across requests and groups, with each group's
     # own object size. Deduplication also prevents duplicate concurrent writers.
     sizes: dict[str, int] = {}
@@ -204,25 +202,12 @@ def _open_puts(worker, slots, snapshot_scopes):
         sizes[key] = size
     started = set()
 
-    fallbacks = []
-    resolved_slots = []
-    fallback_sizes = {}
     try:
-        conflicts = _open_missing(worker, sizes, started, allow_fallback=True)
-        for view, key, slot, size in slots:
-            if key in conflicts:
-                # Do not wait here: the public writer may need this rank to
-                # enter an EP collective before it can finish the write.
-                key = f"{key}@offload_v1:fallback:{snapshot_scopes[view.req_id]}"
-                fallback_sizes[key] = size
-                fallbacks.append((view, slot, key))
-            resolved_slots.append((view, key, slot, size))
-        if fallback_sizes:
-            _open_missing(worker, fallback_sizes, started, allow_fallback=False)
+        _open_missing(worker, sizes, started)
     except Exception:
         worker._queue_layerwise_revoke_keys(list(started))
         raise
-    for view, key, slot, _ in resolved_slots:
+    for view, key, slot, _ in slots:
         if key in started:
             # Use one request's source pages for a deduplicated public write.
             started.remove(key)
@@ -230,7 +215,6 @@ def _open_puts(worker, slots, snapshot_scopes):
                 view.save_last_block_key = key
             else:
                 view.save_block_keys[slot] = key
-    return fallbacks
 
 
 def prepare_offload_sessions(
@@ -244,15 +228,12 @@ def prepare_offload_sessions(
     get_slots = []
     put_slots: list[tuple[ReqMeta, str, int | None, int]] = []
     pending = {}
-    save_records = {}
     config = getattr(worker, "kv_cache_config", None)
     window_groups = getattr(config, "block_key_prefill_windows", {})
-    snapshot_scopes = {}
     next_snapshots: dict[str, dict[int, dict[int, BlockKeySnapshot]]] = {}
     for request_index, request in enumerate(requests):
         assert snapshot_batch_id is not None
         snapshot_scope = f"{snapshot_batch_id}:{request_index}"
-        snapshot_scopes[request.req_id] = snapshot_scope
         load_spec = request.load_spec
         running = load_spec is not None and load_spec.layerwise_previous_step
         previous = worker._block_key_snapshots.get(request.req_id, {}) if running else {}
@@ -281,7 +262,6 @@ def prepare_offload_sessions(
                 get_slots.append((view, key, request.block_ids_by_group[group][index], index))
             group_snapshots = snapshots.setdefault(group, previous.get(group, {}).copy())
             saves = _save_entries(worker, request, view, group, hashes, group_snapshots, snapshot_scope)
-            checkpoint_pages = None
             if (
                 group in window_groups
                 and not worker.group_uses_align_state[group]
@@ -303,19 +283,12 @@ def prepare_offload_sessions(
                 pending[(request.req_id, group)] = (
                     request.target_token_len, checkpoint_pages
                 )
-            if saves:
-                save_records[id(view)] = (group_snapshots, checkpoint_pages)
             put_slots.extend((view, key, slot, sum(worker.group_block_len[group])) for key, slot in saves)
             groups[group].append(view)
     try:
         worker._open_layerwise_get_sessions(get_slots)
         worker._check_hybrid_load_errors()
-        for view, slot, key in _open_puts(worker, put_slots, snapshot_scopes):
-            index = view.partial_block_index if slot is None else view.save_key_block_offset + slot
-            group_snapshots, checkpoint_pages = save_records[id(view)]
-            group_snapshots[index] = BlockKeySnapshot(key, view.target_token_len)
-            if checkpoint_pages is not None and index in checkpoint_pages:
-                checkpoint_pages[index] = key
+        _open_puts(worker, put_slots)
         worker._offload_pending_pages = pending
         for views in groups.values():
             for view in views:
