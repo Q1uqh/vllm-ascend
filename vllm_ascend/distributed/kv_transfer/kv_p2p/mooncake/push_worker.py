@@ -45,7 +45,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     get_layerwise_reuse_layout,
 )
-from vllm_ascend.models.deepseek_v4.cache_config import is_deepseek_v4_cache, validate_dsv4_transfer_speculation
 
 # Rank tuples are (PP, PCP, TP), matching scheduler handshake keys.
 WorkerRank = tuple[int, int, int]
@@ -206,18 +205,6 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
 
     def __init__(self, vllm_config, engine_id, kv_cache_config) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
-        self._is_dsv4 = is_deepseek_v4_cache(getattr(kv_cache_config, "kv_cache_groups", ()))
-        if self._is_dsv4:
-            parallel = vllm_config.parallel_config
-            if (
-                parallel.tensor_parallel_size,
-                parallel.pipeline_parallel_size,
-                parallel.prefill_context_parallel_size,
-            ) != (1, 1, 1):
-                raise ValueError("DSV4 Mooncake Push requires TP=PP=PCP=1")
-            if not vllm_config.model_config.enforce_eager:
-                raise ValueError("DSV4 Mooncake Push requires eager execution")
-            validate_dsv4_transfer_speculation(vllm_config)
         self._stop_event = threading.Event()
         self._result_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._reqs_recv_state: dict[str, _ReceiveState] = {}
