@@ -12,8 +12,10 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
 from vllm.utils.network_utils import make_zmq_path
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
     GET_META_MSG,
     MooncakeBaseConnectorScheduler,
@@ -55,6 +57,11 @@ class MooncakePushConnectorScheduler(MooncakeBaseConnectorScheduler):
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: "KVCacheConfig") -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._requires_current_block_tables = any(
+            isinstance(spec, SlidingWindowSpec) and not is_circular_kv_cache_spec(spec)
+            for specs in self.group_unique_specs
+            for spec in specs
+        )
         self._metadata_thread: MooncakePushMetadataThread | None = None
         self._reqs_pending_recv: dict[str, tuple[Request, BlockIds, int]] = {}
         self._reqs_need_send_layerwise: dict[str, tuple[Request, BlockIds, int]] = {}
@@ -156,6 +163,12 @@ class MooncakePushConnectorScheduler(MooncakeBaseConnectorScheduler):
                 local_num_computed_tokens = num_computed_tokens[req_id]
                 if local_num_computed_tokens >= request.num_prompt_tokens:
                     continue
+                if self._requires_current_block_tables:
+                    state = getattr(scheduler_output, "kv_connector_block_state", None)
+                    live_blocks = state.get_block_ids(req_id) if state is not None else None
+                    if live_blocks is None:
+                        raise RuntimeError("Sliding-window Push requires current grouped block tables")
+                    block_ids = tuple(list(group) for group in live_blocks)
                 meta.add_new_push_send_req(
                     request_id=req_id,
                     # Match D's transfer table: the final Mamba block must be
