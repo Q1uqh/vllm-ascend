@@ -73,17 +73,11 @@ sharding without adding a data-parallel rank namespace.
 
 ### Deterministic output and concurrency
 
-Run from the repository root on the server. Use the same model weights,
-tokenizer, and sampling settings for both services. The script supplies token
-IDs directly to control input length. Its concurrent batches include repeated
-and mixed-length inputs.
-
-```bash
-python tests/e2e/cases/features/kv_pool/tools/compare_dsv4_offload.py \
-  --baseline http://BASELINE_HOST:PORT \
-  --candidate http://OFFLOAD_HOST:PORT \
-  --model dsv4 --concurrency 4 > comparison.log
-```
+Compare deterministic completions from the baseline and offload services using
+the same model weights, tokenizer, and sampling settings. Send identical token
+ID prompts to both services and compare completion text and finish reasons.
+Cover cold requests, repeated prefixes, changed suffixes, and concurrent
+batches with mixed input lengths.
 
 Retain the full service logs. Report performance metrics, output comparison
 results, and the first error with its context in at most 300 lines. After a
@@ -135,14 +129,47 @@ and have different suffixes.
 Add the following arguments to the P startup command:
 
 ```bash
---kv-transfer-config "$(cat examples/disaggregated_prefill_v1/dsv4_offload_p.json)" \
+--kv-transfer-config '{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_producer",
+  "kv_load_failure_policy": "fail",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {
+        "kv_connector": "MooncakePushConnector",
+        "kv_role": "kv_producer",
+        "kv_port": 14500
+      },
+      {
+        "kv_connector": "AscendStoreConnector",
+        "kv_role": "kv_producer",
+        "kv_connector_extra_config": {
+          "backend": "mooncake",
+          "lookup_rpc_port": "0",
+          "use_layerwise": true,
+          "layerwise_num_shared_buffers": 2,
+          "layerwise_independent_layers": [
+            0,
+            1
+          ],
+          "layerwise_prefetch_layers": 2
+        }
+      }
+    ]
+  }
+}' \
 --enforce-eager --no-async-scheduling --max-num-batched-tokens 4096
 ```
 
 Add the following arguments to the D startup command:
 
 ```bash
---kv-transfer-config "$(cat examples/disaggregated_prefill_v1/dsv4_offload_d.json)" \
+--kv-transfer-config '{
+  "kv_connector": "MooncakePushConnector",
+  "kv_role": "kv_consumer",
+  "kv_port": 14600,
+  "kv_load_failure_policy": "fail"
+}' \
 --enforce-eager --no-async-scheduling
 ```
 
