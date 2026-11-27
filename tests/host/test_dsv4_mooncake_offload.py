@@ -547,23 +547,19 @@ def test_aligned_prefill_saves_live_window_outside_public_store_mask(ns):
     assert ns["_load_entries"](worker, request, 0, hashes, [False] * 252 + [True] * 4) == saved
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_push_registers_declared_swa_owner(ns, shared):
-    path = "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/push_worker.py"
-    owner = "model.layers.0.self_attn.swa_cache"
-    hook = "model.layers.0.self_attn.attn"
-    layer = ("model.layers", 0)
-    worker = NS(
-        _layer_index_by_name={owner: layer},
-        _shared_layer_indices={owner: 0} if shared else {},
-        vllm_config=NS(compilation_config=NS(static_forward_context={
-            hook: NS(layerwise_push_cache_name=owner),
-            "unregistered": NS(layerwise_push_cache_name="not_on_this_rank"),
-        })),
-    )
-    register = isolated_method(path, "MooncakePushConnectorWorker", "_register_composite_layer_aliases", ns)
-    register._register_composite_layer_aliases(worker)
-    assert worker._layer_index_by_name == {owner: layer, hook: layer}
+@pytest.mark.parametrize(("has_connector", "shared"), [(False, False), (True, False), (True, True)])
+def test_swa_save_callback_uses_registered_name_for_shared_cache(ns, has_connector, shared):
+    swa = "model.layers.0.self_attn.swa_cache"
+    attn = "model.layers.0.self_attn.attn"
+    layout = NS(reused_cache_names={swa} if shared else set())
+    config = NS(layerwise_reuse_layout=layout)
+    ns["is_v1_kv_transfer_group"] = lambda: has_connector
+    ns["get_kv_transfer_group"] = MagicMock(return_value=NS(_kv_cache_config=config))
+    ns["get_layerwise_reuse_layout"] = lambda config: config.layerwise_reuse_layout
+    definitions("vllm_ascend/models/deepseek_v4/cache_reuse.py", ns, {"get_swa_save_layer_name"})
+    assert ns["get_swa_save_layer_name"](attn, swa) == (swa if shared else attn)
+    if not has_connector:
+        ns["get_kv_transfer_group"].assert_not_called()
 
 
 def isolated_method(path, cls_name, method_name, ns):

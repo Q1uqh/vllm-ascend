@@ -278,10 +278,6 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
             cache_names = getattr(layer, "kv_transfer_cache_names", None)
             if cache_names is not None:
                 self._layer_index_by_name[alias] = self._layer_index_by_name[cache_names[0]]
-            elif alias not in self._layer_index_by_name:
-                owner = getattr(layer, "layerwise_push_cache_name", None)
-                if owner in self._layer_index_by_name:
-                    self._layer_index_by_name[alias] = self._layer_index_by_name[owner]
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         if self.kv_transfer_config.is_kv_producer:
