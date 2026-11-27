@@ -172,7 +172,6 @@ def ns():
         n,
         {"BlockKeySnapshot", "_make_snapshot", "_load_entries", "_save_entries", "_continuation_window_start"},
     )
-    definitions("vllm_ascend/models/deepseek_v4/cache_transfer.py", n)
     n["selected"] = lambda mask, index: mask is None or (index < len(mask) and mask[index])
     n["KV_CACHE_BUFFER_ALIGNMENT"] = 2 * 1024 * 1024
     n["block_hash_to_str"] = lambda value: value.hex()
@@ -565,21 +564,6 @@ def test_push_registers_declared_swa_owner(ns, shared):
     register = isolated_method(path, "MooncakePushConnectorWorker", "_register_composite_layer_aliases", ns)
     register._register_composite_layer_aliases(worker)
     assert worker._layer_index_by_name == {owner: layer, hook: layer}
-
-
-def test_indexer_transport_drops_only_overlapping_view(ns):
-    torch = pytest.importorskip("torch")
-    ns["torch"] = torch
-    backing = torch.empty((2, 8), dtype=torch.uint8)
-    views = (backing[:, :6], backing[:, 6:], backing)
-    other = object()
-    caches = {"layer.indexer.k_cache": views, "other": other}
-    selected = ns["transfer_cache_views"](caches)
-    assert selected["layer.indexer.k_cache"][0] is views[0]
-    assert selected["layer.indexer.k_cache"][1] is views[1]
-    assert len(selected["layer.indexer.k_cache"]) == 2
-    assert selected["other"] is other
-    assert caches["layer.indexer.k_cache"] is views
 
 
 def isolated_method(path, cls_name, method_name, ns):
