@@ -417,18 +417,21 @@ def test_align_state_uses_exact_snapshot_with_finer_pages(ns):
     assert ns["_load_entries"](worker, request, 0, hashes, None) == [(key, 1)]
 
 
-def test_dsv4_window_continuation_restores_live_pages_only(ns):
-    worker = NS(
+def make_shared_window_worker(page_tokens, *, window=None, transfer_granularity=None):
+    return NS(
+        grouped_block_size=[page_tokens],
         group_uses_align_state=[False],
-        grouped_block_size=[128],
-        use_eagle=False,
-        kv_cache_config=NS(block_key_prefill_windows={0: 256}),
-        _group_reuses_buffer=lambda group: True,
+        cache_transfer_granularity=page_tokens if transfer_granularity is None else transfer_granularity,
+        kv_cache_config=NS(block_key_prefill_windows={} if window is None else {0: window}),
         _reused_layers_by_group={0: {0}},
         _block_key_snapshots={},
-        _layerwise_load_snapshot_start=lambda *args: None,
+        _is_layerwise_save_owner=lambda group: True,
         _make_layerwise_full_key=lambda group, key: key,
     )
+
+
+def test_dsv4_window_continuation_restores_live_pages_only(ns):
+    worker = make_shared_window_worker(128, window=256)
     request = NS(
         load_spec=NS(
             can_load=True, layerwise_previous_step=True, kvpool_cached_tokens=256, kvpool_store_skip_tokens=None
@@ -459,15 +462,7 @@ def test_mtp_prefill_uses_same_window_for_save_and_continuation(ns):
 
 
 def test_window_save_respects_public_mask_at_aligned_endpoint(ns):
-    worker = NS(
-        grouped_block_size=[128],
-        group_uses_align_state=[False],
-        cache_transfer_granularity=128,
-        _reused_layers_by_group={0: {0}},
-        _is_layerwise_save_owner=lambda group: True,
-        _layerwise_save_full_end=lambda *args: 4,
-        _make_layerwise_full_key=lambda group, key: key,
-    )
+    worker = make_shared_window_worker(128)
     request = NS(
         target_token_len=512, save_start_token=0, can_save=True,
         block_ids_by_group=[[1, 2, 3, 4]], store_masks=[[True, False, False, False]],
@@ -478,19 +473,7 @@ def test_window_save_respects_public_mask_at_aligned_endpoint(ns):
 
 
 def test_untrimmed_shared_window_skips_masked_public_page(ns):
-    worker = NS(
-        grouped_block_size=[128],
-        group_uses_align_state=[False],
-        cache_transfer_granularity=128,
-        kv_cache_config=NS(block_key_prefill_windows={0: 256}),
-        _group_reuses_buffer=lambda group: True,
-        _reused_layers_by_group={0: {0}},
-        _block_key_snapshots={},
-        _is_layerwise_save_owner=lambda group: True,
-        _layerwise_save_full_end=lambda *args: 3,
-        _layerwise_load_snapshot_start=lambda *args: None,
-        _make_layerwise_full_key=lambda group, key: key,
-    )
+    worker = make_shared_window_worker(128, window=256)
     request = NS(
         req_id="request", layerwise_request_id="incarnation",
         target_token_len=384, save_start_token=0, can_save=True,
@@ -510,16 +493,7 @@ def test_untrimmed_shared_window_skips_masked_public_page(ns):
 
 
 def test_aligned_prefill_saves_live_window_outside_public_store_mask(ns):
-    worker = NS(
-        grouped_block_size=[32],
-        group_uses_align_state=[False],
-        cache_transfer_granularity=4096,
-        kv_cache_config=NS(block_key_prefill_windows={0: 128}),
-        _reused_layers_by_group={0: {0}},
-        _block_key_snapshots={},
-        _is_layerwise_save_owner=lambda group: True,
-        _make_layerwise_full_key=lambda group, key: key,
-    )
+    worker = make_shared_window_worker(32, window=128, transfer_granularity=4096)
     request = NS(
         req_id="request",
         layerwise_request_id="incarnation",
@@ -832,22 +806,7 @@ def test_transfer_suffix_snapshots_match_next_step_keys(ns, endpoint, size, hash
     total = (endpoint + size - 1) // size
     hashes = [str(i).encode() for i in range(max(0, endpoint // size - hash_lag))]
     transfer = 4096
-    cutoff = min(endpoint // transfer, len(hashes) * size // transfer) * transfer // size
-    needs_snapshot = bool(endpoint % transfer or endpoint // transfer > len(hashes) * size // transfer)
-    worker = NS(
-        grouped_block_size=[size], group_uses_align_state=[False],
-        cache_transfer_granularity=transfer, use_eagle=False,
-        _group_reuses_buffer=lambda group: True,
-        _reused_layers_by_group={0: {0}},
-        _block_key_snapshots={},
-        _is_layerwise_save_owner=lambda group: True,
-        _make_layerwise_full_key=lambda group, key: key,
-    )
-    worker._layerwise_save_full_end = lambda req, group, span, partial: (
-        min(req.target_token_len // span, partial)
-        if partial is not None else req.target_token_len // span
-    )
-    worker._layerwise_load_snapshot_start = lambda req, group, tokens: cutoff if needs_snapshot else None
+    worker = make_shared_window_worker(size, transfer_granularity=transfer)
     request = NS(
         target_token_len=endpoint, save_start_token=0, can_save=True,
         block_ids_by_group=[list(range(1, total + 1))], store_masks=None,

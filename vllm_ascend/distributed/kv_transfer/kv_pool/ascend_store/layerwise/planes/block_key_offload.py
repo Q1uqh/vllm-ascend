@@ -175,23 +175,6 @@ def _save_entries(worker, request, view, group, hashes, snapshots, snapshot_scop
     return entries if worker._is_layerwise_save_owner(group) else []
 
 
-def _open_missing(worker, target_sizes, started):
-    missing = worker._filter_pool_existing_keys(list(target_sizes))
-    for batch in worker._layerwise_key_batches(missing):
-        codes = require_aligned_batch_results(
-            "batch_put_start", batch, worker.m_store.batch_put_start(batch, [target_sizes[key] for key in batch])
-        )
-        opened = {key for key, code in zip(batch, codes, strict=True) if code == 0}
-        started.update(opened)
-        with worker._put_started_keys_lock:
-            worker._put_started_keys.update(opened)
-        rejected = [
-            key for key, code in zip(batch, codes, strict=True) if code not in (0, _OBJECT_ALREADY_EXISTS)
-        ]
-        if rejected and worker._filter_pool_existing_keys(rejected):
-            raise RuntimeError("Mooncake offload could not open a required PUT session")
-
-
 def _open_puts(worker, slots):
     # One metadata RPC per batch across requests and groups, with each group's
     # own object size. Deduplication also prevents duplicate concurrent writers.
@@ -203,7 +186,20 @@ def _open_puts(worker, slots):
     started = set()
 
     try:
-        _open_missing(worker, sizes, started)
+        missing = worker._filter_pool_existing_keys(list(sizes))
+        for batch in worker._layerwise_key_batches(missing):
+            codes = require_aligned_batch_results(
+                "batch_put_start", batch, worker.m_store.batch_put_start(batch, [sizes[key] for key in batch])
+            )
+            opened = {key for key, code in zip(batch, codes, strict=True) if code == 0}
+            started.update(opened)
+            with worker._put_started_keys_lock:
+                worker._put_started_keys.update(opened)
+            rejected = [
+                key for key, code in zip(batch, codes, strict=True) if code not in (0, _OBJECT_ALREADY_EXISTS)
+            ]
+            if rejected and worker._filter_pool_existing_keys(rejected):
+                raise RuntimeError("Mooncake offload could not open a required PUT session")
     except Exception:
         worker._queue_layerwise_revoke_keys(list(started))
         raise
