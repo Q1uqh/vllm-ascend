@@ -7,8 +7,9 @@ layers and DSpark draft caches retain their own addresses within their groups.
 
 ## Layout and runtime configuration
 
-The model layout entry point in `vllm_ascend/models/deepseek_v4/cache_config.py`
-uses the common planner to assign shared slots by page stride and cache group.
+The common planner uses the model rules in
+`vllm_ascend/models/deepseek_v4/cache_reuse.py` to assign shared slots by page
+stride and cache group.
 Components in the same layer and group use distinct slots. A layer that reuses
 multiple slots waits for every predecessor's Store save and handoff before
 writing those slots.

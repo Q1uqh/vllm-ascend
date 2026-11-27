@@ -124,9 +124,9 @@ def ns():
     definitions(STORE + "layerwise/cache_planner.py", planning, {"LayerwiseCachePlanner"})
     planning["cache_view_alignment"] = lambda spec: 1
     n["LayerwiseCachePlanner"] = planning["LayerwiseCachePlanner"]
-    definitions("vllm_ascend/models/deepseek_v4/cache_config.py", n)
     planner_path = STORE + "layerwise/cache_planner.py"
     model_path = "vllm_ascend/models/deepseek_v4/cache_reuse.py"
+    definitions(model_path, n, {"is_deepseek_v4_cache", "validate_dsv4_transfer_speculation"})
     from types import MappingProxyType
 
     n["MappingProxyType"] = MappingProxyType

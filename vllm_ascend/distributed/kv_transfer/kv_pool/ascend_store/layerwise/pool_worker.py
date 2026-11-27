@@ -70,7 +70,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     is_kv_save_role,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import BaseKVPoolWorker
-from vllm_ascend.models.deepseek_v4.cache_config import is_deepseek_v4_cache
+from vllm_ascend.models.deepseek_v4.cache_reuse import is_deepseek_v4_cache
 
 # PERF-TUNE switch: defer the last layer's save drain out of the forward
 # critical path; the drain runs at the start of the next step's start_load_kv.

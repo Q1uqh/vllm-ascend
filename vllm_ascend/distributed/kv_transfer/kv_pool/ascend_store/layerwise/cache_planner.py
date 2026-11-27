@@ -14,7 +14,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, KVCacheTensor
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import get_backend_class
-from vllm_ascend.models.deepseek_v4.cache_config import is_deepseek_v4_cache, validate_dsv4_transfer_speculation
+from vllm_ascend.models.deepseek_v4.cache_reuse import is_deepseek_v4_cache, validate_dsv4_transfer_speculation
 
 from .layerwise_cache_layout import (
     LayerwiseCacheConfig,
