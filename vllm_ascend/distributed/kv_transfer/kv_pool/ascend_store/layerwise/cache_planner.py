@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, KVCacheTensor
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import get_backend_class
+from vllm_ascend.models.deepseek_v4.cache_reuse import is_deepseek_v4_cache, validate_dsv4_transfer_speculation
 
 from .layerwise_cache_layout import (
     LayerwiseCacheConfig,
@@ -31,6 +32,7 @@ SPEC_REUSE_RULES = MappingProxyType(
         "glm_moe_dsa": "vllm_ascend.models.glm5next.cache_reuse.GLM_DSA_SPEC_REUSE_RULES",
         "qwen4_exp": "vllm_ascend.models.qwen4_exp.cache_reuse.QWEN4_EXP_SPEC_REUSE_RULES",
         "qwen4_exp_text": "vllm_ascend.models.qwen4_exp.cache_reuse.QWEN4_EXP_SPEC_REUSE_RULES",
+        "deepseek_v4": "vllm_ascend.models.deepseek_v4.cache_reuse.DEEPSEEK_V4_SPEC_REUSE_RULES",
     }
 )
 
@@ -319,4 +321,24 @@ def plan_layerwise_cache_reuse(
         getattr(spec, "store_on_host", False) for spec in planner.spec_by_entry.values()
     ):
         raise ValueError("Layerwise offload requires device-resident cache tensors.")
+    if str(extra_config.get("backend", "mooncake")).lower() == "mooncake":
+        if is_deepseek_v4_cache(kv_cache_config.kv_cache_groups):
+            parallel = vllm_config.parallel_config
+            if parallel.pipeline_parallel_size != 1 or parallel.prefill_context_parallel_size != 1:
+                raise ValueError("DSV4 Mooncake KV offload requires PP=PCP=1")
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError("DSV4 Mooncake KV offload requires eager execution")
+            validate_dsv4_transfer_speculation(vllm_config)
+        windows = {}
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            if layout.reused_cache_names.isdisjoint(group.layer_names):
+                continue
+            spec = planner.spec_by_entry[group.layer_names[0]]
+            window = getattr(spec, "sliding_window", None)
+            if window is not None:
+                windows[group_id] = window + (getattr(spec, "extra_retained_tokens", 0) or 0)
+        kv_cache_config.block_key_prefill_windows = windows
+        kv_cache_config.block_key_continuation_windows = (
+            windows if vllm_config.speculative_config is None else {}
+        )
     return layout

@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_worker import LayerwiseKVPoolWorker
 
 
+_OBJECT_ALREADY_EXISTS = -705
+
+
 class BlockKeySnapshot(NamedTuple):
     key: str
     endpoint: int
@@ -35,6 +38,15 @@ def _make_snapshot(
 ) -> BlockKeySnapshot:
     key = worker._make_layerwise_full_key(group, f"offload_v1:{snapshot_scope}:{endpoint}:{index}")
     return BlockKeySnapshot(key, endpoint)
+
+
+def _continuation_window_start(worker, group, endpoint, page_tokens, request=None):
+    config = getattr(worker, "kv_cache_config", None)
+    window = getattr(config, "block_key_continuation_windows", {}).get(group)
+    prefill_end = getattr(request, "num_prompt_tokens", None)
+    if window is None and prefill_end is not None and request.target_token_len <= prefill_end:
+        window = getattr(config, "block_key_prefill_windows", {}).get(group)
+    return None if window is None else max(0, endpoint - window + 1) // page_tokens
 
 
 def _load_entries(worker, request, group, hashes, mask):
@@ -58,12 +70,30 @@ def _load_entries(worker, request, group, hashes, mask):
             raise ValueError("Mooncake recurrent restore requires its exact saved snapshot endpoint")
         return [(snapshot.key, index)]
 
+    config = getattr(worker, "kv_cache_config", None)
+    live_window = running and group in getattr(config, "block_key_prefill_windows", {})
+    first = _continuation_window_start(worker, group, tokens, size, request) if live_window else None
+    checkpoint = getattr(worker, "_offload_active_pages", {}).get(
+        (request.req_id, group)
+    ) if live_window else None
+    saved_pages = checkpoint[1] if checkpoint is not None else snapshots
     entries = []
-    for index in range(end):
-        if not selected(mask, index):
+    for index in range(first or 0, end):
+        if live_window:
+            if mask is not None and index < len(mask) and not mask[index] and index not in saved_pages:
+                continue
+        elif index not in snapshots and not selected(mask, index):
             continue
         if ids[index] == 0:
+            if live_window:
+                continue
             raise ValueError("Mooncake offload restore selected a null block")
+        if checkpoint is not None:
+            endpoint, pages = checkpoint
+            if endpoint != tokens or index not in pages:
+                raise ValueError("Mooncake offload has no committed version for a live continuation page")
+            entries.append((pages[index], index))
+            continue
         snapshot = snapshots.get(index)
         if snapshot is None:
             if index >= min(tokens // size, len(hashes)):
@@ -111,12 +141,30 @@ def _save_entries(worker, request, view, group, hashes, snapshots, snapshot_scop
     if end > len(ids) or (partial is not None and (partial >= len(ids) or ids[partial] == 0)):
         raise ValueError("Mooncake offload save has no allocated checkpoint or block")
     mask = request.store_masks[group] if request.store_masks is not None else None
+    snapshot_start = None
+    transfer_size = getattr(worker, "cache_transfer_granularity", size)
+    if not recurrent and size < transfer_size:
+        # A transfer unit can contain several complete pages of this group.
+        public_tokens = min(tokens, len(hashes) * size) // transfer_size * transfer_size
+        snapshot_start = public_tokens // size
+    continuation_start = None
+    if reuses_buffer and not recurrent:
+        continuation_start = _continuation_window_start(worker, group, tokens, size, request)
+
     entries = []
     for index in range(start, end):
-        # Reachability masks describe published pages, not new private pages.
-        if ids[index] == 0 or (index < len(hashes) and mask is not None and index < len(mask) and not mask[index]):
+        if ids[index] == 0:
             continue
-        if index < len(hashes):
+        private = index >= len(hashes) or (snapshot_start is not None and index >= snapshot_start)
+        masked = mask is not None and index < len(mask) and not mask[index]
+        if continuation_start is not None:
+            # Private suffix pages also have to be live at the save endpoint.
+            if (private or masked) and index < continuation_start:
+                continue
+        elif masked and not private:
+            continue
+        private = private or masked
+        if not private:
             key = worker._make_layerwise_full_key(group, block_hash_to_str(hashes[index]))
             snapshots.pop(index, None)
         else:
@@ -137,9 +185,10 @@ def _open_puts(worker, slots):
         if key in sizes and sizes[key] != size:
             raise ValueError("Mooncake offload key has inconsistent object sizes")
         sizes[key] = size
-    missing = worker._filter_pool_existing_keys(list(sizes))
     started = set()
+
     try:
+        missing = worker._filter_pool_existing_keys(list(sizes))
         for batch in worker._layerwise_key_batches(missing):
             codes = require_aligned_batch_results(
                 "batch_put_start", batch, worker.m_store.batch_put_start(batch, [sizes[key] for key in batch])
@@ -148,9 +197,9 @@ def _open_puts(worker, slots):
             started.update(opened)
             with worker._put_started_keys_lock:
                 worker._put_started_keys.update(opened)
-            rejected = [key for key, code in zip(batch, codes, strict=True) if code != 0]
-            # A competing writer may have committed since the existence probe.
-            # An unfinished competing PUT is not a safe offload destination.
+            rejected = [
+                key for key, code in zip(batch, codes, strict=True) if code not in (0, _OBJECT_ALREADY_EXISTS)
+            ]
             if rejected and worker._filter_pool_existing_keys(rejected):
                 raise RuntimeError("Mooncake offload could not open a required PUT session")
     except Exception:
@@ -176,6 +225,9 @@ def prepare_offload_sessions(
     groups: dict[int, list[ReqMeta]] = {group: [] for group in worker.cacheable_group_ids}
     get_slots = []
     put_slots: list[tuple[ReqMeta, str, int | None, int]] = []
+    pending = {}
+    config = getattr(worker, "kv_cache_config", None)
+    window_groups = getattr(config, "block_key_prefill_windows", {})
     next_snapshots: dict[str, dict[int, dict[int, BlockKeySnapshot]]] = {}
     for request_index, request in enumerate(requests):
         assert snapshot_batch_id is not None
@@ -189,8 +241,6 @@ def prepare_offload_sessions(
         # window for its full pages and let private snapshots cover the tail.
         aligned = cached // worker.cache_transfer_granularity * worker.cache_transfer_granularity
         masks = worker._compute_reachable_load_masks(request, aligned)
-        if cached != aligned and running:
-            masks = None
         for group in worker.cacheable_group_ids:
             view = copy(request)
             view.load_block_keys = []
@@ -200,28 +250,44 @@ def prepare_offload_sessions(
             view.save_last_block_key = view.load_last_block_key = None
             view.load_key_block_offset = 0
             hashes = get_block_hashes(request.block_hashes, worker.grouped_block_size[group], worker.hash_block_size)
-            entries = _load_entries(worker, request, group, hashes, masks[group] if masks is not None else None)
+            mask = masks[group] if masks is not None else None
+            if cached != aligned and running and group not in window_groups:
+                mask = None
+            entries = _load_entries(worker, request, group, hashes, mask)
             view.load_block_keys = [None] * (max((index for _, index in entries), default=-1) + 1)
             for key, index in entries:
                 view.load_block_keys[index] = key
                 get_slots.append((view, key, request.block_ids_by_group[group][index], index))
-            put_slots.extend(
-                (view, key, slot, sum(worker.group_block_len[group]))
-                for key, slot in _save_entries(
-                    worker,
-                    request,
-                    view,
-                    group,
-                    hashes,
-                    snapshots.setdefault(group, previous.get(group, {}).copy()),
-                    snapshot_scope,
+            group_snapshots = snapshots.setdefault(group, previous.get(group, {}).copy())
+            saves = _save_entries(worker, request, view, group, hashes, group_snapshots, snapshot_scope)
+            if (
+                group in window_groups
+                and not worker.group_uses_align_state[group]
+                and request.can_save
+                and not request.is_last_chunk
+                and group in worker._reused_layers_by_group
+            ):
+                pages = {index: key for key, index in entries}
+                for key, slot in saves:
+                    index = view.partial_block_index if slot is None else view.save_key_block_offset + slot
+                    pages[index] = key
+                ids = request.block_ids_by_group[group]
+                first = _continuation_window_start(
+                    worker, group, request.target_token_len, worker.grouped_block_size[group], request
                 )
-            )
+                checkpoint_pages = {
+                    index: key for index, key in pages.items() if (first or 0) <= index < len(ids) and ids[index]
+                }
+                pending[(request.req_id, group)] = (
+                    request.target_token_len, checkpoint_pages
+                )
+            put_slots.extend((view, key, slot, sum(worker.group_block_len[group])) for key, slot in saves)
             groups[group].append(view)
     try:
         worker._open_layerwise_get_sessions(get_slots)
         worker._check_hybrid_load_errors()
         _open_puts(worker, put_slots)
+        worker._offload_pending_pages = pending
         for views in groups.values():
             for view in views:
                 if not any(view.save_block_keys):
