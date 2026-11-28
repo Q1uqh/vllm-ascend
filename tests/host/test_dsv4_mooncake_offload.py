@@ -521,6 +521,53 @@ def test_aligned_prefill_saves_live_window_outside_public_store_mask(ns):
     assert ns["_load_entries"](worker, request, 0, hashes, [False] * 252 + [True] * 4) == saved
 
 
+@pytest.mark.parametrize("page_tokens", [2, 4])
+@pytest.mark.parametrize("last_chunk", [False, True])
+def test_window_save_bounds_private_suffix_at_clamp_and_final_chunk(ns, page_tokens, last_chunk):
+    worker = make_shared_window_worker(page_tokens, window=8, transfer_granularity=4096)
+    endpoint = 6145
+    complete_pages = endpoint // page_tokens
+    first_live_page = (endpoint - 8 + 1) // page_tokens
+    hit_pages = 4096 // page_tokens
+    request = NS(
+        req_id="request",
+        target_token_len=endpoint,
+        num_prompt_tokens=endpoint if last_chunk else 8192,
+        is_last_chunk=last_chunk,
+        save_start_token=0,
+        can_save=True,
+        block_ids_by_group=[list(range(1, complete_pages + 2))],
+        store_masks=[[True] * hit_pages + [False] * (complete_pages + 1 - hit_pages)],
+        load_spec=None if last_chunk else NS(
+            layerwise_previous_step=False,
+            clamp_save_start=lambda start, size: max(start, 4096 // size),
+        ),
+    )
+    hashes = [index.to_bytes(2, "big") for index in range(hit_pages + 1)]
+    snapshots = {}
+    view = NS()
+    saved = ns["_save_entries"](worker, request, view, 0, hashes, snapshots, "scope")
+
+    expected_public = [] if not last_chunk else [(key.hex(), index) for index, key in enumerate(hashes[:hit_pages])]
+    assert view.save_key_block_offset == (0 if last_chunk else hit_pages)
+    assert view.partial_block_index == complete_pages
+    assert set(snapshots) == set(range(first_live_page, complete_pages + 1))
+    assert saved == expected_public + [
+        (snapshots[index].key, index - view.save_key_block_offset)
+        for index in range(first_live_page, complete_pages)
+    ] + [(snapshots[complete_pages].key, None)]
+
+    if not last_chunk:
+        worker._offload_active_pages = {
+            ("request", 0): (endpoint, {index: snapshot.key for index, snapshot in snapshots.items()})
+        }
+        request.target_token_len = request.num_prompt_tokens
+        request.load_spec = NS(can_load=True, layerwise_previous_step=True, kvpool_cached_tokens=endpoint)
+        assert ns["_load_entries"](worker, request, 0, hashes, request.store_masks[0]) == [
+            (snapshots[index].key, index) for index in range(first_live_page, complete_pages + 1)
+        ]
+
+
 @pytest.mark.parametrize(("has_connector", "shared"), [(False, False), (True, False), (True, True)])
 def test_swa_save_callback_uses_registered_name_for_shared_cache(ns, has_connector, shared):
     swa = "model.layers.0.self_attn.swa_cache"
